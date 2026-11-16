@@ -5,6 +5,11 @@ const MODULE_META: Record<
   Exclude<RouteKey, 'dashboard'>,
   { title: string; summary: string; oracleObjects: string }
 > = {
+  analytics: {
+    title: 'OPD Analytics & Regional Insights',
+    summary: 'Explore annual OPD consultation trends, top doctors, departments, and patient regions.',
+    oracleObjects: 'GET /api/analytics · Historical Seed + Oracle ORDS',
+  },
   patients: {
     title: 'Patient Directory & Records',
     summary: 'Search, register, update patient demographics, and inspect appointment history.',
@@ -29,6 +34,16 @@ const MODULE_META: Record<
     title: 'Consultation Types',
     summary: 'Configure consultation durations and fee tiers by department.',
     oracleObjects: 'GIRISH_CONSULTATION_TYPES · POST /consultation-types/',
+  },
+  'medical-records': {
+    title: 'Medical Records',
+    summary: 'Inspect, create, and update outpatient visit diagnoses and clinical notes.',
+    oracleObjects: 'RBAC Clinical Store · /api/medical-records',
+  },
+  prescriptions: {
+    title: 'Prescriptions',
+    summary: 'Manage structured OPD medication orders and dispensing status.',
+    oracleObjects: 'RBAC Clinical Store · /api/prescriptions',
   },
   appointments: {
     title: 'Appointments Workspace',
@@ -71,14 +86,29 @@ const MODULE_META: Record<
     oracleObjects: 'GIRISH_TOKEN_QUEUE · GET /token_queue',
   },
   'users-roles': {
-    title: 'Users, Roles & Permissions',
-    summary: 'Manage system accounts, role assignments, and granular RBAC permissions.',
-    oracleObjects: 'GIRISH_USERS · GIRISH_ROLES · GIRISH_ROLE_PERMISSIONS',
+    title: 'User Management',
+    summary: 'Manage staff and patient accounts, lifecycle status, roles, and individual overrides.',
+    oracleObjects: 'RBAC Store · /api/rbac/users',
+  },
+  'role-management': {
+    title: 'Role Management',
+    summary: 'Configure default permission templates for core hospital system roles.',
+    oracleObjects: 'RBAC Store · /api/rbac/roles',
+  },
+  'permission-management': {
+    title: 'Granular Permission Matrix',
+    summary: 'Edit 19-module × 5-action RBAC permission policies with live diff preview.',
+    oracleObjects: 'RBAC Store · /api/rbac/modules',
   },
   'audit-logs': {
-    title: 'System Audit Logs',
-    summary: 'Inspect login, logout, insert, update, and delete audit trail events.',
-    oracleObjects: 'GIRISH_AUDIT_LOGS · GIRISH_AUDIT_CONFIG',
+    title: 'System & Security Audit Logs',
+    summary: 'Inspect authentication, permission changes, 403 denials, and Oracle audit events.',
+    oracleObjects: 'RBAC Audit Store · GIRISH_AUDIT_LOGS',
+  },
+  'security-settings': {
+    title: 'Security Settings',
+    summary: 'Control session lifetimes, strict RBAC enforcement, and registration policy.',
+    oracleObjects: 'RBAC Store · /api/rbac/security-settings',
   },
   'error-logs': {
     title: 'PL/SQL & API Error Logs',

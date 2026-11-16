@@ -9,6 +9,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import type { AuthUser, DashboardSummaryResponse, RouteKey } from '../../types/opd';
+import { canAccessRoute, hasModulePermission } from '../../utils/permissions';
 import { formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
 import {
   doesDoctorNeedDailySlotsPrompt,
@@ -58,6 +59,11 @@ export function DoctorDashboard({
     todayIso,
   );
 
+  const showLeaves = canAccessRoute(user, 'doctor-leaves');
+  const showSlots = canAccessRoute(user, 'slots');
+  const showAppointments = canAccessRoute(user, 'appointments');
+  const canManageSlots = hasModulePermission(user, 'SLOTS', 'CREATE');
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -70,13 +76,15 @@ export function DoctorDashboard({
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={() => onNavigate('doctor-leaves')}
-            className="rounded-lg bg-teal-700 px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap"
-          >
-            Request Leave
-          </button>
+          {showLeaves && canManageSlots && (
+            <button
+              type="button"
+              onClick={() => onNavigate('doctor-leaves')}
+              className="rounded-lg bg-teal-700 px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap"
+            >
+              Request Leave
+            </button>
+          )}
           <button
             type="button"
             onClick={onRefresh}
@@ -106,13 +114,15 @@ export function DoctorDashboard({
               </p>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={() => onNavigate('slots')}
-            className="rounded-lg bg-amber-800 px-3.5 py-2 text-xs font-medium text-white hover:bg-amber-900 whitespace-nowrap shrink-0"
-          >
-            Open Full Schedule
-          </button>
+          {showSlots && (
+            <button
+              type="button"
+              onClick={() => onNavigate('slots')}
+              className="rounded-lg bg-amber-800 px-3.5 py-2 text-xs font-medium text-white hover:bg-amber-900 whitespace-nowrap shrink-0"
+            >
+              Open Full Schedule
+            </button>
+          )}
         </div>
       ) : (
         <div className="flex items-center gap-2.5 rounded-xl border border-emerald-200 bg-emerald-50/70 px-4 py-3 text-sm text-emerald-950">
@@ -171,7 +181,7 @@ export function DoctorDashboard({
                   ? 'Registered shift'
                   : 'Registration required'}
             </span>
-            {!doctor_shift?.pending_change_request && (
+            {!doctor_shift?.pending_change_request && canManageSlots && (
               <button
                 type="button"
                 onClick={() => setShiftChangeOpen(true)}
@@ -198,7 +208,7 @@ export function DoctorDashboard({
       </div>
 
       {/* Interactive Doctor Working-Hours Slot Calendar */}
-      {doctorId > 0 && (
+      {doctorId > 0 && showSlots && (
         <DoctorSlotCalendar
           doctorId={doctorId}
           doctorName={doctorDisplayName}
@@ -206,7 +216,8 @@ export function DoctorDashboard({
           templates={doctor_templates}
           leaves={doctor_leaves}
           shiftConfig={doctor_shift}
-          onRequestShiftChange={() => setShiftChangeOpen(true)}
+          readOnly={!canManageSlots}
+          onRequestShiftChange={canManageSlots ? () => setShiftChangeOpen(true) : undefined}
           onSlotsChanged={onRefresh}
           compact
         />
@@ -215,13 +226,15 @@ export function DoctorDashboard({
       <section className="rounded-xl border border-slate-200 bg-white">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
           <h3 className="text-base font-semibold text-slate-900">My Appointments</h3>
-          <button
-            type="button"
-            onClick={() => onNavigate('appointments')}
-            className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
-          >
-            View All Appointments
-          </button>
+          {showAppointments && (
+            <button
+              type="button"
+              onClick={() => onNavigate('appointments')}
+              className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
+            >
+              View All Appointments
+            </button>
+          )}
         </div>
         {data.recent_appointments.length === 0 ? (
           <div className="p-8 text-center text-sm text-slate-500">

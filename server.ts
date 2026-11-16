@@ -6,6 +6,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer as createViteServer } from 'vite';
 import type {
+  AccountStatus,
+  AnalyticsDatasetResponse,
+  AnalyticsVisitRecord,
   Appointment,
   AuthUser,
   DashboardSummaryResponse,
@@ -13,8 +16,10 @@ import type {
   Doctor,
   DoctorLeave,
   DoctorShiftConfig,
+  ModuleKey,
   Patient,
   Payment,
+  PermissionAction,
   PortalNotification,
   RoleName,
   ShiftChangeRequest,
@@ -26,12 +31,28 @@ import type {
   UtilisationReportRow,
 } from './src/types/opd.ts';
 import {
-  isSingleAdminUser,
+  DEFAULT_ROLE_PERMISSION_MATRIX,
+  RBAC_MODULES,
   ROLE_DEFAULT_PERMISSIONS,
   ROLE_LABELS,
   SINGLE_ADMIN_EMAIL,
   SINGLE_ADMIN_NAME,
+  SUPER_ADMIN_EMAIL,
+  SUPER_ADMIN_NAME,
+  SUPER_ADMIN_USERNAME,
+  canActorModifyTargetUser,
+  computeEffectivePermissions,
+  diffPermissionSets,
+  hasAnyEffectivePermission,
+  hasEffectivePermission,
+  isProtectedSuperAdminIdentity,
+  isSingleAdminUser,
 } from './src/utils/permissions.ts';
+import {
+  ALL_CANONICAL_PERMISSIONS,
+  SUPER_ADMIN_USER_ID,
+  normalizeCanonicalPermissions,
+} from './src/utils/rbac.ts';
 import {
   doesLoginNameMatch,
   enrichAppointments,
@@ -49,6 +70,30 @@ import {
   getWeekdayName,
   isDateCoveredByApprovedLeave,
 } from './src/utils/calendar.ts';
+import {
+  DEFAULT_SEEDED_PATIENT_REGIONS,
+  normalizeRegionText,
+  type PatientRegion,
+} from './src/utils/regions.ts';
+import { generateHistoricalAnalyticsSeed } from './src/utils/analyticsSeed.ts';
+import {
+  buildRoleDefinitions,
+  buildUnifiedUsersDirectory,
+  checkLoginLockout,
+  clearFailedLoginAttempts,
+  findManagedUserRecord,
+  hashPasswordScrypt,
+  hydrateAuthUserFromStore,
+  isDisallowedLegacyFakeAdmin,
+  normalizeUserKey,
+  readRbacAuditLogs,
+  readRbacStore,
+  recordFailedLoginAttempt,
+  recordRbacAuditLog,
+  verifyPasswordScrypt,
+  writeRbacStore,
+} from './server/rbacStore.ts';
+import { readClinicalStore, writeClinicalStore } from './server/clinicalStore.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
@@ -129,10 +174,16 @@ const BRIDGE_ACCOUNTS: BridgeCredential[] = [
   },
 ];
 
+function getSessionTtlMs(): number {
+  const store = readRbacStore();
+  const hours = Math.max(1, Math.min(168, Number(store.security_settings.session_ttl_hours || 12)));
+  return hours * 60 * 60 * 1000;
+}
+
 function signSession(user: AuthUser): string {
   const payload: SessionPayload = {
     user,
-    exp: Date.now() + 1000 * 60 * 60 * 12,
+    exp: Date.now() + getSessionTtlMs(),
   };
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
   const sig = crypto.createHmac('sha256', SESSION_SECRET).update(encoded).digest('base64url');
@@ -151,12 +202,6 @@ function verifySession(token?: string | null): AuthUser | null {
   try {
     const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as SessionPayload;
     if (!parsed.exp || parsed.exp < Date.now()) return null;
-    if (parsed.user.role === 'ADMIN') {
-      parsed.user = {
-        ...parsed.user,
-        permissions: ROLE_DEFAULT_PERMISSIONS.ADMIN,
-      };
-    }
     return parsed.user;
   } catch {
     return null;
@@ -191,7 +236,7 @@ function setSessionCookie(req: Request, res: Response, token: string): void {
     httpOnly: true,
     sameSite: isHttps ? 'none' : 'lax',
     secure: isHttps,
-    maxAge: 1000 * 60 * 60 * 12,
+    maxAge: getSessionTtlMs(),
     path: '/',
   });
 }
@@ -242,39 +287,181 @@ async function fetchOrdsItems<T>(endpoint: string): Promise<T[]> {
 }
 
 function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const user = verifySession(getRequestToken(req));
-  if (!user) {
+  const rawUser = verifySession(getRequestToken(req));
+  if (!rawUser) {
     res.status(401).json({ status: 'error', message: 'Authentication required' });
     return;
   }
-  (req as Request & { authUser?: AuthUser }).authUser = user;
+  const hydrated = hydrateAuthUserFromStore(rawUser);
+  if (!hydrated.user) {
+    clearSessionCookie(req, res);
+    res.status(403).json({
+      status: 'error',
+      message: `Account is ${(hydrated.blockedStatus || 'INACTIVE').toLowerCase()}. Access denied.`,
+    });
+    return;
+  }
+  (req as Request & { authUser?: AuthUser }).authUser = hydrated.user;
   next();
+}
+
+function requirePermission(
+  user: AuthUser,
+  res: Response,
+  requiredPermission: string,
+  resourceLabel: string,
+): boolean {
+  if (hasEffectivePermission(user.permissions, user.role, requiredPermission)) {
+    return true;
+  }
+  recordRbacAuditLog({
+    actor_user_id: user.user_id,
+    actor_name: user.full_name,
+    actor_role: user.role,
+    target_label: resourceLabel,
+    action: 'UNAUTHORIZED_ACCESS',
+    category: 'SECURITY',
+    previous_value: null,
+    new_value: `DENIED:${requiredPermission}`,
+    details: `Blocked ${user.role} (${user.email}) from accessing ${resourceLabel} — missing ${requiredPermission}.`,
+    severity: 'warning',
+  });
+  res.status(403).json({
+    status: 'error',
+    message: `Access denied: missing required permission (${requiredPermission}) for ${resourceLabel}.`,
+  });
+  return false;
+}
+
+function requireAnyPermission(
+  user: AuthUser,
+  res: Response,
+  candidates: string[],
+  resourceLabel: string,
+): boolean {
+  if (hasAnyEffectivePermission(user.permissions, user.role, candidates)) {
+    return true;
+  }
+  recordRbacAuditLog({
+    actor_user_id: user.user_id,
+    actor_name: user.full_name,
+    actor_role: user.role,
+    target_label: resourceLabel,
+    action: 'UNAUTHORIZED_ACCESS',
+    category: 'SECURITY',
+    previous_value: null,
+    new_value: `DENIED:${candidates.join('|')}`,
+    details: `Blocked ${user.role} (${user.email}) from accessing ${resourceLabel} — requires one of [${candidates.join(', ')}].`,
+    severity: 'warning',
+  });
+  res.status(403).json({
+    status: 'error',
+    message: `Access denied: insufficient permissions for ${resourceLabel}.`,
+  });
+  return false;
+}
+
+function isHospitalAdminOrSuper(user: AuthUser): boolean {
+  return user.role === 'SUPER_ADMIN' || user.role === 'ADMIN';
 }
 
 const SHIFT_STORE_DIR = path.resolve(__dirname, 'data');
 const SHIFT_STORE_PATH = path.join(SHIFT_STORE_DIR, 'doctor_shifts.json');
 const NOTIF_ACK_PATH = path.join(SHIFT_STORE_DIR, 'notifications_ack.json');
 const PATIENT_PW_PATH = path.join(SHIFT_STORE_DIR, 'patient_passwords.json');
+const PATIENT_REGIONS_PATH = path.join(SHIFT_STORE_DIR, 'patient_regions.json');
+const HISTORICAL_ANALYTICS_PATH = path.join(SHIFT_STORE_DIR, 'historical_analytics_seed.json');
+
+function readPatientRegions(): Record<string, PatientRegion> {
+  const merged: Record<string, PatientRegion> = {};
+  for (const [id, reg] of Object.entries(DEFAULT_SEEDED_PATIENT_REGIONS)) {
+    merged[String(id)] = reg;
+  }
+  try {
+    if (!fs.existsSync(PATIENT_REGIONS_PATH)) {
+      fs.mkdirSync(SHIFT_STORE_DIR, { recursive: true });
+      fs.writeFileSync(PATIENT_REGIONS_PATH, JSON.stringify(merged, null, 2), 'utf8');
+      return merged;
+    }
+    const raw = JSON.parse(fs.readFileSync(PATIENT_REGIONS_PATH, 'utf8')) as Record<string, unknown>;
+    for (const [k, v] of Object.entries(raw)) {
+      if (v && typeof v === 'object') {
+        const city = normalizeRegionText((v as PatientRegion).city);
+        const locality = normalizeRegionText((v as PatientRegion).locality);
+        if (city || locality) {
+          merged[k] = { city, locality };
+        }
+      }
+    }
+  } catch {
+    // Keep seeded defaults
+  }
+  return merged;
+}
+
+function writePatientRegions(regions: Record<string, PatientRegion>): void {
+  fs.mkdirSync(SHIFT_STORE_DIR, { recursive: true });
+  fs.writeFileSync(PATIENT_REGIONS_PATH, JSON.stringify(regions, null, 2), 'utf8');
+}
+
+function savePatientRegion(patientId: number, city: string, locality: string): void {
+  if (!patientId || patientId <= 0) return;
+  const regions = readPatientRegions();
+  regions[String(patientId)] = {
+    city: normalizeRegionText(city),
+    locality: normalizeRegionText(locality),
+  };
+  writePatientRegions(regions);
+}
+
+function attachRegionsToPatients(patients: Patient[]): Patient[] {
+  const regions = readPatientRegions();
+  return patients.map((p) => {
+    const stored = regions[String(p.patient_id)];
+    const city = normalizeRegionText(p.city) || stored?.city || null;
+    const locality = normalizeRegionText(p.locality) || stored?.locality || null;
+    return {
+      ...p,
+      city,
+      locality,
+    };
+  });
+}
+
+function computePatientAgeGroup(dob?: string | null): AnalyticsVisitRecord['patient_age_group'] {
+  if (!dob) return 'Unknown';
+  const year = Number(String(dob).slice(0, 4));
+  if (!year || year < 1900 || year > 2026) return 'Unknown';
+  const age = 2026 - year;
+  if (age <= 18) return '0-18';
+  if (age <= 35) return '19-35';
+  if (age <= 55) return '36-55';
+  return '56+';
+}
+
+function loadOrSeedHistoricalAnalytics(
+  doctors: Doctor[],
+  departments: Department[],
+): AnalyticsVisitRecord[] {
+  try {
+    if (fs.existsSync(HISTORICAL_ANALYTICS_PATH)) {
+      const parsed = JSON.parse(fs.readFileSync(HISTORICAL_ANALYTICS_PATH, 'utf8'));
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed as AnalyticsVisitRecord[];
+      }
+    }
+  } catch {
+    // Regenerate seed if unreadable
+  }
+  const seeded = generateHistoricalAnalyticsSeed(doctors, departments);
+  fs.mkdirSync(SHIFT_STORE_DIR, { recursive: true });
+  fs.writeFileSync(HISTORICAL_ANALYTICS_PATH, JSON.stringify(seeded, null, 2), 'utf8');
+  return seeded;
+}
 
 function normalizePhoneDigits(phone?: string | null): string {
   const digits = String(phone || '').replace(/\D+/g, '');
   return digits.length > 10 ? digits.slice(-10) : digits;
-}
-
-function hashPasswordScrypt(password: string): string {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
-  return `${salt}:${derived}`;
-}
-
-function verifyPasswordScrypt(password: string, storedHash: string): boolean {
-  const parts = storedHash.split(':');
-  if (parts.length !== 2) return false;
-  const [salt, expectedHex] = parts;
-  const derived = crypto.scryptSync(password, salt, 64);
-  const expected = Buffer.from(expectedHex, 'hex');
-  if (derived.length !== expected.length) return false;
-  return crypto.timingSafeEqual(derived, expected);
 }
 
 function readPatientPasswordOverrides(): Record<string, string> {
@@ -309,6 +496,9 @@ interface ShiftStoreData {
 const KNOWN_HISTORICAL_TEMPLATE_DOCTORS: Record<string, number> = {
   '261': 2,
   '293': 2,
+  '325': 2,
+  '327': 3,
+  '545': 4,
 };
 
 function makeSlotKey(doctorId: number, slotDate: string, startTime: string): string {
@@ -583,99 +773,14 @@ async function startServer() {
     }
   });
 
-  // Public non-sensitive directory of registered portal accounts (no passwords/hashes)
-  app.get('/api/auth/directory', async (_req, res) => {
-    try {
-      const [users, doctors, patients, departments] = await Promise.all([
-        fetchOrdsItems<UserAccount>('users').catch(() => [] as UserAccount[]),
-        fetchOrdsItems<Doctor>('doctors').catch(() => [] as Doctor[]),
-        fetchOrdsItems<Patient>('patients').catch(() => [] as Patient[]),
-        fetchOrdsItems<Department>('departments/').catch(() => [] as Department[]),
-      ]);
-      const deptMap = new Map(departments.map((d) => [d.department_id, d.department_name]));
-
-      const entries: Array<{
-        role: RoleName;
-        full_name: string;
-        email: string;
-        detail?: string;
-      }> = [
-        {
-          role: 'ADMIN',
-          full_name: SINGLE_ADMIN_NAME,
-          email: SINGLE_ADMIN_EMAIL,
-          detail: 'Sole System Administrator',
-        },
-      ];
-      const seenEmails = new Set<string>([SINGLE_ADMIN_EMAIL.toLowerCase()]);
-
-      // Receptionists from ORDS users (Meera Kulkarni / primary)
-      for (const u of users) {
-        if (u.is_active === 'Y' && u.role_name === 'RECEPTIONIST' && u.email) {
-          const em = u.email.toLowerCase();
-          if (em === 'reception@hospital.com') continue;
-          if (!seenEmails.has(em)) {
-            seenEmails.add(em);
-            entries.push({
-              role: 'RECEPTIONIST',
-              full_name: u.full_name,
-              email: em,
-              detail: 'Front Desk',
-            });
-          }
-        }
-      }
-
-      // Active Doctors (prefer GIRISH_USERS email, fallback to generated hospital slug)
-      for (const d of doctors) {
-        const linkedUser = users.find(
-          (u) => u.is_active === 'Y' && u.role_name === 'DOCTOR' && u.doctor_id === d.doctor_id,
-        );
-        const slug = `${d.first_name}.${d.last_name}`.toLowerCase().replace(/[^a-z0-9]+/g, '.');
-        const email = (
-          linkedUser?.email ||
-          (d.doctor_id === 2 ? 'priya@hospital.com' : `${slug}.${d.doctor_id}@hospital.com`)
-        ).toLowerCase();
-        if (!seenEmails.has(email)) {
-          seenEmails.add(email);
-          entries.push({
-            role: 'DOCTOR',
-            full_name: linkedUser?.full_name || `Dr. ${d.first_name} ${d.last_name}`,
-            email,
-            detail: `${deptMap.get(d.department_id) || 'OPD'}${d.specialization ? ` · ${d.specialization}` : ''}`,
-          });
-        }
-      }
-
-      // Patients (prefer GIRISH_USERS linked email, fallback to GIRISH_PATIENTS email)
-      for (const p of patients) {
-        const linkedUser = users.find(
-          (u) => u.is_active === 'Y' && u.role_name === 'PATIENT' && u.patient_id === p.patient_id,
-        );
-        const email = (linkedUser?.email || p.email || '').trim().toLowerCase();
-        if (email && !seenEmails.has(email)) {
-          seenEmails.add(email);
-          entries.push({
-            role: 'PATIENT',
-            full_name: linkedUser?.full_name || `${p.first_name} ${p.last_name}`,
-            email,
-            detail: `Patient #${p.patient_id}`,
-          });
-        }
-      }
-
-      const roleParam = String(_req.query?.role || '').trim().toUpperCase();
-      const filteredEntries = ['ADMIN', 'DOCTOR', 'RECEPTIONIST', 'PATIENT'].includes(roleParam)
-        ? entries.filter((e) => e.role === roleParam)
-        : entries;
-
-      res.json({ status: 'success', accounts: filteredEntries });
-    } catch (err) {
-      res.status(502).json({
-        status: 'error',
-        message: err instanceof Error ? err.message : 'Unable to fetch directory',
-      });
-    }
+  app.get('/api/auth/security-policy', (_req, res) => {
+    const store = readRbacStore();
+    res.json({
+      status: 'success',
+      allow_patient_registration: store.security_settings.allow_patient_registration,
+      min_password_length: store.security_settings.min_password_length,
+      enforce_strict_role_portal: store.security_settings.enforce_strict_role_portal,
+    });
   });
 
   app.post('/api/auth/patient/forgot-password', async (req, res) => {
@@ -683,6 +788,8 @@ async function startServer() {
     const phoneInput = normalizePhoneDigits(req.body?.phone_number);
     const newPassword = String(req.body?.new_password || '');
     const confirmPassword = String(req.body?.confirm_password || '');
+    const store = readRbacStore();
+    const minLen = Math.max(6, Number(store.security_settings.min_password_length || 6));
 
     if (!emailInput || !phoneInput || !newPassword || !confirmPassword) {
       res.status(400).json({
@@ -692,10 +799,10 @@ async function startServer() {
       return;
     }
 
-    if (newPassword.length < 6) {
+    if (newPassword.length < minLen) {
       res.status(400).json({
         status: 'error',
-        message: 'New password must be at least 6 characters.',
+        message: `New password must be at least ${minLen} characters.`,
       });
       return;
     }
@@ -708,7 +815,10 @@ async function startServer() {
       return;
     }
 
-    if (emailInput === SINGLE_ADMIN_EMAIL.toLowerCase()) {
+    if (
+      emailInput === SINGLE_ADMIN_EMAIL.toLowerCase() ||
+      emailInput === SUPER_ADMIN_EMAIL.toLowerCase()
+    ) {
       res.status(403).json({
         status: 'error',
         message: 'Password reset is only available for Patient accounts.',
@@ -728,7 +838,11 @@ async function startServer() {
           u.role_name &&
           u.role_name !== 'PATIENT',
       );
-      if (nonPatientUser || BRIDGE_ACCOUNTS.some((b) => b.email.toLowerCase() === emailInput && b.role !== 'PATIENT')) {
+      if (
+        nonPatientUser ||
+        BRIDGE_ACCOUNTS.some((b) => b.email.toLowerCase() === emailInput && b.role !== 'PATIENT') ||
+        store.managed_users.some((m) => m.email.toLowerCase() === emailInput && m.role !== 'PATIENT')
+      ) {
         res.status(403).json({
           status: 'error',
           message: 'Password self-reset is only permitted for Patient accounts.',
@@ -751,6 +865,20 @@ async function startServer() {
       }
 
       writePatientPasswordOverride(emailInput, newPassword);
+      const updatedStore = readRbacStore();
+      updatedStore.password_overrides[emailInput] = hashPasswordScrypt(newPassword);
+      writeRbacStore(updatedStore);
+      recordRbacAuditLog({
+        actor_user_id: matchedPatient.patient_id,
+        actor_name: `${matchedPatient.first_name} ${matchedPatient.last_name}`,
+        actor_role: 'PATIENT',
+        target_label: emailInput,
+        action: 'PASSWORD_SELF_RESET',
+        category: 'AUTH',
+        details: 'Patient verified email + registered phone and updated password.',
+        severity: 'info',
+      });
+
       res.json({
         status: 'success',
         message: 'Password updated successfully. Please sign in with your new password.',
@@ -768,7 +896,9 @@ async function startServer() {
     const fullNameInput = String(req.body?.full_name || '').trim();
     const password = String(req.body?.password || '');
     const expectedRoleRaw = String(req.body?.expected_role || '').trim().toUpperCase();
-    const expectedRole = ['ADMIN', 'DOCTOR', 'RECEPTIONIST', 'PATIENT'].includes(expectedRoleRaw)
+    const expectedRole = ['SUPER_ADMIN', 'ADMIN', 'DOCTOR', 'RECEPTIONIST', 'PATIENT'].includes(
+      expectedRoleRaw,
+    )
       ? (expectedRoleRaw as RoleName)
       : undefined;
 
@@ -780,67 +910,246 @@ async function startServer() {
       return;
     }
 
-    // Never permit legacy non-Girish admin emails
-    if (
-      ['admin', 'admin@hospital.com', 'admin@carepulse.local'].includes(emailInput) ||
-      fullNameInput.toLowerCase().includes('kavita rao')
-    ) {
-      res.status(403).json({
+    const store = readRbacStore();
+    const strictPortal = store.security_settings.enforce_strict_role_portal;
+
+    const lockout = checkLoginLockout(emailInput);
+    if (lockout.locked) {
+      recordRbacAuditLog({
+        actor_user_id: null,
+        actor_name: fullNameInput || emailInput,
+        actor_role: expectedRole || 'UNKNOWN',
+        target_label: emailInput,
+        action: 'LOGIN_LOCKED_OUT',
+        category: 'SECURITY',
+        details: `Blocked login attempt while account locked (${lockout.retryAfterMinutes} min remaining).`,
+        severity: 'warning',
+      });
+      res.status(429).json({
         status: 'error',
-        message: `Only the sole system administrator (${SINGLE_ADMIN_NAME} · ${SINGLE_ADMIN_EMAIL}) can sign in as Admin.`,
+        message: `Too many failed sign-in attempts. Please wait ${lockout.retryAfterMinutes} minute(s) before retrying.`,
       });
       return;
     }
 
-    // 0. Check if patient used Forgot Password override
-    const pwOverrides = readPatientPasswordOverrides();
-    if (pwOverrides[emailInput]) {
-      if (expectedRole && expectedRole !== 'PATIENT') {
+    // Never permit legacy fake admin emails
+    if (isDisallowedLegacyFakeAdmin(emailInput, fullNameInput)) {
+      res.status(403).json({
+        status: 'error',
+        message: `Restricted system administrator account (${SINGLE_ADMIN_EMAIL}) required for Admin access.`,
+      });
+      return;
+    }
+
+    const finalizeAndRespond = (rawUser: AuthUser): boolean => {
+      const hydrated = hydrateAuthUserFromStore(rawUser);
+      if (!hydrated.user) {
+        const blockedStatus = hydrated.blockedStatus || 'INACTIVE';
+        recordRbacAuditLog({
+          actor_user_id: rawUser.user_id,
+          actor_name: rawUser.full_name,
+          actor_role: rawUser.role,
+          target_label: rawUser.email,
+          action: 'LOGIN_BLOCKED_STATUS',
+          category: 'SECURITY',
+          new_value: blockedStatus,
+          details: `Denied login for ${rawUser.email}: account status is ${blockedStatus}.`,
+          severity: 'warning',
+        });
         res.status(403).json({
           status: 'error',
-          message: `This account is registered as Patient. Please select the Patient Portal to sign in.`,
+          message: `This account is currently ${blockedStatus.toLowerCase()}. Please contact the Super Admin.`,
         });
+        return true;
+      }
+
+      if (strictPortal && expectedRole && hydrated.user.role !== expectedRole) {
+        res.status(403).json({
+          status: 'error',
+          message: `This account is registered as ${ROLE_LABELS[hydrated.user.role]}. Please go back and select ${ROLE_LABELS[hydrated.user.role]} to sign in.`,
+        });
+        return true;
+      }
+
+      clearFailedLoginAttempts(emailInput);
+      recordRbacAuditLog({
+        actor_user_id: hydrated.user.user_id,
+        actor_name: hydrated.user.full_name,
+        actor_role: hydrated.user.role,
+        target_label: hydrated.user.email,
+        action: 'LOGIN_SUCCESS',
+        category: 'AUTH',
+        details: `Signed in via ${hydrated.user.auth_mode || 'system'} portal.`,
+        severity: 'info',
+      });
+
+      const token = signSession(hydrated.user);
+      setSessionCookie(req, res, token);
+      res.json({ status: 'success', user: hydrated.user, token });
+      return true;
+    };
+
+    const failLogin = (statusCode: number, message: string) => {
+      const failure = recordFailedLoginAttempt(emailInput);
+      recordRbacAuditLog({
+        actor_user_id: null,
+        actor_name: fullNameInput || emailInput,
+        actor_role: expectedRole || 'UNKNOWN',
+        target_label: emailInput,
+        action: 'LOGIN_FAILED',
+        category: 'SECURITY',
+        details: `${message}${failure.lockedNow ? ' (Account locked out)' : ''}`,
+        severity: failure.lockedNow ? 'critical' : 'warning',
+      });
+      res.status(statusCode).json({
+        status: 'error',
+        message: failure.lockedNow
+          ? `Too many failed attempts. Account temporarily locked for ${store.security_settings.lockout_minutes} minutes.`
+          : message,
+      });
+    };
+
+    // 0A. Immutable Super Admin login (Karan Tulsani)
+    if (
+      emailInput === SUPER_ADMIN_EMAIL.toLowerCase() ||
+      emailInput === SUPER_ADMIN_USERNAME.toLowerCase()
+    ) {
+      if (!doesLoginNameMatch(fullNameInput, SUPER_ADMIN_NAME, 'SUPER_ADMIN')) {
+        failLogin(401, 'Entered full name does not match the registered Super Admin.');
         return;
       }
+      if (!verifyPasswordScrypt(password, store.super_admin_password_hash)) {
+        failLogin(401, 'Invalid full name, email ID, or password.');
+        return;
+      }
+      finalizeAndRespond({
+        user_id: SUPER_ADMIN_USER_ID,
+        username: SUPER_ADMIN_USERNAME,
+        email: SUPER_ADMIN_EMAIL,
+        full_name: SUPER_ADMIN_NAME,
+        role: 'SUPER_ADMIN',
+        roles: ['SUPER_ADMIN'],
+        status: 'ACTIVE',
+        permissions: [...ALL_CANONICAL_PERMISSIONS],
+        auth_mode: 'system',
+      });
+      return;
+    }
+
+    // 0B. Managed Staff Accounts created by Super Admin / Admin in RBAC Store
+    const managedMatch = store.managed_users.find(
+      (m) => m.email.toLowerCase() === emailInput || m.username.toLowerCase() === emailInput,
+    );
+    if (managedMatch) {
+      if (!doesLoginNameMatch(fullNameInput, managedMatch.full_name, managedMatch.role)) {
+        failLogin(401, 'Entered full name does not match the registered account.');
+        return;
+      }
+      const pwHash = store.password_overrides[managedMatch.email.toLowerCase()] || managedMatch.password_hash;
+      if (!verifyPasswordScrypt(password, pwHash)) {
+        failLogin(401, 'Invalid full name, email ID, or password.');
+        return;
+      }
+      let doctorId = managedMatch.doctor_id ?? null;
+      let departmentId: number | null = null;
+      let departmentName: string | null = null;
+      let specialization: string | null = null;
+      if (managedMatch.role === 'DOCTOR') {
+        try {
+          const [doctors, departments] = await Promise.all([
+            fetchOrdsItems<Doctor>('doctors'),
+            fetchOrdsItems<Department>('departments/'),
+          ]);
+          const doc =
+            (doctorId ? doctors.find((d) => d.doctor_id === doctorId) : undefined) ||
+            doctors.find((d) =>
+              doesLoginNameMatch(
+                managedMatch.full_name,
+                `Dr. ${d.first_name} ${d.last_name}`,
+                'DOCTOR',
+              ),
+            );
+          if (doc) {
+            doctorId = doc.doctor_id;
+            departmentId = doc.department_id;
+            specialization = doc.specialization ?? null;
+            departmentName =
+              departments.find((dp) => dp.department_id === doc.department_id)?.department_name ?? null;
+          }
+        } catch {
+          // Non-fatal
+        }
+      }
+      finalizeAndRespond({
+        user_id: managedMatch.user_id,
+        username: managedMatch.username,
+        email: managedMatch.email,
+        full_name: managedMatch.full_name,
+        phone_number: managedMatch.phone_number ?? null,
+        role: managedMatch.role,
+        roles: [managedMatch.role],
+        permissions: computeEffectivePermissions(managedMatch.role, store.role_matrix),
+        doctor_id: doctorId,
+        patient_id: managedMatch.patient_id ?? null,
+        department_id: departmentId,
+        department_name: departmentName,
+        specialization,
+        auth_mode: 'managed',
+      });
+      return;
+    }
+
+    // 0C. Password overrides (Super Admin resets + Patient Forgot Password)
+    const pwOverrides = { ...readPatientPasswordOverrides(), ...store.password_overrides };
+    if (pwOverrides[emailInput]) {
       if (!verifyPasswordScrypt(password, pwOverrides[emailInput])) {
-        res.status(401).json({
-          status: 'error',
-          message: 'Invalid full name, email ID, or password.',
-        });
+        failLogin(401, 'Invalid full name, email ID, or password.');
         return;
       }
       try {
-        const [patients, users] = await Promise.all([
+        const [patients, users, doctors, departments] = await Promise.all([
           fetchOrdsItems<Patient>('patients').catch(() => [] as Patient[]),
           fetchOrdsItems<UserAccount>('users').catch(() => [] as UserAccount[]),
+          fetchOrdsItems<Doctor>('doctors').catch(() => [] as Doctor[]),
+          fetchOrdsItems<Department>('departments/').catch(() => [] as Department[]),
         ]);
+        const directory = buildUnifiedUsersDirectory(users, BRIDGE_ACCOUNTS, doctors);
+        const dirMatch = directory.find((u) => u.email.toLowerCase() === emailInput);
         const pat = patients.find((p) => (p.email || '').trim().toLowerCase() === emailInput);
-        const linkedUser = users.find(
-          (u) => (u.email || '').trim().toLowerCase() === emailInput && u.role_name === 'PATIENT',
-        );
-        const resolvedName = linkedUser?.full_name || (pat ? `${pat.first_name} ${pat.last_name}` : '');
-        if (!resolvedName || !doesLoginNameMatch(fullNameInput, resolvedName, 'PATIENT')) {
-          res.status(401).json({
-            status: 'error',
-            message: 'Entered name does not match the patient registered for this email ID.',
-          });
+        const resolvedRole: RoleName = dirMatch?.role || 'PATIENT';
+        const resolvedName =
+          dirMatch?.full_name || (pat ? `${pat.first_name} ${pat.last_name}` : '');
+        if (!resolvedName || !doesLoginNameMatch(fullNameInput, resolvedName, resolvedRole)) {
+          failLogin(401, 'Entered name does not match the account registered for this email ID.');
           return;
         }
-        const user: AuthUser = {
-          user_id: linkedUser?.user_id ?? (pat ? 2000 + pat.patient_id : Date.now()),
-          username: linkedUser?.username || emailInput,
+        let docId = dirMatch?.doctor_id ?? null;
+        let deptId: number | null = null;
+        let deptName: string | null = null;
+        let spec: string | null = null;
+        if (resolvedRole === 'DOCTOR' && docId) {
+          const d = doctors.find((item) => item.doctor_id === docId);
+          if (d) {
+            deptId = d.department_id;
+            spec = d.specialization ?? null;
+            deptName = departments.find((dp) => dp.department_id === d.department_id)?.department_name ?? null;
+          }
+        }
+        finalizeAndRespond({
+          user_id: dirMatch?.user_id ?? (pat ? 2000 + pat.patient_id : Date.now()),
+          username: dirMatch?.username || emailInput,
           email: emailInput,
           full_name: resolvedName,
-          role: 'PATIENT',
-          roles: ['PATIENT'],
-          permissions: ROLE_DEFAULT_PERMISSIONS.PATIENT,
-          patient_id: pat?.patient_id ?? linkedUser?.patient_id ?? null,
-          doctor_id: null,
+          role: resolvedRole,
+          roles: [resolvedRole],
+          permissions: [],
+          patient_id: dirMatch?.patient_id ?? pat?.patient_id ?? null,
+          doctor_id: docId,
+          department_id: deptId,
+          department_name: deptName,
+          specialization: spec,
           auth_mode: 'ords',
-        };
-        const token = signSession(user);
-        setSessionCookie(req, res, token);
-        res.json({ status: 'success', user, token });
+        });
         return;
       } catch {
         // Fall through if lookup fails
@@ -865,30 +1174,25 @@ async function startServer() {
       if (ordsAuth.status === 'success' && ordsAuth.user) {
         const candidate: AuthUser = {
           ...ordsAuth.user,
-          permissions:
-            ordsAuth.user.role === 'ADMIN'
-              ? ROLE_DEFAULT_PERMISSIONS.ADMIN
-              : ordsAuth.user.permissions,
           auth_mode: 'ords',
         };
 
-        if (candidate.role === 'ADMIN' && !isSingleAdminUser(candidate)) {
+        const resolvedViaOverride = Boolean(
+          store.user_role_overrides[normalizeUserKey(candidate.email, candidate.user_id)],
+        );
+        if (candidate.role === 'ADMIN' && !isSingleAdminUser(candidate) && !resolvedViaOverride) {
           res.status(403).json({
             status: 'error',
-            message: `Only ${SINGLE_ADMIN_NAME} (${SINGLE_ADMIN_EMAIL}) is authorized as System Administrator.`,
+            message: `Unrecognized Administrator account. Only authorized Hospital Admins may sign in.`,
           });
           return;
         }
 
         if (!doesLoginNameMatch(fullNameInput, candidate.full_name, candidate.role)) {
-          res.status(401).json({
-            status: 'error',
-            message: 'Entered name does not match the account registered for this email ID.',
-          });
+          failLogin(401, 'Entered name does not match the account registered for this email ID.');
           return;
         }
 
-        // Enrich or resolve doctor_id / patient_id carefully without overwriting a valid linked ID
         if (candidate.role === 'DOCTOR') {
           try {
             const [doctors, departments] = await Promise.all([
@@ -937,22 +1241,11 @@ async function startServer() {
           }
         }
 
-        if (expectedRole && candidate.role !== expectedRole) {
-          res.status(403).json({
-            status: 'error',
-            message: `This account is registered as ${ROLE_LABELS[candidate.role]}. Please go back and select ${ROLE_LABELS[candidate.role]} to sign in.`,
-          });
-          return;
-        }
-
-        const token = signSession(candidate);
-        setSessionCookie(req, res, token);
-        res.json({ status: 'success', user: candidate, token });
+        finalizeAndRespond(candidate);
         return;
       }
       if (ordsAuth.status === 'error') {
         const msg = (ordsAuth.message || '').toLowerCase();
-        // Allow bridge check if ORDS does not yet have script 07 users (e.g. girishramachandra12dr@gmail.com)
         if (
           msg.includes('invalid email') ||
           msg.includes('no account found') ||
@@ -960,10 +1253,7 @@ async function startServer() {
         ) {
           ordsUnavailableOrNotFound = true;
         } else {
-          res.status(401).json({
-            status: 'error',
-            message: ordsAuth.message || 'Invalid credentials',
-          });
+          failLogin(401, ordsAuth.message || 'Invalid credentials');
           return;
         }
       }
@@ -972,12 +1262,12 @@ async function startServer() {
       if (!statusCode || statusCode === 404 || statusCode === 405) {
         ordsUnavailableOrNotFound = true;
       } else {
-        res.status(401).json({ status: 'error', message: (err as Error).message });
+        failLogin(401, (err as Error).message);
         return;
       }
     }
 
-    // 2. Fallback / pre-Script-07 identity resolution tied to real Oracle records
+    // 2. Fallback / Bridge identity resolution tied to real Oracle records
     let matched = BRIDGE_ACCOUNTS.find(
       (acct) =>
         (acct.email.toLowerCase() === emailInput || acct.username.toLowerCase() === emailInput) &&
@@ -995,7 +1285,6 @@ async function startServer() {
           fetchOrdsItems<Patient>('patients'),
         ]);
 
-        // Match real Oracle doctor by full name + <first>.<last>@hospital.com (or Doctor@123)
         if (password === (process.env.DEMO_DOCTOR_PASSWORD || 'Doctor@123')) {
           resolvedDoctor = doctors.find((d) => {
             const docFull = `Dr. ${d.first_name} ${d.last_name}`;
@@ -1019,7 +1308,6 @@ async function startServer() {
           }
         }
 
-        // Match real Oracle patient by their registered email + full name
         if (!matched && password === (process.env.DEMO_PATIENT_PASSWORD || 'Patient@123')) {
           resolvedPatient = patients.find((p) => {
             const pEmail = (p.email || '').trim().toLowerCase();
@@ -1044,10 +1332,7 @@ async function startServer() {
     }
 
     if (!matched) {
-      res.status(401).json({
-        status: 'error',
-        message: 'Invalid full name, email ID, or password.',
-      });
+      failLogin(401, 'Invalid full name, email ID, or password.');
       return;
     }
 
@@ -1100,7 +1385,7 @@ async function startServer() {
       full_name: fullName,
       role: matched.role,
       roles: [matched.role],
-      permissions: ROLE_DEFAULT_PERMISSIONS[matched.role],
+      permissions: computeEffectivePermissions(matched.role, store.role_matrix),
       doctor_id: doctorId,
       patient_id: patientId,
       department_id: departmentId,
@@ -1112,44 +1397,49 @@ async function startServer() {
     if (user.role === 'ADMIN' && !isSingleAdminUser(user)) {
       res.status(403).json({
         status: 'error',
-        message: `Only ${SINGLE_ADMIN_NAME} (${SINGLE_ADMIN_EMAIL}) is authorized as Admin.`,
+        message: `Unrecognized Administrator account. Only authorized Hospital Admins may sign in.`,
       });
       return;
     }
 
-    if (expectedRole && user.role !== expectedRole) {
-      res.status(403).json({
-        status: 'error',
-        message: `This account is registered as ${ROLE_LABELS[user.role]}. Please go back and select ${ROLE_LABELS[user.role]} to sign in.`,
-      });
-      return;
-    }
-
-    const token = signSession(user);
-    setSessionCookie(req, res, token);
-    res.json({ status: 'success', user, token });
+    finalizeAndRespond(user);
   });
 
   app.post('/api/auth/register', async (req, res) => {
+    const store = readRbacStore();
+    if (!store.security_settings.allow_patient_registration) {
+      res.status(403).json({
+        status: 'error',
+        message: 'Public patient registration is currently disabled by Security Settings.',
+      });
+      return;
+    }
+
+    const minLen = Math.max(6, Number(store.security_settings.min_password_length || 6));
     const first_name = String(req.body?.first_name || '').trim();
     const last_name = String(req.body?.last_name || '').trim();
     const phone_number = String(req.body?.phone_number || '').trim();
     const email = String(req.body?.email || '').trim();
+    const city = normalizeRegionText(req.body?.city);
+    const locality = normalizeRegionText(req.body?.locality);
     const date_of_birth = String(req.body?.date_of_birth || '').trim();
     const gender = String(req.body?.gender || '').trim().toUpperCase();
     const blood_group = String(req.body?.blood_group || '').trim();
     const password = String(req.body?.password || '');
 
-    if (!first_name || !last_name || !phone_number || !email || !password) {
+    if (!first_name || !last_name || !phone_number || !email || !city || !locality || !password) {
       res.status(400).json({
         status: 'error',
-        message: 'First name, last name, phone number, email, and password are required',
+        message: 'First name, last name, phone number, email, city, locality, and password are required',
       });
       return;
     }
 
-    if (password.length < 6) {
-      res.status(400).json({ status: 'error', message: 'Password must be at least 6 characters' });
+    if (password.length < minLen) {
+      res.status(400).json({
+        status: 'error',
+        message: `Password must be at least ${minLen} characters`,
+      });
       return;
     }
 
@@ -1158,7 +1448,30 @@ async function startServer() {
       return;
     }
 
-    // 1. Prefer ORDS /auth/register once deployed in Phase 5
+    const finishRegister = (rawUser: AuthUser, statusCode: number, message?: string) => {
+      const hydrated = hydrateAuthUserFromStore(rawUser).user || rawUser;
+      recordRbacAuditLog({
+        actor_user_id: hydrated.user_id,
+        actor_name: hydrated.full_name,
+        actor_role: 'PATIENT',
+        target_user_id: hydrated.user_id,
+        target_label: hydrated.email,
+        action: 'USER_REGISTERED',
+        category: 'AUTH',
+        new_value: 'PATIENT:ACTIVE',
+        details: `Self-registered patient account (${city}, ${locality}).`,
+        severity: 'info',
+      });
+      const token = signSession(hydrated);
+      setSessionCookie(req, res, token);
+      res.status(statusCode).json({
+        status: 'success',
+        ...(message ? { message } : {}),
+        user: hydrated,
+        token,
+      });
+    };
+
     try {
       const ordsReg = await fetchOrdsJson<{ status?: string; message?: string; user?: AuthUser }>(
         'auth/register',
@@ -1169,6 +1482,8 @@ async function startServer() {
             last_name,
             phone_number,
             email,
+            city,
+            locality,
             date_of_birth: date_of_birth || null,
             gender: gender || null,
             blood_group: blood_group || null,
@@ -1178,9 +1493,18 @@ async function startServer() {
       );
       if (ordsReg.status === 'success' && ordsReg.user) {
         const user: AuthUser = { ...ordsReg.user, auth_mode: 'ords' };
-        const token = signSession(user);
-        setSessionCookie(req, res, token);
-        res.status(201).json({ status: 'success', user, token });
+        let resolvedPatientId = user.patient_id ?? null;
+        if (!resolvedPatientId) {
+          const matches = await fetchOrdsItems<Patient>(
+            `patients?phone=${encodeURIComponent(phone_number)}`,
+          ).catch(() => [] as Patient[]);
+          resolvedPatientId = matches[0]?.patient_id ?? null;
+          if (resolvedPatientId) user.patient_id = resolvedPatientId;
+        }
+        if (resolvedPatientId) {
+          savePatientRegion(resolvedPatientId, city, locality);
+        }
+        finishRegister(user, 201);
         return;
       }
       if (ordsReg.status === 'error') {
@@ -1195,7 +1519,6 @@ async function startServer() {
       }
     }
 
-    // 2. Fallback: write directly to Oracle GIRISH_PATIENTS via existing live ORDS POST /patients
     try {
       const createRes = await fetchOrdsJson<{ status?: string; message?: string }>('patients', {
         method: 'POST',
@@ -1222,6 +1545,9 @@ async function startServer() {
         `patients?phone=${encodeURIComponent(phone_number)}`,
       );
       const created = matches[0];
+      if (created?.patient_id) {
+        savePatientRegion(created.patient_id, city, locality);
+      }
 
       const user: AuthUser = {
         user_id: created?.patient_id ? 2000 + created.patient_id : Date.now(),
@@ -1231,20 +1557,13 @@ async function startServer() {
         phone_number,
         role: 'PATIENT',
         roles: ['PATIENT'],
-        permissions: ROLE_DEFAULT_PERMISSIONS.PATIENT,
+        permissions: computeEffectivePermissions('PATIENT', store.role_matrix),
         patient_id: created?.patient_id ?? null,
         doctor_id: null,
         auth_mode: 'bridge',
       };
 
-      const token = signSession(user);
-      setSessionCookie(req, res, token);
-      res.status(201).json({
-        status: 'success',
-        message: 'Patient registered in Oracle database',
-        user,
-        token,
-      });
+      finishRegister(user, 201, 'Patient registered in Oracle database');
     } catch (err) {
       res.status(502).json({
         status: 'error',
@@ -1254,21 +1573,41 @@ async function startServer() {
   });
 
   app.get('/api/auth/me', (req, res) => {
-    const user = verifySession(getRequestToken(req));
-    if (!user) {
+    const rawUser = verifySession(getRequestToken(req));
+    if (!rawUser) {
       res.json({ status: 'unauthenticated', user: null });
       return;
     }
-    res.json({ status: 'success', user });
+    const hydrated = hydrateAuthUserFromStore(rawUser);
+    if (!hydrated.user) {
+      clearSessionCookie(req, res);
+      res.json({ status: 'unauthenticated', user: null });
+      return;
+    }
+    res.json({ status: 'success', user: hydrated.user });
   });
 
   app.post('/api/auth/logout', (req, res) => {
+    const rawUser = verifySession(getRequestToken(req));
+    if (rawUser) {
+      recordRbacAuditLog({
+        actor_user_id: rawUser.user_id,
+        actor_name: rawUser.full_name,
+        actor_role: rawUser.role,
+        target_label: rawUser.email,
+        action: 'LOGOUT',
+        category: 'AUTH',
+        details: 'User signed out cleanly.',
+        severity: 'info',
+      });
+    }
     clearSessionCookie(req, res);
     res.json({ status: 'success', message: 'Signed out' });
   });
 
   app.get('/api/dashboard/summary', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(user, res, 'DASHBOARD:VIEW', 'Dashboard Summary')) return;
 
     try {
       const [
@@ -1324,7 +1663,9 @@ async function startServer() {
 
       let scopedAppointments = enrichedAppointments;
       let scopedSlots = enrichedSlots;
-      let scopedPayments = payments;
+      let scopedPayments = hasEffectivePermission(user.permissions, user.role, 'PAYMENTS:VIEW')
+        ? payments
+        : [];
       let scopedTokens = tokenQueue;
       let scopedUtilisation = utilisation;
       let patientProfile: Patient | null = null;
@@ -1342,12 +1683,12 @@ async function startServer() {
         scopedPatientCount = 1;
         scopedAppointments = enrichedAppointments.filter((a) => a.patient_id === user.patient_id);
         const apptIds = new Set(scopedAppointments.map((a) => a.appointment_id));
-        scopedPayments = payments.filter((p) => apptIds.has(p.appointment_id));
+        scopedPayments = scopedPayments.filter((p) => apptIds.has(p.appointment_id));
         scopedTokens = tokenQueue.filter((t) => apptIds.has(t.appointment_id));
         scopedSlots = enrichedSlots.filter((s) => s.status === 'AVAILABLE').slice(0, 12);
 
         if (user.patient_id) {
-          const allPatients = await fetchOrdsItems<Patient>('patients');
+          const allPatients = attachRegionsToPatients(await fetchOrdsItems<Patient>('patients'));
           patientProfile = allPatients.find((p) => p.patient_id === user.patient_id) || null;
         }
       } else if (user.role === 'DOCTOR') {
@@ -1395,7 +1736,6 @@ async function startServer() {
           );
         }
       } else {
-        // ADMIN & RECEPTIONIST
         allDoctorShifts = doctors.map((d) =>
           resolveDoctorShift(
             d.doctor_id,
@@ -1429,7 +1769,7 @@ async function startServer() {
       const referenceSlots = slotsToday.length > 0 ? slotsToday : scopedSlots;
 
       let pendingApprovalsCount: number | null = null;
-      if (isSingleAdminUser(user)) {
+      if (isHospitalAdminOrSuper(user) || hasEffectivePermission(user.permissions, user.role, 'SLOTS:UPDATE')) {
         const pendingShiftReqs = shiftStore.change_requests.filter(
           (r) => r.status === 'PENDING',
         ).length;
@@ -1498,13 +1838,161 @@ async function startServer() {
     }
   });
 
+  app.get('/api/analytics', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    const analyticsPermissions = [
+      'REVENUE_ANALYTICS:VIEW',
+      'DOCTOR_ANALYTICS:VIEW',
+      'DEPARTMENT_ANALYTICS:VIEW',
+      'GEOGRAPHIC_ANALYTICS:VIEW',
+    ];
+    if (!requireAnyPermission(user, res, analyticsPermissions, 'Analytics & Insights')) {
+      return;
+    }
+
+    const allowedSections = {
+      revenue: hasEffectivePermission(user.permissions, user.role, 'REVENUE_ANALYTICS:VIEW'),
+      doctor: hasEffectivePermission(user.permissions, user.role, 'DOCTOR_ANALYTICS:VIEW'),
+      department: hasEffectivePermission(user.permissions, user.role, 'DEPARTMENT_ANALYTICS:VIEW'),
+      geographic: hasEffectivePermission(user.permissions, user.role, 'GEOGRAPHIC_ANALYTICS:VIEW'),
+      export_revenue: hasEffectivePermission(user.permissions, user.role, 'REVENUE_ANALYTICS:EXPORT'),
+      export_doctor: hasEffectivePermission(user.permissions, user.role, 'DOCTOR_ANALYTICS:EXPORT'),
+      export_department: hasEffectivePermission(user.permissions, user.role, 'DEPARTMENT_ANALYTICS:EXPORT'),
+      export_geographic: hasEffectivePermission(user.permissions, user.role, 'GEOGRAPHIC_ANALYTICS:EXPORT'),
+    };
+
+    try {
+      const [departments, doctors, rawPatients, rawAppointments, rawSlots, templates, payments] =
+        await Promise.all([
+          fetchOrdsItems<Department>('departments/'),
+          fetchOrdsItems<Doctor>('doctors'),
+          fetchOrdsItems<Patient>('patients'),
+          fetchOrdsItems<Appointment>('appointments'),
+          fetchOrdsItems<Slot>('slots'),
+          fetchOrdsItems<SlotTemplate>('slot_templates'),
+          fetchOrdsItems<Payment>('payments'),
+        ]);
+
+      const activeDeptIds = new Set(departments.map((d) => d.department_id));
+      const missingDeptIds = Array.from(
+        new Set(doctors.map((d) => d.department_id).filter((id) => !activeDeptIds.has(id))),
+      );
+      const extraDepts = (
+        await Promise.all(
+          missingDeptIds.map((id) =>
+            fetchOrdsItems<Department>(`departments/${id}`)
+              .then((items) => items[0] ?? null)
+              .catch(() => null),
+          ),
+        )
+      ).filter((d): d is Department => Boolean(d));
+      const allDepartments = [...departments, ...extraDepts];
+
+      const shiftStore = readShiftStore();
+      const rawSlotsWithDoctors = attachDoctorIdsToSlots(rawSlots, templates, shiftStore);
+      const joinedSlots = enrichSlots(rawSlotsWithDoctors, templates, doctors, allDepartments);
+      const enrichedAppointments = enrichAppointments(rawAppointments, joinedSlots, doctors);
+
+      const patientsWithRegions = attachRegionsToPatients(rawPatients);
+      const patientMap = new Map<number, Patient>(
+        patientsWithRegions.map((p) => [p.patient_id, p]),
+      );
+      const doctorMap = new Map<number, Doctor>(doctors.map((d) => [d.doctor_id, d]));
+      const deptNameMap = new Map<number, string>(
+        allDepartments.map((d) => [d.department_id, d.department_name]),
+      );
+      const paymentByApptId = new Map<number, Payment>();
+      for (const p of payments) {
+        if (p.status === 'SUCCESS') {
+          paymentByApptId.set(p.appointment_id, p);
+        }
+      }
+
+      const historicalRecords = loadOrSeedHistoricalAnalytics(doctors, allDepartments);
+      const liveRecords: AnalyticsVisitRecord[] = enrichedAppointments.map((a) => {
+        const pat = patientMap.get(a.patient_id);
+        const doc = a.doctor_id ? doctorMap.get(a.doctor_id) : undefined;
+        const pay = paymentByApptId.get(a.appointment_id);
+        const visitDate = getIsoDatePart(a.slot_date || a.created_on) || getTodayIsoLocal();
+        const rawMethod = String(pay?.payment_method || '').trim().toUpperCase();
+        const paymentMethod: AnalyticsVisitRecord['payment_method'] = pay
+          ? rawMethod === 'UPI' || rawMethod === 'CARD' || rawMethod === 'CASH' || rawMethod === 'NETBANKING'
+            ? rawMethod
+            : 'CASH'
+          : 'UNPAID';
+        const deptId = a.department_id ?? doc?.department_id ?? 0;
+        const deptName =
+          a.department_name ||
+          (deptId ? deptNameMap.get(deptId) : undefined) ||
+          'General OPD';
+
+        const amount = pay
+          ? Number(pay.amount || 0)
+          : a.status === 'COMPLETED' || a.status === 'CONFIRMED'
+            ? Number(a.consultation_fee || doc?.consultation_fee || 0)
+            : 0;
+
+        return {
+          id: `LIVE-${a.appointment_id}`,
+          source: 'LIVE',
+          visit_date: visitDate,
+          visit_month: visitDate.slice(0, 7),
+          start_time: a.start_time || '09:00',
+          doctor_id: a.doctor_id || doc?.doctor_id || 0,
+          doctor_name: a.doctor_name || (doc ? `Dr. ${doc.first_name} ${doc.last_name}` : `Slot #${a.slot_id}`),
+          department_id: deptId,
+          department_name: deptName,
+          specialization: doc?.specialization || 'General OPD',
+          patient_id: a.patient_id,
+          patient_name: a.patient_name || (pat ? `${pat.first_name} ${pat.last_name}` : `Patient #${a.patient_id}`),
+          patient_gender: (pat?.gender as AnalyticsVisitRecord['patient_gender']) || 'UNKNOWN',
+          patient_age_group: computePatientAgeGroup(pat?.date_of_birth),
+          city: normalizeRegionText(pat?.city) || 'Unspecified',
+          locality: normalizeRegionText(pat?.locality) || 'Unspecified',
+          status: a.status,
+          booking_source: a.booking_source === 'WALK_IN' ? 'WALK_IN' : 'ONLINE',
+          payment_method: allowedSections.revenue ? paymentMethod : 'UNPAID',
+          amount: allowedSections.revenue ? amount : 0,
+        };
+      });
+
+      const sanitizedHistorical = allowedSections.revenue
+        ? historicalRecords
+        : historicalRecords.map((r) => ({ ...r, amount: 0, payment_method: 'UNPAID' as const }));
+
+      const records = [...liveRecords, ...sanitizedHistorical].sort((a, b) =>
+        b.visit_date.localeCompare(a.visit_date),
+      );
+
+      const responsePayload: AnalyticsDatasetResponse = {
+        status: 'success',
+        generated_at: new Date().toISOString(),
+        range_start: '2025-11-01',
+        range_end: '2026-11-16',
+        historical_count: historicalRecords.length,
+        live_count: liveRecords.length,
+        records,
+        allowed_sections: allowedSections,
+      };
+      res.json(responsePayload);
+    } catch (err) {
+      res.status(502).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to compile hospital analytics',
+      });
+    }
+  });
+
   async function buildNotificationsForUser(user: AuthUser): Promise<PortalNotification[]> {
     const shiftStore = readShiftStore();
     const ackKey = `${user.role}:${user.user_id}`;
     const dismissed = new Set(readNotificationAcks()[ackKey] || []);
     const list: PortalNotification[] = [];
 
-    if (isSingleAdminUser(user)) {
+    if (
+      isHospitalAdminOrSuper(user) ||
+      hasEffectivePermission(user.permissions, user.role, 'SLOTS:UPDATE')
+    ) {
       for (const reqItem of shiftStore.change_requests) {
         if (reqItem.status === 'PENDING') {
           const id = `shift-req-${reqItem.request_id}`;
@@ -1729,7 +2217,11 @@ async function startServer() {
       res.json({
         status: 'success',
         shifts,
-        change_requests: isSingleAdminUser(user) ? store.change_requests : [],
+        change_requests:
+          isHospitalAdminOrSuper(user) ||
+          hasEffectivePermission(user.permissions, user.role, 'SLOTS:UPDATE')
+            ? store.change_requests
+            : [],
       });
     } catch (err) {
       res.status(502).json({
@@ -1896,26 +2388,21 @@ async function startServer() {
 
   app.get('/api/admin/shift-change-requests', requireAuth, (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
-    if (!isSingleAdminUser(user)) {
-      res.status(403).json({
-        status: 'error',
-        message: `Restricted to sole system administrator (${SINGLE_ADMIN_NAME})`,
-      });
-      return;
-    }
+    if (!requirePermission(user, res, 'SLOTS:UPDATE', 'Shift Change Requests')) return;
     const store = readShiftStore();
     res.json({ status: 'success', requests: store.change_requests });
   });
 
   app.post('/api/admin/shift-change-requests/:id/decide', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
-    if (!isSingleAdminUser(user)) {
+    if (user.role === 'DOCTOR') {
       res.status(403).json({
         status: 'error',
-        message: `Restricted to sole system administrator (${SINGLE_ADMIN_NAME})`,
+        message: 'Doctors cannot approve or reject their own shift change requests.',
       });
       return;
     }
+    if (!requirePermission(user, res, 'SLOTS:UPDATE', 'Shift Change Decision')) return;
 
     const requestId = req.params.id;
     const decision = String(req.body?.decision || '').trim().toUpperCase();
@@ -1961,7 +2448,7 @@ async function startServer() {
 
       target.status = decision as 'APPROVED' | 'REJECTED';
       target.decided_on = nowIso;
-      target.decided_by = SINGLE_ADMIN_NAME;
+      target.decided_by = user.full_name;
       target.decision_comments = comments;
       writeShiftStore(store);
 
@@ -2257,7 +2744,1058 @@ async function startServer() {
     }
   });
 
-  // Generic authenticated ORDS BFF proxy with server-side RBAC & data isolation
+  // ============================================================================
+  // SUPER ADMIN GOVERNANCE, RBAC MATRIX, OVERRIDES, AUDIT & SECURITY APIs
+  // ============================================================================
+
+  async function loadUnifiedDirectory() {
+    const [ordsUsers, doctors] = await Promise.all([
+      fetchOrdsItems<UserAccount>('users').catch(() => [] as UserAccount[]),
+      fetchOrdsItems<Doctor>('doctors').catch(() => [] as Doctor[]),
+    ]);
+    return buildUnifiedUsersDirectory(ordsUsers, BRIDGE_ACCOUNTS, doctors);
+  }
+
+  app.get('/api/rbac/overview', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requireAnyPermission(user, res, ['USERS:VIEW', 'ROLES:VIEW'], 'RBAC Overview')) return;
+    try {
+      const directory = await loadUnifiedDirectory();
+      const roles = buildRoleDefinitions(directory);
+      const logs = readRbacAuditLogs(300);
+
+      const recentRegistrations = [...directory]
+        .sort((a, b) => (b.created_on || '').localeCompare(a.created_on || ''))
+        .slice(0, 8);
+      const recentPermissionChanges = logs
+        .filter((l) => l.category === 'PERMISSION' || l.category === 'ROLE')
+        .slice(0, 10);
+      const recentSecurityActivities = logs
+        .filter((l) => l.category === 'SECURITY' || l.category === 'AUTH')
+        .slice(0, 10);
+
+      res.json({
+        status: 'success',
+        generated_at: new Date().toISOString(),
+        metrics: {
+          total_users: directory.length,
+          total_admins: directory.filter((u) => u.role === 'ADMIN').length,
+          total_doctors: directory.filter((u) => u.role === 'DOCTOR').length,
+          total_receptionists: directory.filter((u) => u.role === 'RECEPTIONIST').length,
+          total_patients: directory.filter((u) => u.role === 'PATIENT').length,
+          active_accounts: directory.filter((u) => u.status === 'ACTIVE').length,
+          inactive_accounts: directory.filter((u) => u.status === 'INACTIVE').length,
+          suspended_accounts: directory.filter((u) => u.status === 'SUSPENDED').length,
+        },
+        recent_registrations: recentRegistrations,
+        recent_permission_changes: recentPermissionChanges,
+        recent_security_activities: recentSecurityActivities,
+        roles,
+      });
+    } catch (err) {
+      res.status(502).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to load RBAC overview',
+      });
+    }
+  });
+
+  app.get('/api/rbac/users', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(user, res, 'USERS:VIEW', 'User Management Directory')) return;
+    try {
+      const directory = await loadUnifiedDirectory();
+      const roles = buildRoleDefinitions(directory);
+      res.json({ status: 'success', users: directory, roles });
+    } catch (err) {
+      res.status(502).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to load users directory',
+      });
+    }
+  });
+
+  app.post('/api/rbac/users', requireAuth, async (req, res) => {
+    const actor = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(actor, res, 'USERS:CREATE', 'Create Staff Account')) return;
+
+    const fullName = String(req.body?.full_name || '').trim();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const phoneNumber = String(req.body?.phone_number || '').trim() || null;
+    const password = String(req.body?.password || '');
+    const requestedRole = String(req.body?.role_name || '').trim().toUpperCase() as RoleName;
+
+    const store = readRbacStore();
+    const minLen = Math.max(6, Number(store.security_settings.min_password_length || 6));
+
+    if (!fullName || !email || !password || !requestedRole) {
+      res.status(400).json({
+        status: 'error',
+        message: 'Full name, email ID, password, and role are required.',
+      });
+      return;
+    }
+
+    if (requestedRole === 'SUPER_ADMIN') {
+      recordRbacAuditLog({
+        actor_user_id: actor.user_id,
+        actor_name: actor.full_name,
+        actor_role: actor.role,
+        target_label: email,
+        action: 'UNAUTHORIZED_ACCESS',
+        category: 'SECURITY',
+        new_value: 'CREATE:SUPER_ADMIN',
+        details: `Blocked attempt by ${actor.email} to create a second SUPER_ADMIN account.`,
+        severity: 'critical',
+      });
+      res.status(403).json({
+        status: 'error',
+        message: 'Public or secondary Super Admin creation is strictly prohibited.',
+      });
+      return;
+    }
+
+    if (!['ADMIN', 'DOCTOR', 'RECEPTIONIST'].includes(requestedRole)) {
+      res.status(400).json({
+        status: 'error',
+        message: 'Staff creation supports ADMIN, DOCTOR, or RECEPTIONIST roles only.',
+      });
+      return;
+    }
+
+    if (requestedRole === 'ADMIN' && actor.role !== 'SUPER_ADMIN') {
+      recordRbacAuditLog({
+        actor_user_id: actor.user_id,
+        actor_name: actor.full_name,
+        actor_role: actor.role,
+        target_label: email,
+        action: 'UNAUTHORIZED_ACCESS',
+        category: 'SECURITY',
+        new_value: 'CREATE:ADMIN',
+        details: `Blocked non-Super-Admin (${actor.email}) from provisioning an ADMIN account.`,
+        severity: 'warning',
+      });
+      res.status(403).json({
+        status: 'error',
+        message: 'Only the Super Admin can create Administrator accounts.',
+      });
+      return;
+    }
+
+    if (password.length < minLen) {
+      res.status(400).json({
+        status: 'error',
+        message: `Password must be at least ${minLen} characters (per Security Settings).`,
+      });
+      return;
+    }
+
+    try {
+      const directory = await loadUnifiedDirectory();
+      if (directory.some((u) => u.email.toLowerCase() === email)) {
+        res.status(400).json({
+          status: 'error',
+          message: `An account with email ${email} already exists.`,
+        });
+        return;
+      }
+
+      let linkedDoctorId: number | null = req.body?.doctor_id ? Number(req.body.doctor_id) : null;
+
+      // Optional Doctor master creation if department_id supplied
+      if (requestedRole === 'DOCTOR' && !linkedDoctorId && req.body?.department_id) {
+        const cleanName = fullName.replace(/^dr\.?\s*/i, '').trim();
+        const parts = cleanName.split(/\s+/);
+        const firstName = parts[0] || cleanName;
+        const lastName = parts.slice(1).join(' ') || 'Staff';
+        await fetchOrdsJson('doctors', {
+          method: 'POST',
+          body: JSON.stringify({
+            department_id: Number(req.body.department_id),
+            first_name: firstName,
+            last_name: lastName,
+            specialization: String(req.body?.specialization || 'General Medicine').trim(),
+            consultation_fee: Number(req.body?.consultation_fee || 500),
+            tele_consult_flag: req.body?.tele_consult_flag === 'Y' ? 'Y' : 'N',
+            employment_type: req.body?.employment_type === 'PART_TIME' ? 'PART_TIME' : 'FULL_TIME',
+          }),
+        }).catch(() => null);
+
+        const refreshedDocs = await fetchOrdsItems<Doctor>('doctors').catch(() => [] as Doctor[]);
+        const matchedDoc = refreshedDocs
+          .filter(
+            (d) =>
+              d.first_name.trim().toLowerCase() === firstName.toLowerCase() &&
+              d.last_name.trim().toLowerCase() === lastName.toLowerCase(),
+          )
+          .sort((a, b) => b.doctor_id - a.doctor_id)[0];
+        if (matchedDoc) {
+          linkedDoctorId = matchedDoc.doctor_id;
+        }
+      }
+
+      const usernameSlug = email.split('@')[0].replace(/[^a-z0-9._-]/g, '.');
+      const nextId = 5000 + store.managed_users.length + Math.floor(Math.random() * 500);
+      const formattedName =
+        requestedRole === 'DOCTOR' && !/^dr\.?\s/i.test(fullName) ? `Dr. ${fullName}` : fullName;
+
+      store.managed_users.push({
+        user_id: nextId,
+        username: usernameSlug,
+        email,
+        full_name: formattedName,
+        phone_number: phoneNumber,
+        role: requestedRole as Exclude<RoleName, 'SUPER_ADMIN'>,
+        password_hash: hashPasswordScrypt(password),
+        doctor_id: linkedDoctorId,
+        patient_id: null,
+        created_on: new Date().toISOString(),
+      });
+      store.user_statuses[email] = 'ACTIVE';
+      writeRbacStore(store);
+
+      // Sync DOCTOR/RECEPTIONIST to Oracle ORDS users when compatible (non-blocking)
+      if (requestedRole === 'DOCTOR' || requestedRole === 'RECEPTIONIST') {
+        fetchOrdsJson('users', {
+          method: 'POST',
+          body: JSON.stringify({
+            username: `${usernameSlug}.${nextId}`,
+            email,
+            full_name: formattedName,
+            password,
+            role_name: requestedRole,
+            phone_number: phoneNumber || undefined,
+            ...(linkedDoctorId ? { doctor_id: linkedDoctorId } : {}),
+          }),
+        }).catch(() => null);
+      }
+
+      recordRbacAuditLog({
+        actor_user_id: actor.user_id,
+        actor_name: actor.full_name,
+        actor_role: actor.role,
+        target_user_id: nextId,
+        target_label: `${formattedName} (${email})`,
+        action: 'USER_CREATED',
+        category: 'USER',
+        previous_value: null,
+        new_value: `${requestedRole}:ACTIVE`,
+        details: `Provisioned new ${requestedRole} account for ${formattedName}.`,
+        severity: 'info',
+      });
+
+      const refreshed = await loadUnifiedDirectory();
+      const created = findManagedUserRecord(refreshed, email);
+      res.status(201).json({
+        status: 'success',
+        message: `${ROLE_LABELS[requestedRole]} account created for ${formattedName}.`,
+        user: created,
+      });
+    } catch (err) {
+      res.status(502).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to provision account',
+      });
+    }
+  });
+
+  app.patch('/api/rbac/users/:userKey/status', requireAuth, async (req, res) => {
+    const actor = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(actor, res, 'USERS:UPDATE', 'Change Account Status')) return;
+
+    const nextStatus = String(req.body?.status || '').trim().toUpperCase() as AccountStatus;
+    if (!['ACTIVE', 'INACTIVE', 'SUSPENDED'].includes(nextStatus)) {
+      res.status(400).json({ status: 'error', message: 'Status must be ACTIVE, INACTIVE, or SUSPENDED.' });
+      return;
+    }
+
+    const directory = await loadUnifiedDirectory();
+    const target = findManagedUserRecord(directory, req.params.userKey);
+    if (!target) {
+      res.status(404).json({ status: 'error', message: 'User account not found.' });
+      return;
+    }
+
+    const guard = canActorModifyTargetUser(actor, target, 'STATUS');
+    if (!guard.allowed) {
+      recordRbacAuditLog({
+        actor_user_id: actor.user_id,
+        actor_name: actor.full_name,
+        actor_role: actor.role,
+        target_user_id: target.user_id,
+        target_label: `${target.full_name} (${target.email})`,
+        action: 'UNAUTHORIZED_ACCESS',
+        category: 'SECURITY',
+        new_value: `STATUS:${nextStatus}`,
+        details: guard.reason || 'Blocked user status change.',
+        severity: 'critical',
+      });
+      res.status(403).json({ status: 'error', message: guard.reason });
+      return;
+    }
+
+    const store = readRbacStore();
+    const prevStatus = target.status;
+    store.user_statuses[target.user_key] = nextStatus;
+    writeRbacStore(store);
+
+    recordRbacAuditLog({
+      actor_user_id: actor.user_id,
+      actor_name: actor.full_name,
+      actor_role: actor.role,
+      target_user_id: target.user_id,
+      target_label: `${target.full_name} (${target.email})`,
+      action: 'USER_STATUS_CHANGED',
+      category: 'USER',
+      previous_value: prevStatus,
+      new_value: nextStatus,
+      details: `Account status changed from ${prevStatus} to ${nextStatus}.`,
+      severity: nextStatus === 'SUSPENDED' ? 'warning' : 'info',
+    });
+
+    const refreshed = await loadUnifiedDirectory();
+    res.json({
+      status: 'success',
+      message: `${target.full_name} is now ${nextStatus}.`,
+      user: findManagedUserRecord(refreshed, target.user_key),
+    });
+  });
+
+  app.patch('/api/rbac/users/:userKey/role', requireAuth, async (req, res) => {
+    const actor = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(actor, res, 'ROLES:UPDATE', 'Change User Role')) return;
+
+    const nextRole = String(req.body?.role || '').trim().toUpperCase() as RoleName;
+    if (!['SUPER_ADMIN', 'ADMIN', 'DOCTOR', 'RECEPTIONIST', 'PATIENT'].includes(nextRole)) {
+      res.status(400).json({ status: 'error', message: 'Invalid role specified.' });
+      return;
+    }
+
+    const directory = await loadUnifiedDirectory();
+    const target = findManagedUserRecord(directory, req.params.userKey);
+    if (!target) {
+      res.status(404).json({ status: 'error', message: 'User account not found.' });
+      return;
+    }
+
+    const guard = canActorModifyTargetUser(actor, target, 'ROLE', nextRole);
+    if (!guard.allowed) {
+      recordRbacAuditLog({
+        actor_user_id: actor.user_id,
+        actor_name: actor.full_name,
+        actor_role: actor.role,
+        target_user_id: target.user_id,
+        target_label: `${target.full_name} (${target.email})`,
+        action: 'UNAUTHORIZED_ACCESS',
+        category: 'SECURITY',
+        new_value: `ROLE:${nextRole}`,
+        details: guard.reason || 'Blocked role escalation or protected modification.',
+        severity: 'critical',
+      });
+      res.status(403).json({ status: 'error', message: guard.reason });
+      return;
+    }
+
+    const store = readRbacStore();
+    const prevRole = target.role;
+    store.user_role_overrides[target.user_key] = nextRole;
+    const managedIdx = store.managed_users.findIndex(
+      (m) => m.email.toLowerCase() === target.email.toLowerCase(),
+    );
+    if (managedIdx >= 0) {
+      store.managed_users[managedIdx].role = nextRole as Exclude<RoleName, 'SUPER_ADMIN'>;
+    }
+    writeRbacStore(store);
+
+    recordRbacAuditLog({
+      actor_user_id: actor.user_id,
+      actor_name: actor.full_name,
+      actor_role: actor.role,
+      target_user_id: target.user_id,
+      target_label: `${target.full_name} (${target.email})`,
+      action: 'USER_ROLE_CHANGED',
+      category: 'ROLE',
+      previous_value: prevRole,
+      new_value: nextRole,
+      details: `Changed assigned role from ${prevRole} to ${nextRole}.`,
+      severity: 'info',
+    });
+
+    const refreshed = await loadUnifiedDirectory();
+    res.json({
+      status: 'success',
+      message: `${target.full_name} role updated to ${ROLE_LABELS[nextRole]}.`,
+      user: findManagedUserRecord(refreshed, target.user_key),
+    });
+  });
+
+  app.put('/api/rbac/users/:userKey/permissions', requireAuth, async (req, res) => {
+    const actor = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(actor, res, 'PERMISSIONS:UPDATE', 'User Permission Overrides')) return;
+
+    const directory = await loadUnifiedDirectory();
+    const target = findManagedUserRecord(directory, req.params.userKey);
+    if (!target) {
+      res.status(404).json({ status: 'error', message: 'User account not found.' });
+      return;
+    }
+
+    const guard = canActorModifyTargetUser(actor, target, 'PERMISSIONS');
+    if (!guard.allowed) {
+      recordRbacAuditLog({
+        actor_user_id: actor.user_id,
+        actor_name: actor.full_name,
+        actor_role: actor.role,
+        target_user_id: target.user_id,
+        target_label: `${target.full_name} (${target.email})`,
+        action: 'UNAUTHORIZED_ACCESS',
+        category: 'SECURITY',
+        details: guard.reason || 'Blocked user permission override attempt.',
+        severity: 'critical',
+      });
+      res.status(403).json({ status: 'error', message: guard.reason });
+      return;
+    }
+
+    const store = readRbacStore();
+    const roleDefaults = store.role_matrix[target.role] || DEFAULT_ROLE_PERMISSION_MATRIX[target.role];
+    const roleDefaultSet = new Set(roleDefaults);
+
+    let grants: string[] = [];
+    let revokes: string[] = [];
+    if (Array.isArray(req.body?.effective_permissions)) {
+      const desired = new Set<string>(
+        normalizeCanonicalPermissions(req.body.effective_permissions.map(String)),
+      );
+      grants = Array.from(desired).filter((p) => !roleDefaultSet.has(p));
+      revokes = roleDefaults.filter((p) => !desired.has(p));
+    } else {
+      grants = normalizeCanonicalPermissions(
+        Array.isArray(req.body?.grants) ? req.body.grants.map(String) : [],
+      );
+      revokes = normalizeCanonicalPermissions(
+        Array.isArray(req.body?.revokes) ? req.body.revokes.map(String) : [],
+      );
+    }
+
+    const beforeEffective = target.effective_permissions;
+    const afterEffective = computeEffectivePermissions(target.role, store.role_matrix, {
+      grants,
+      revokes,
+    });
+    const diff = diffPermissionSets(beforeEffective, afterEffective);
+
+    if (grants.length === 0 && revokes.length === 0) {
+      delete store.user_overrides[target.user_key];
+    } else {
+      store.user_overrides[target.user_key] = { grants, revokes };
+    }
+    writeRbacStore(store);
+
+    recordRbacAuditLog({
+      actor_user_id: actor.user_id,
+      actor_name: actor.full_name,
+      actor_role: actor.role,
+      target_user_id: target.user_id,
+      target_label: `${target.full_name} (${target.email})`,
+      action: 'USER_PERMISSIONS_UPDATED',
+      category: 'PERMISSION',
+      previous_value: diff.removed.length > 0 ? `-${diff.removed.join(', ')}` : 'No removals',
+      new_value: diff.added.length > 0 ? `+${diff.added.join(', ')}` : 'No additions',
+      details: `Updated overrides for ${target.full_name}: +${diff.added.length} granted, -${diff.removed.length} revoked (Effective: ${afterEffective.length}).`,
+      severity: 'info',
+    });
+
+    const refreshed = await loadUnifiedDirectory();
+    res.json({
+      status: 'success',
+      message: `Saved permission overrides for ${target.full_name}.`,
+      diff,
+      user: findManagedUserRecord(refreshed, target.user_key),
+    });
+  });
+
+  app.post('/api/rbac/users/:userKey/reset-permissions', requireAuth, async (req, res) => {
+    const actor = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(actor, res, 'PERMISSIONS:UPDATE', 'Reset User Permissions')) return;
+
+    const directory = await loadUnifiedDirectory();
+    const target = findManagedUserRecord(directory, req.params.userKey);
+    if (!target) {
+      res.status(404).json({ status: 'error', message: 'User account not found.' });
+      return;
+    }
+
+    const guard = canActorModifyTargetUser(actor, target, 'PERMISSIONS');
+    if (!guard.allowed) {
+      res.status(403).json({ status: 'error', message: guard.reason });
+      return;
+    }
+
+    const store = readRbacStore();
+    delete store.user_overrides[target.user_key];
+    writeRbacStore(store);
+
+    recordRbacAuditLog({
+      actor_user_id: actor.user_id,
+      actor_name: actor.full_name,
+      actor_role: actor.role,
+      target_user_id: target.user_id,
+      target_label: `${target.full_name} (${target.email})`,
+      action: 'USER_PERMISSIONS_RESET',
+      category: 'PERMISSION',
+      previous_value: `+${target.grants.length} / -${target.revokes.length} overrides`,
+      new_value: `Role defaults (${target.role})`,
+      details: `Reset ${target.full_name} permissions back to ${ROLE_LABELS[target.role]} role defaults.`,
+      severity: 'info',
+    });
+
+    const refreshed = await loadUnifiedDirectory();
+    res.json({
+      status: 'success',
+      message: `Reset ${target.full_name} permissions to ${ROLE_LABELS[target.role]} defaults.`,
+      user: findManagedUserRecord(refreshed, target.user_key),
+    });
+  });
+
+  app.post('/api/rbac/users/:userKey/reset-password', requireAuth, async (req, res) => {
+    const actor = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(actor, res, 'USERS:UPDATE', 'Reset User Password')) return;
+
+    const directory = await loadUnifiedDirectory();
+    const target = findManagedUserRecord(directory, req.params.userKey);
+    if (!target) {
+      res.status(404).json({ status: 'error', message: 'User account not found.' });
+      return;
+    }
+
+    const guard = canActorModifyTargetUser(actor, target, 'RESET_PASSWORD');
+    if (!guard.allowed) {
+      res.status(403).json({ status: 'error', message: guard.reason });
+      return;
+    }
+
+    const store = readRbacStore();
+    const minLen = Math.max(6, Number(store.security_settings.min_password_length || 6));
+    const newPassword = String(req.body?.new_password || '');
+    if (newPassword.length < minLen) {
+      res.status(400).json({
+        status: 'error',
+        message: `New password must be at least ${minLen} characters.`,
+      });
+      return;
+    }
+
+    const hashed = hashPasswordScrypt(newPassword);
+    store.password_overrides[target.email.toLowerCase()] = hashed;
+    const managedIdx = store.managed_users.findIndex(
+      (m) => m.email.toLowerCase() === target.email.toLowerCase(),
+    );
+    if (managedIdx >= 0) {
+      store.managed_users[managedIdx].password_hash = hashed;
+    }
+    delete store.login_failures[target.email.toLowerCase()];
+    writeRbacStore(store);
+
+    recordRbacAuditLog({
+      actor_user_id: actor.user_id,
+      actor_name: actor.full_name,
+      actor_role: actor.role,
+      target_user_id: target.user_id,
+      target_label: `${target.full_name} (${target.email})`,
+      action: 'USER_PASSWORD_RESET',
+      category: 'SECURITY',
+      details: `Administrator reset password and cleared login lockout for ${target.email}.`,
+      severity: 'info',
+    });
+
+    res.json({
+      status: 'success',
+      message: `Password updated for ${target.full_name}.`,
+    });
+  });
+
+  app.get('/api/rbac/roles', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requireAnyPermission(user, res, ['ROLES:VIEW', 'PERMISSIONS:VIEW'], 'Role Management')) return;
+    try {
+      const directory = await loadUnifiedDirectory();
+      const roles = buildRoleDefinitions(directory);
+      res.json({
+        status: 'success',
+        roles,
+        modules: RBAC_MODULES,
+        defaults: DEFAULT_ROLE_PERMISSION_MATRIX,
+      });
+    } catch (err) {
+      res.status(502).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to fetch role definitions',
+      });
+    }
+  });
+
+  app.put('/api/rbac/roles/:role/permissions', requireAuth, async (req, res) => {
+    const actor = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(actor, res, 'PERMISSIONS:UPDATE', 'Role Permission Matrix')) return;
+
+    const targetRole = String(req.params.role || '').trim().toUpperCase() as RoleName;
+    if (!['SUPER_ADMIN', 'ADMIN', 'DOCTOR', 'RECEPTIONIST', 'PATIENT'].includes(targetRole)) {
+      res.status(400).json({ status: 'error', message: 'Unknown system role.' });
+      return;
+    }
+
+    if (targetRole === 'SUPER_ADMIN') {
+      res.status(403).json({
+        status: 'error',
+        message: 'SUPER_ADMIN role permissions are immutable and protected.',
+      });
+      return;
+    }
+
+    if (actor.role !== 'SUPER_ADMIN' && (targetRole === actor.role || targetRole === 'ADMIN')) {
+      recordRbacAuditLog({
+        actor_user_id: actor.user_id,
+        actor_name: actor.full_name,
+        actor_role: actor.role,
+        target_label: targetRole,
+        action: 'UNAUTHORIZED_ACCESS',
+        category: 'SECURITY',
+        details: `Blocked ${actor.role} from modifying ${targetRole} role permissions.`,
+        severity: 'critical',
+      });
+      res.status(403).json({
+        status: 'error',
+        message: 'Only the Super Admin can modify Administrator or peer role permissions.',
+      });
+      return;
+    }
+
+    const incoming = Array.isArray(req.body?.permissions)
+      ? normalizeCanonicalPermissions(req.body.permissions)
+      : [];
+    const store = readRbacStore();
+    const before = store.role_matrix[targetRole] || [];
+    const diff = diffPermissionSets(before, incoming);
+
+    store.role_matrix[targetRole] = incoming;
+    writeRbacStore(store);
+
+    recordRbacAuditLog({
+      actor_user_id: actor.user_id,
+      actor_name: actor.full_name,
+      actor_role: actor.role,
+      target_label: `${ROLE_LABELS[targetRole]} (${targetRole})`,
+      action: 'ROLE_PERMISSIONS_UPDATED',
+      category: 'PERMISSION',
+      previous_value: diff.removed.length > 0 ? `-${diff.removed.join(', ')}` : `${before.length} perms`,
+      new_value: diff.added.length > 0 ? `+${diff.added.join(', ')}` : `${incoming.length} perms`,
+      details: `Updated ${targetRole} matrix: +${diff.added.length} added, -${diff.removed.length} removed (${incoming.length} total).`,
+      severity: 'info',
+    });
+
+    const directory = await loadUnifiedDirectory();
+    res.json({
+      status: 'success',
+      message: `Updated ${ROLE_LABELS[targetRole]} role permissions (${incoming.length} active).`,
+      diff,
+      roles: buildRoleDefinitions(directory),
+    });
+  });
+
+  app.post('/api/rbac/roles/:role/reset', requireAuth, async (req, res) => {
+    const actor = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(actor, res, 'PERMISSIONS:UPDATE', 'Reset Role Permissions')) return;
+
+    const targetRole = String(req.params.role || '').trim().toUpperCase() as RoleName;
+    if (targetRole === 'SUPER_ADMIN' || !DEFAULT_ROLE_PERMISSION_MATRIX[targetRole]) {
+      res.status(403).json({ status: 'error', message: 'Cannot reset immutable or unknown role.' });
+      return;
+    }
+    if (actor.role !== 'SUPER_ADMIN') {
+      res.status(403).json({ status: 'error', message: 'Only the Super Admin can reset role permission matrices.' });
+      return;
+    }
+
+    const store = readRbacStore();
+    const before = store.role_matrix[targetRole] || [];
+    const defaults = [...DEFAULT_ROLE_PERMISSION_MATRIX[targetRole]];
+    const diff = diffPermissionSets(before, defaults);
+    store.role_matrix[targetRole] = defaults;
+    writeRbacStore(store);
+
+    recordRbacAuditLog({
+      actor_user_id: actor.user_id,
+      actor_name: actor.full_name,
+      actor_role: actor.role,
+      target_label: `${ROLE_LABELS[targetRole]} (${targetRole})`,
+      action: 'ROLE_PERMISSIONS_RESET',
+      category: 'PERMISSION',
+      previous_value: `${before.length} perms`,
+      new_value: `${defaults.length} default perms`,
+      details: `Reset ${targetRole} permissions to factory defaults (+${diff.added.length}, -${diff.removed.length}).`,
+      severity: 'info',
+    });
+
+    const directory = await loadUnifiedDirectory();
+    res.json({
+      status: 'success',
+      message: `Reset ${ROLE_LABELS[targetRole]} permissions to default baseline.`,
+      roles: buildRoleDefinitions(directory),
+    });
+  });
+
+  app.get('/api/rbac/audit-logs', requireAuth, (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (
+      !requireAnyPermission(
+        user,
+        res,
+        ['SYSTEM_SETTINGS:VIEW', 'USERS:VIEW', 'ROLES:VIEW', 'PERMISSIONS:VIEW'],
+        'RBAC Audit Logs',
+      )
+    ) {
+      return;
+    }
+    const logs = readRbacAuditLogs(500);
+    res.json({ status: 'success', logs });
+  });
+
+  app.get('/api/rbac/security-settings', requireAuth, (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(user, res, 'SYSTEM_SETTINGS:VIEW', 'Security Settings')) return;
+    const store = readRbacStore();
+    res.json({ status: 'success', settings: store.security_settings });
+  });
+
+  app.put('/api/rbac/security-settings', requireAuth, (req, res) => {
+    const actor = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(actor, res, 'SYSTEM_SETTINGS:UPDATE', 'Security Settings')) return;
+
+    const store = readRbacStore();
+    const prev = { ...store.security_settings };
+    const next = {
+      max_failed_login_attempts: Math.max(
+        2,
+        Math.min(20, Number(req.body?.max_failed_login_attempts ?? prev.max_failed_login_attempts)),
+      ),
+      lockout_minutes: Math.max(
+        1,
+        Math.min(120, Number(req.body?.lockout_minutes ?? prev.lockout_minutes)),
+      ),
+      min_password_length: Math.max(
+        6,
+        Math.min(32, Number(req.body?.min_password_length ?? prev.min_password_length)),
+      ),
+      session_ttl_hours: Math.max(
+        1,
+        Math.min(168, Number(req.body?.session_ttl_hours ?? prev.session_ttl_hours)),
+      ),
+      allow_patient_registration:
+        typeof req.body?.allow_patient_registration === 'boolean'
+          ? req.body.allow_patient_registration
+          : prev.allow_patient_registration,
+      enforce_strict_role_portal:
+        typeof req.body?.enforce_strict_role_portal === 'boolean'
+          ? req.body.enforce_strict_role_portal
+          : prev.enforce_strict_role_portal,
+    };
+
+    store.security_settings = next;
+    writeRbacStore(store);
+
+    recordRbacAuditLog({
+      actor_user_id: actor.user_id,
+      actor_name: actor.full_name,
+      actor_role: actor.role,
+      target_label: 'System Security Policy',
+      action: 'SECURITY_SETTINGS_UPDATED',
+      category: 'SECURITY',
+      previous_value: `maxFail=${prev.max_failed_login_attempts}, minPw=${prev.min_password_length}, reg=${prev.allow_patient_registration}`,
+      new_value: `maxFail=${next.max_failed_login_attempts}, minPw=${next.min_password_length}, reg=${next.allow_patient_registration}`,
+      details: `Updated security settings (lockout ${next.lockout_minutes}m, session ${next.session_ttl_hours}h, strictPortal=${next.enforce_strict_role_portal}).`,
+      severity: 'info',
+    });
+
+    res.json({
+      status: 'success',
+      message: 'Security policy settings saved.',
+      settings: next,
+    });
+  });
+
+  // ============================================================================
+  // CLINICAL MODULES: MEDICAL RECORDS & PRESCRIPTIONS (MODULE:ACTION + SCOPING)
+  // ============================================================================
+
+  app.get('/api/clinical/records', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(user, res, 'MEDICAL_RECORDS:VIEW', 'Medical Records')) return;
+    const store = readClinicalStore();
+    let records = store.medical_records;
+    if (user.role === 'PATIENT') {
+      records = records.filter((r) => r.patient_id === user.patient_id);
+    } else if (user.role === 'DOCTOR' && user.doctor_id) {
+      const bookedIds = await getBookedPatientIdsForDoctor(user.doctor_id).catch(
+        () => new Set<number>(),
+      );
+      records = records.filter(
+        (r) => r.doctor_id === user.doctor_id || bookedIds.has(r.patient_id),
+      );
+    }
+    res.json({ status: 'success', records });
+  });
+
+  app.post('/api/clinical/records', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(user, res, 'MEDICAL_RECORDS:CREATE', 'Create Medical Record')) return;
+
+    const patientId = Number(req.body?.patient_id);
+    const patientName = String(req.body?.patient_name || '').trim();
+    const doctorId = Number(req.body?.doctor_id || user.doctor_id || 0);
+    const doctorName = String(req.body?.doctor_name || user.full_name || '').trim();
+    const chiefComplaint = String(req.body?.chief_complaint || '').trim();
+    const diagnosis = String(req.body?.diagnosis || '').trim();
+    const clinicalNotes = String(req.body?.clinical_notes || '').trim();
+
+    if (!patientId || !chiefComplaint || !diagnosis) {
+      res.status(400).json({
+        status: 'error',
+        message: 'Patient, chief complaint, and diagnosis are required.',
+      });
+      return;
+    }
+
+    const store = readClinicalStore();
+    const entry = {
+      record_id: `MR-${Date.now()}`,
+      patient_id: patientId,
+      patient_name: patientName || `Patient #${patientId}`,
+      doctor_id: doctorId,
+      doctor_name: doctorName || `Doctor #${doctorId}`,
+      appointment_ref: String(req.body?.appointment_ref || '').trim() || null,
+      visit_date: String(req.body?.visit_date || getTodayIsoLocal()).slice(0, 10),
+      chief_complaint: chiefComplaint,
+      diagnosis,
+      vitals_summary: String(req.body?.vitals_summary || '').trim() || null,
+      clinical_notes: clinicalNotes || 'Recorded during OPD consultation.',
+      updated_at: new Date().toISOString(),
+    };
+    store.medical_records.unshift(entry);
+    writeClinicalStore(store);
+
+    recordRbacAuditLog({
+      actor_user_id: user.user_id,
+      actor_name: user.full_name,
+      actor_role: user.role,
+      target_label: `${entry.patient_name} (${entry.record_id})`,
+      action: 'MEDICAL_RECORD_CREATED',
+      category: 'CLINICAL',
+      new_value: entry.diagnosis,
+      details: `Added clinical record for ${entry.patient_name}.`,
+      severity: 'info',
+    });
+
+    res.status(201).json({ status: 'success', record: entry });
+  });
+
+  app.put('/api/clinical/records/:id', requireAuth, (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(user, res, 'MEDICAL_RECORDS:UPDATE', 'Update Medical Record')) return;
+    const store = readClinicalStore();
+    const idx = store.medical_records.findIndex((r) => r.record_id === req.params.id);
+    if (idx < 0) {
+      res.status(404).json({ status: 'error', message: 'Medical record not found.' });
+      return;
+    }
+    const current = store.medical_records[idx];
+    if (user.role === 'DOCTOR' && user.doctor_id && current.doctor_id !== user.doctor_id) {
+      res.status(403).json({
+        status: 'error',
+        message: 'Doctors can only modify their own clinical records.',
+      });
+      return;
+    }
+    store.medical_records[idx] = {
+      ...current,
+      chief_complaint: String(req.body?.chief_complaint ?? current.chief_complaint).trim(),
+      diagnosis: String(req.body?.diagnosis ?? current.diagnosis).trim(),
+      vitals_summary: req.body?.vitals_summary !== undefined ? String(req.body.vitals_summary).trim() || null : current.vitals_summary,
+      clinical_notes: String(req.body?.clinical_notes ?? current.clinical_notes).trim(),
+      updated_at: new Date().toISOString(),
+    };
+    writeClinicalStore(store);
+
+    recordRbacAuditLog({
+      actor_user_id: user.user_id,
+      actor_name: user.full_name,
+      actor_role: user.role,
+      target_label: `${current.patient_name} (${current.record_id})`,
+      action: 'MEDICAL_RECORD_UPDATED',
+      category: 'CLINICAL',
+      details: `Updated clinical record ${current.record_id}.`,
+      severity: 'info',
+    });
+
+    res.json({ status: 'success', record: store.medical_records[idx] });
+  });
+
+  app.delete('/api/clinical/records/:id', requireAuth, (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(user, res, 'MEDICAL_RECORDS:DELETE', 'Delete Medical Record')) return;
+    const store = readClinicalStore();
+    const idx = store.medical_records.findIndex((r) => r.record_id === req.params.id);
+    if (idx < 0) {
+      res.status(404).json({ status: 'error', message: 'Medical record not found.' });
+      return;
+    }
+    const [removed] = store.medical_records.splice(idx, 1);
+    writeClinicalStore(store);
+    recordRbacAuditLog({
+      actor_user_id: user.user_id,
+      actor_name: user.full_name,
+      actor_role: user.role,
+      target_label: `${removed.patient_name} (${removed.record_id})`,
+      action: 'MEDICAL_RECORD_DELETED',
+      category: 'CLINICAL',
+      details: `Deleted medical record ${removed.record_id}.`,
+      severity: 'warning',
+    });
+    res.json({ status: 'success', message: 'Medical record deleted.' });
+  });
+
+  app.get('/api/clinical/prescriptions', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(user, res, 'PRESCRIPTIONS:VIEW', 'Prescriptions')) return;
+    const store = readClinicalStore();
+    let prescriptions = store.prescriptions;
+    if (user.role === 'PATIENT') {
+      prescriptions = prescriptions.filter((p) => p.patient_id === user.patient_id);
+    } else if (user.role === 'DOCTOR' && user.doctor_id) {
+      const bookedIds = await getBookedPatientIdsForDoctor(user.doctor_id).catch(
+        () => new Set<number>(),
+      );
+      prescriptions = prescriptions.filter(
+        (p) => p.doctor_id === user.doctor_id || bookedIds.has(p.patient_id),
+      );
+    }
+    res.json({ status: 'success', prescriptions });
+  });
+
+  app.post('/api/clinical/prescriptions', requireAuth, (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(user, res, 'PRESCRIPTIONS:CREATE', 'Create Prescription')) return;
+
+    const patientId = Number(req.body?.patient_id);
+    const patientName = String(req.body?.patient_name || '').trim();
+    const doctorId = Number(req.body?.doctor_id || user.doctor_id || 0);
+    const doctorName = String(req.body?.doctor_name || user.full_name || '').trim();
+    const diagnosis = String(req.body?.diagnosis || '').trim();
+    const medications = Array.isArray(req.body?.medications) ? req.body.medications : [];
+    const instructions = String(req.body?.instructions || '').trim();
+
+    if (!patientId || !diagnosis || medications.length === 0) {
+      res.status(400).json({
+        status: 'error',
+        message: 'Patient, diagnosis, and at least one medication are required.',
+      });
+      return;
+    }
+
+    const store = readClinicalStore();
+    const entry = {
+      prescription_id: `RX-${Date.now()}`,
+      patient_id: patientId,
+      patient_name: patientName || `Patient #${patientId}`,
+      doctor_id: doctorId,
+      doctor_name: doctorName || `Doctor #${doctorId}`,
+      appointment_ref: String(req.body?.appointment_ref || '').trim() || null,
+      prescribed_date: String(req.body?.prescribed_date || getTodayIsoLocal()).slice(0, 10),
+      diagnosis,
+      medications: medications.map((m: Record<string, unknown>) => ({
+        name: String(m.name || '').trim(),
+        dosage: String(m.dosage || '').trim(),
+        frequency: String(m.frequency || '').trim(),
+        duration: String(m.duration || '').trim(),
+      })),
+      instructions: instructions || 'Take medications as directed.',
+      status: 'ACTIVE' as const,
+      updated_at: new Date().toISOString(),
+    };
+    store.prescriptions.unshift(entry);
+    writeClinicalStore(store);
+
+    recordRbacAuditLog({
+      actor_user_id: user.user_id,
+      actor_name: user.full_name,
+      actor_role: user.role,
+      target_label: `${entry.patient_name} (${entry.prescription_id})`,
+      action: 'PRESCRIPTION_CREATED',
+      category: 'CLINICAL',
+      new_value: entry.diagnosis,
+      details: `Issued prescription ${entry.prescription_id} with ${entry.medications.length} medication(s).`,
+      severity: 'info',
+    });
+
+    res.status(201).json({ status: 'success', prescription: entry });
+  });
+
+  app.put('/api/clinical/prescriptions/:id', requireAuth, (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(user, res, 'PRESCRIPTIONS:UPDATE', 'Update Prescription')) return;
+    const store = readClinicalStore();
+    const idx = store.prescriptions.findIndex((p) => p.prescription_id === req.params.id);
+    if (idx < 0) {
+      res.status(404).json({ status: 'error', message: 'Prescription not found.' });
+      return;
+    }
+    const current = store.prescriptions[idx];
+    if (user.role === 'DOCTOR' && user.doctor_id && current.doctor_id !== user.doctor_id) {
+      res.status(403).json({
+        status: 'error',
+        message: 'Doctors can only update prescriptions they issued.',
+      });
+      return;
+    }
+    store.prescriptions[idx] = {
+      ...current,
+      diagnosis: String(req.body?.diagnosis ?? current.diagnosis).trim(),
+      instructions: String(req.body?.instructions ?? current.instructions).trim(),
+      status: req.body?.status === 'COMPLETED' ? 'COMPLETED' : current.status,
+      ...(Array.isArray(req.body?.medications) ? { medications: req.body.medications } : {}),
+      updated_at: new Date().toISOString(),
+    };
+    writeClinicalStore(store);
+    res.json({ status: 'success', prescription: store.prescriptions[idx] });
+  });
+
+  app.delete('/api/clinical/prescriptions/:id', requireAuth, (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(user, res, 'PRESCRIPTIONS:DELETE', 'Delete Prescription')) return;
+    const store = readClinicalStore();
+    const idx = store.prescriptions.findIndex((p) => p.prescription_id === req.params.id);
+    if (idx < 0) {
+      res.status(404).json({ status: 'error', message: 'Prescription not found.' });
+      return;
+    }
+    const [removed] = store.prescriptions.splice(idx, 1);
+    writeClinicalStore(store);
+    recordRbacAuditLog({
+      actor_user_id: user.user_id,
+      actor_name: user.full_name,
+      actor_role: user.role,
+      target_label: `${removed.patient_name} (${removed.prescription_id})`,
+      action: 'PRESCRIPTION_DELETED',
+      category: 'CLINICAL',
+      details: `Deleted prescription ${removed.prescription_id}.`,
+      severity: 'warning',
+    });
+    res.json({ status: 'success', message: 'Prescription deleted.' });
+  });
+
+  // ============================================================================
+  // GENERIC AUTHENTICATED ORDS BFF PROXY WITH DENY-BY-DEFAULT MODULE:ACTION RBAC
+  // ============================================================================
   app.all('/api/ords/*', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
     const subPath = (req.params[0] || '').replace(/^\/+/, '');
@@ -2265,120 +3803,241 @@ async function startServer() {
     const queryString = queryIdx >= 0 ? req.originalUrl.slice(queryIdx) : '';
     const method = req.method.toUpperCase();
 
-    const adminOnlyPrefixes = [
-      'users',
-      'roles',
-      'permissions',
-      'role-permissions',
-      'audit-logs',
-      'audit-config',
-      'error-logs',
-      'approvals',
-    ];
-    if (adminOnlyPrefixes.some((p) => subPath.startsWith(p)) && !isSingleAdminUser(user)) {
-      res.status(403).json({
-        status: 'error',
-        message: `Restricted to sole system administrator (${SINGLE_ADMIN_NAME})`,
-      });
-      return;
-    }
+    const actionForMethod = (m: string): PermissionAction =>
+      m === 'POST' ? 'CREATE' : m === 'PUT' || m === 'PATCH' ? 'UPDATE' : m === 'DELETE' ? 'DELETE' : 'VIEW';
 
-    // Enforce single-admin block & max 2 active receptionists
-    if (subPath === 'users' && method === 'POST') {
-      const requestedRole = String(req.body?.role_name || '').trim().toUpperCase();
-      if (requestedRole === 'ADMIN') {
-        res.status(403).json({
-          status: 'error',
-          message: `Only one system administrator (${SINGLE_ADMIN_NAME} · ${SINGLE_ADMIN_EMAIL}) is permitted.`,
-        });
+    const enforceModulePerm = (mod: ModuleKey, act: PermissionAction, label: string) =>
+      requirePermission(user, res, `${mod}:${act}`, label);
+
+    if (subPath.startsWith('users')) {
+      const needed = method === 'GET' ? 'USERS:VIEW' : method === 'POST' ? 'USERS:CREATE' : 'USERS:UPDATE';
+      if (!requirePermission(user, res, needed, `ORDS ${subPath}`)) return;
+
+      if (subPath === 'users' && method === 'POST') {
+        const requestedRole = String(req.body?.role_name || '').trim().toUpperCase();
+        if (requestedRole === 'SUPER_ADMIN') {
+          res.status(403).json({ status: 'error', message: 'Cannot create SUPER_ADMIN accounts.' });
+          return;
+        }
+        if (requestedRole === 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+          res.status(403).json({ status: 'error', message: 'Only the Super Admin can create Administrator accounts.' });
+          return;
+        }
+      }
+    } else if (subPath.startsWith('roles')) {
+      if (!enforceModulePerm('ROLES', method === 'GET' ? 'VIEW' : 'UPDATE', `ORDS ${subPath}`)) return;
+    } else if (subPath.startsWith('permissions') || subPath.startsWith('role-permissions')) {
+      if (!enforceModulePerm('PERMISSIONS', method === 'GET' ? 'VIEW' : 'UPDATE', `ORDS ${subPath}`)) return;
+    } else if (
+      subPath.startsWith('audit-logs') ||
+      subPath.startsWith('audit-config') ||
+      subPath.startsWith('error-logs')
+    ) {
+      if (
+        !requireAnyPermission(
+          user,
+          res,
+          method === 'GET'
+            ? ['SYSTEM_SETTINGS:VIEW', 'USERS:VIEW', 'ROLES:VIEW', 'PERMISSIONS:VIEW']
+            : ['SYSTEM_SETTINGS:UPDATE'],
+          `ORDS ${subPath}`,
+        )
+      ) {
         return;
       }
-      if (requestedRole === 'RECEPTIONIST') {
-        const existingUsers = await fetchOrdsItems<UserAccount>('users').catch(() => [] as UserAccount[]);
-        const activeReceptionists = existingUsers.filter(
-          (u) =>
-            u.is_active === 'Y' &&
-            u.role_name === 'RECEPTIONIST' &&
-            (u.email || '').trim().toLowerCase() !== 'reception@hospital.com',
-        );
-        if (activeReceptionists.length >= 2) {
-          res.status(400).json({
+    } else if (subPath.startsWith('approvals')) {
+      if (
+        !requireAnyPermission(
+          user,
+          res,
+          method === 'GET' ? ['SLOTS:VIEW', 'SLOTS:UPDATE'] : ['SLOTS:UPDATE'],
+          `ORDS ${subPath}`,
+        )
+      ) {
+        return;
+      }
+    } else if (subPath.startsWith('departments') || subPath.startsWith('consultation-types')) {
+      if (method === 'GET') {
+        if (
+          !requireAnyPermission(
+            user,
+            res,
+            ['DEPARTMENTS:VIEW', 'APPOINTMENTS:CREATE', 'APPOINTMENTS:VIEW', 'SLOTS:VIEW', 'DOCTORS:VIEW'],
+            `ORDS ${subPath}`,
+          )
+        ) {
+          return;
+        }
+      } else {
+        if (!enforceModulePerm('DEPARTMENTS', actionForMethod(method), `ORDS ${subPath}`)) return;
+      }
+    } else if (subPath.startsWith('doctors')) {
+      if (method === 'GET') {
+        if (
+          !requireAnyPermission(
+            user,
+            res,
+            ['DOCTORS:VIEW', 'APPOINTMENTS:CREATE', 'APPOINTMENTS:VIEW', 'SLOTS:VIEW'],
+            `ORDS ${subPath}`,
+          )
+        ) {
+          return;
+        }
+      } else {
+        if (!enforceModulePerm('DOCTORS', actionForMethod(method), `ORDS ${subPath}`)) return;
+      }
+    } else if (subPath.startsWith('slot_templates') || subPath.startsWith('slots')) {
+      if (method === 'GET') {
+        if (
+          !requireAnyPermission(
+            user,
+            res,
+            ['SLOTS:VIEW', 'APPOINTMENTS:CREATE', 'APPOINTMENTS:VIEW'],
+            `ORDS ${subPath}`,
+          )
+        ) {
+          return;
+        }
+      } else {
+        if (!enforceModulePerm('SLOTS', actionForMethod(method), `ORDS ${subPath}`)) return;
+        if (subPath === 'slots/generate') {
+          res.status(403).json({
             status: 'error',
-            message: 'Maximum of 2 active Receptionist accounts reached.',
+            message: 'Bulk slot generation is disabled. Confirm daily slots from your availability calendar.',
           });
           return;
         }
-      }
-    }
-
-    if (
-      (subPath.startsWith('departments') ||
-        subPath.startsWith('doctors') ||
-        subPath.startsWith('consultation-types')) &&
-      method !== 'GET' &&
-      !isSingleAdminUser(user)
-    ) {
-      res.status(403).json({ status: 'error', message: 'Administrator role required to modify hospital master data' });
-      return;
-    }
-
-    if (
-      (subPath.startsWith('slot_templates') || subPath.startsWith('slots')) &&
-      method !== 'GET'
-    ) {
-      if (user.role === 'ADMIN') {
-        res.status(403).json({
-          status: 'error',
-          message: 'Administrators have read-only access to doctor schedules and slots.',
-        });
-        return;
-      }
-      const isDoctor = user.role === 'DOCTOR' && Boolean(user.doctor_id);
-      if (!isDoctor) {
-        res.status(403).json({ status: 'error', message: 'Only the doctor can modify their own daily slots' });
-        return;
-      }
-      if (subPath === 'slots/generate') {
-        res.status(403).json({
-          status: 'error',
-          message: 'Bulk slot generation is disabled. Confirm daily slots from your availability calendar.',
-        });
-        return;
-      }
-      if (subPath === 'slot_templates' && method === 'POST') {
-        res.status(403).json({
-          status: 'error',
-          message: 'Shift changes require administrator approval via Shift Change Request.',
-        });
-        return;
-      } else if (subPath.startsWith('slot_templates/') && method === 'DELETE') {
-        res.status(403).json({
-          status: 'error',
-          message: 'Shift changes require administrator approval via Shift Change Request.',
-        });
-        return;
-      } else if (subPath === 'slots' && method === 'POST') {
-        const tid = Number(req.body?.template_id);
-        const allTmpls = await fetchOrdsItems<SlotTemplate>('slot_templates');
-        const target = allTmpls.find((t) => t.template_id === tid);
-        if (!target || target.doctor_id !== user.doctor_id) {
-          res.status(403).json({ status: 'error', message: 'Doctors can only create slots under their own schedule' });
+        if (subPath === 'slot_templates' && method === 'POST') {
+          res.status(403).json({
+            status: 'error',
+            message: 'Shift changes require administrator approval via Shift Change Request.',
+          });
           return;
         }
+        if (subPath.startsWith('slot_templates/') && method === 'DELETE') {
+          res.status(403).json({
+            status: 'error',
+            message: 'Shift changes require administrator approval via Shift Change Request.',
+          });
+          return;
+        }
+        if (user.role === 'DOCTOR' && subPath === 'slots' && method === 'POST') {
+          const tid = Number(req.body?.template_id);
+          const allTmpls = await fetchOrdsItems<SlotTemplate>('slot_templates');
+          const target = allTmpls.find((t) => t.template_id === tid);
+          if (!target || target.doctor_id !== user.doctor_id) {
+            res.status(403).json({
+              status: 'error',
+              message: 'Doctors can only create slots under their own schedule',
+            });
+            return;
+          }
+        }
       }
-    }
-
-    if (subPath.startsWith('patients') && method !== 'GET' && !['RECEPTIONIST', 'PATIENT'].includes(user.role)) {
-      res.status(403).json({ status: 'error', message: 'Only receptionists or patients themselves can register or edit patient records' });
-      return;
-    }
-
-    if (subPath.startsWith('patients') && method !== 'GET' && user.role === 'PATIENT') {
-      const targetId = Number(subPath.split('/')[1]);
-      if (!targetId || targetId !== user.patient_id) {
-        res.status(403).json({ status: 'error', message: 'Patients can only update their own profile' });
+    } else if (subPath.startsWith('patients')) {
+      if (method === 'GET') {
+        const isOwnPatientLookup =
+          user.role === 'PATIENT' &&
+          Boolean(user.patient_id) &&
+          (subPath === `patients/${user.patient_id}` || subPath === 'patients');
+        if (!isOwnPatientLookup && !enforceModulePerm('PATIENTS', 'VIEW', `ORDS ${subPath}`)) return;
+      } else {
+        const isOwnPatientUpdate =
+          user.role === 'PATIENT' &&
+          Boolean(user.patient_id) &&
+          subPath === `patients/${user.patient_id}` &&
+          method === 'PUT';
+        if (!isOwnPatientUpdate && !enforceModulePerm('PATIENTS', actionForMethod(method), `ORDS ${subPath}`)) {
+          return;
+        }
+        if (user.role === 'PATIENT') {
+          const targetId = Number(subPath.split('/')[1]);
+          if (!targetId || targetId !== user.patient_id) {
+            res.status(403).json({ status: 'error', message: 'Patients can only update their own profile' });
+            return;
+          }
+        }
+      }
+    } else if (subPath.startsWith('payments')) {
+      if (!enforceModulePerm('PAYMENTS', actionForMethod(method), `ORDS ${subPath}`)) return;
+    } else if (subPath.startsWith('token_queue')) {
+      const act = method === 'GET' ? 'VIEW' : method === 'POST' ? 'CREATE' : 'UPDATE';
+      if (
+        !requireAnyPermission(
+          user,
+          res,
+          act === 'VIEW' ? ['TOKEN_QUEUE:VIEW'] : ['TOKEN_QUEUE:CREATE', 'TOKEN_QUEUE:UPDATE'],
+          `ORDS ${subPath}`,
+        )
+      ) {
         return;
       }
+    } else if (subPath.startsWith('appointments')) {
+      if (method === 'GET') {
+        if (!enforceModulePerm('APPOINTMENTS', 'VIEW', `ORDS ${subPath}`)) return;
+      } else if (subPath === 'appointments/' || subPath === 'appointments') {
+        if (!enforceModulePerm('APPOINTMENTS', 'CREATE', `ORDS ${subPath}`)) return;
+      } else if (/^appointments\/\d+\/cancel$/.test(subPath)) {
+        if (
+          !requireAnyPermission(
+            user,
+            res,
+            ['APPOINTMENTS:DELETE', 'APPOINTMENTS:UPDATE'],
+            `ORDS ${subPath}`,
+          )
+        ) {
+          return;
+        }
+      } else if (/^appointments\/\d+\/(confirm|outcome)$/.test(subPath)) {
+        if (!enforceModulePerm('APPOINTMENTS', 'UPDATE', `ORDS ${subPath}`)) return;
+      } else {
+        if (!enforceModulePerm('APPOINTMENTS', actionForMethod(method), `ORDS ${subPath}`)) return;
+      }
+    } else if (subPath.startsWith('leaves')) {
+      if (method === 'GET') {
+        if (!enforceModulePerm('SLOTS', 'VIEW', `ORDS ${subPath}`)) return;
+      } else if (subPath === 'leaves') {
+        if (!requireAnyPermission(user, res, ['SLOTS:CREATE', 'SLOTS:UPDATE'], `ORDS ${subPath}`)) return;
+      } else if (/^leaves\/\d+\/decide$/.test(subPath)) {
+        if (user.role === 'DOCTOR') {
+          res.status(403).json({ status: 'error', message: 'Doctors cannot approve their own leave requests' });
+          return;
+        }
+        if (!enforceModulePerm('SLOTS', 'UPDATE', `ORDS ${subPath}`)) return;
+      } else {
+        if (!enforceModulePerm('SLOTS', actionForMethod(method), `ORDS ${subPath}`)) return;
+      }
+    } else if (subPath.startsWith('reports/')) {
+      if (
+        !requireAnyPermission(
+          user,
+          res,
+          ['DOCTOR_ANALYTICS:VIEW', 'DEPARTMENT_ANALYTICS:VIEW', 'REVENUE_ANALYTICS:VIEW', 'SLOTS:VIEW'],
+          `ORDS ${subPath}`,
+        )
+      ) {
+        return;
+      }
+    } else {
+      // Strict deny-by-default for any unmapped ORDS endpoint unless SUPER_ADMIN
+      if (user.role !== 'SUPER_ADMIN') {
+        requirePermission(user, res, 'SYSTEM_SETTINGS:UPDATE', `ORDS ${subPath}`);
+        return;
+      }
+    }
+
+    let pendingPatientRegion: { city: string; locality: string } | null = null;
+    if ((subPath === 'patients' && method === 'POST') || (/^patients\/\d+$/.test(subPath) && method === 'PUT')) {
+      const city = normalizeRegionText(req.body?.city);
+      const locality = normalizeRegionText(req.body?.locality);
+      if (!city || !locality) {
+        res.status(400).json({
+          status: 'error',
+          message: 'City and locality are required.',
+        });
+        return;
+      }
+      pendingPatientRegion = { city, locality };
     }
 
     // Doctor patient isolation on single-patient lookup (/api/ords/patients/:id)
@@ -2396,16 +4055,6 @@ async function startServer() {
         });
         return;
       }
-    }
-
-    if (subPath.startsWith('payments') && method !== 'GET' && !['ADMIN', 'RECEPTIONIST'].includes(user.role)) {
-      res.status(403).json({ status: 'error', message: 'Only receptionists or administrators can record payments' });
-      return;
-    }
-
-    if (subPath.startsWith('token_queue') && method !== 'GET' && !['ADMIN', 'RECEPTIONIST', 'DOCTOR'].includes(user.role)) {
-      res.status(403).json({ status: 'error', message: 'Not authorized to manage token queue' });
-      return;
     }
 
     let outgoingBody = req.body ?? {};
@@ -2429,20 +4078,10 @@ async function startServer() {
           patient_id: user.patient_id,
           booking_source: 'ONLINE',
         };
-      } else if (user.role !== 'RECEPTIONIST') {
-        res.status(403).json({
-          status: 'error',
-          message: 'Only patients or front-desk receptionists can book appointments.',
-        });
-        return;
       }
     }
 
     if (/^appointments\/\d+\/(confirm|cancel)$/.test(subPath) && method === 'POST') {
-      if (user.role === 'DOCTOR') {
-        res.status(403).json({ status: 'error', message: 'Doctors cannot confirm or cancel patient bookings directly' });
-        return;
-      }
       if (user.role === 'PATIENT') {
         const apptId = Number(subPath.split('/')[1]);
         const appts = await fetchOrdsItems<Appointment>('appointments');
@@ -2454,18 +4093,7 @@ async function startServer() {
       }
     }
 
-    if (/^appointments\/\d+\/outcome$/.test(subPath) && method === 'POST') {
-      if (!['ADMIN', 'DOCTOR', 'RECEPTIONIST'].includes(user.role)) {
-        res.status(403).json({ status: 'error', message: 'Not authorized to update consultation outcome' });
-        return;
-      }
-    }
-
     if (subPath === 'leaves' && method === 'POST') {
-      if (!['DOCTOR', 'ADMIN'].includes(user.role)) {
-        res.status(403).json({ status: 'error', message: 'Only doctors or administrators can submit leave requests' });
-        return;
-      }
       outgoingBody = {
         ...outgoingBody,
         ...(user.role === 'DOCTOR' && user.doctor_id ? { doctor_id: user.doctor_id } : {}),
@@ -2474,10 +4102,6 @@ async function startServer() {
     }
 
     if (/^leaves\/\d+\/decide$/.test(subPath) && method === 'POST') {
-      if (!isSingleAdminUser(user)) {
-        res.status(403).json({ status: 'error', message: 'Administrator role required to decide leave requests' });
-        return;
-      }
       outgoingBody = {
         ...outgoingBody,
         admin_user_id: user.user_id || 1,
@@ -2497,22 +4121,55 @@ async function startServer() {
       const text = await upstream.text();
       const contentType = upstream.headers.get('content-type') || 'application/json';
 
-      // Auto-provision GIRISH_USERS portal login when Receptionist registers a new Patient with email
+      // Persist patient city & locality and auto-provision GIRISH_USERS portal login
+      if (upstream.ok && /^patients\/\d+$/.test(subPath) && method === 'PUT' && pendingPatientRegion) {
+        const updatedId = Number(subPath.split('/')[1]);
+        if (updatedId > 0) {
+          savePatientRegion(updatedId, pendingPatientRegion.city, pendingPatientRegion.locality);
+        }
+      }
+
       if (upstream.ok && subPath === 'patients' && method === 'POST') {
         try {
           const parsedBody = text ? JSON.parse(text) : {};
           const patEmail = String(outgoingBody.email || '').trim().toLowerCase();
+          const patPhone = String(outgoingBody.phone_number || '').trim();
           const fn = String(outgoingBody.first_name || '').trim();
           const ln = String(outgoingBody.last_name || '').trim();
-          if (parsedBody?.status !== 'error' && patEmail && fn && ln) {
+          if (parsedBody?.status !== 'error') {
             const [patientsList, existingUsers] = await Promise.all([
               fetchOrdsItems<Patient>('patients').catch(() => [] as Patient[]),
               fetchOrdsItems<UserAccount>('users').catch(() => [] as UserAccount[]),
             ]);
-            const createdPat = patientsList
-              .filter((p) => (p.email || '').trim().toLowerCase() === patEmail)
-              .sort((a, b) => b.patient_id - a.patient_id)[0];
-            if (createdPat && !existingUsers.some((u) => (u.email || '').toLowerCase() === patEmail)) {
+            const createdPat =
+              (patEmail
+                ? patientsList
+                    .filter((p) => (p.email || '').trim().toLowerCase() === patEmail)
+                    .sort((a, b) => b.patient_id - a.patient_id)[0]
+                : undefined) ||
+              (patPhone
+                ? patientsList
+                    .filter(
+                      (p) => normalizePhoneDigits(p.phone_number) === normalizePhoneDigits(patPhone),
+                    )
+                    .sort((a, b) => b.patient_id - a.patient_id)[0]
+                : undefined);
+
+            if (createdPat && pendingPatientRegion) {
+              savePatientRegion(
+                createdPat.patient_id,
+                pendingPatientRegion.city,
+                pendingPatientRegion.locality,
+              );
+            }
+
+            if (
+              createdPat &&
+              patEmail &&
+              fn &&
+              ln &&
+              !existingUsers.some((u) => (u.email || '').toLowerCase() === patEmail)
+            ) {
               const slug = `${fn}.${ln}`.toLowerCase().replace(/[^a-z0-9]+/g, '.');
               await fetchOrdsJson('users', {
                 method: 'POST',
@@ -2522,7 +4179,7 @@ async function startServer() {
                   full_name: `${fn} ${ln}`,
                   password: process.env.DEMO_PATIENT_PASSWORD || 'Patient@123',
                   role_name: 'PATIENT',
-                  phone_number: String(outgoingBody.phone_number || '').trim() || undefined,
+                  phone_number: patPhone || undefined,
                 }),
               }).catch(() => null);
             }
@@ -2590,18 +4247,20 @@ async function startServer() {
           const parsed = JSON.parse(text) as { items?: unknown[] };
           if (Array.isArray(parsed.items)) {
             if (subPath === 'patients' && user.role === 'PATIENT') {
-              parsed.items = parsed.items.filter(
-                (p) => (p as Patient).patient_id === user.patient_id,
+              parsed.items = attachRegionsToPatients(
+                (parsed.items as Patient[]).filter((p) => p.patient_id === user.patient_id),
               );
             } else if (subPath === 'patients' && user.role === 'DOCTOR') {
               if (!user.doctor_id) {
                 parsed.items = [];
               } else {
                 const bookedIds = await getBookedPatientIdsForDoctor(user.doctor_id);
-                parsed.items = parsed.items.filter((p) =>
-                  bookedIds.has((p as Patient).patient_id),
+                parsed.items = attachRegionsToPatients(
+                  (parsed.items as Patient[]).filter((p) => bookedIds.has(p.patient_id)),
                 );
               }
+            } else if (subPath.startsWith('patients')) {
+              parsed.items = attachRegionsToPatients(parsed.items as Patient[]);
             } else if (subPath === 'appointments' && user.role === 'PATIENT') {
               parsed.items = parsed.items.filter(
                 (a) => (a as Appointment).patient_id === user.patient_id,

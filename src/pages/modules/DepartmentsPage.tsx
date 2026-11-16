@@ -1,18 +1,23 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Pencil, Plus, Trash2 } from 'lucide-react';
+import { Download, Pencil, Plus, Trash2 } from 'lucide-react';
 import type { Department } from '../../types/opd';
 import { apiClient } from '../../services/apiClient';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { hasModulePermission } from '../../utils/permissions';
+import { buildCsvString, downloadCsvFile } from '../../utils/csv';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
 import { ConfirmDialog } from '../../components/layout/ConfirmDialog';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 
 export function DepartmentsPage() {
-  const { hasPermission } = useAuth();
+  const { user } = useAuth();
   const { notify } = useToast();
-  const canManage = hasPermission('MANAGE_DEPARTMENTS');
+  const canCreate = hasModulePermission(user, 'DEPARTMENTS', 'CREATE');
+  const canEdit = hasModulePermission(user, 'DEPARTMENTS', 'UPDATE');
+  const canDelete = hasModulePermission(user, 'DEPARTMENTS', 'DELETE');
+  const canExport = hasModulePermission(user, 'DEPARTMENTS', 'EXPORT');
 
   const [departments, setDepartments] = useState<Department[]>([]);
   const [loading, setLoading] = useState(true);
@@ -138,7 +143,7 @@ export function DepartmentsPage() {
       header: 'Status',
       render: () => <StatusIndicator status="ACTIVE" />,
     },
-    ...(canManage
+    ...(canEdit || canDelete
       ? [
           {
             key: 'actions',
@@ -146,24 +151,28 @@ export function DepartmentsPage() {
             align: 'right' as const,
             render: (row: Department) => (
               <div className="inline-flex items-center justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => openEdit(row)}
-                  aria-label={`Edit ${row.department_name}`}
-                  className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
-                >
-                  <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
-                  <span>Edit</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setDeactivateTarget(row)}
-                  aria-label={`Deactivate ${row.department_name}`}
-                  className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:bg-red-50"
-                >
-                  <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-                  <span>Deactivate</span>
-                </button>
+                {canEdit && (
+                  <button
+                    type="button"
+                    onClick={() => openEdit(row)}
+                    aria-label={`Edit ${row.department_name}`}
+                    className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Edit</span>
+                  </button>
+                )}
+                {canDelete && (
+                  <button
+                    type="button"
+                    onClick={() => setDeactivateTarget(row)}
+                    aria-label={`Deactivate ${row.department_name}`}
+                    className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:bg-red-50"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Deactivate</span>
+                  </button>
+                )}
               </div>
             ),
           },
@@ -180,16 +189,35 @@ export function DepartmentsPage() {
             Manage clinical departments stored in Oracle GIRISH_DEPARTMENTS.
           </p>
         </div>
-        {canManage && (
-          <button
-            type="button"
-            onClick={openCreate}
-            className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap shrink-0"
-          >
-            <Plus className="h-4 w-4" aria-hidden="true" />
-            <span>Add Department</span>
-          </button>
-        )}
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {canExport && (
+            <button
+              type="button"
+              onClick={() => {
+                const csv = buildCsvString(
+                  ['Department ID', 'Name', 'Description'],
+                  filtered.map((d) => [d.department_id, d.department_name, d.description || '']),
+                );
+                downloadCsvFile('carepulse-departments.csv', csv);
+                notify('Departments exported as CSV', 'success');
+              }}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+            >
+              <Download className="h-4 w-4" aria-hidden="true" />
+              <span>Export CSV</span>
+            </button>
+          )}
+          {canCreate && (
+            <button
+              type="button"
+              onClick={openCreate}
+              className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap"
+            >
+              <Plus className="h-4 w-4" aria-hidden="true" />
+              <span>Add Department</span>
+            </button>
+          )}
+        </div>
       </div>
 
       <DataTable
@@ -203,7 +231,7 @@ export function DepartmentsPage() {
         emptyTitle="No departments found"
         emptyDescription="Create an active clinical department to assign doctors and schedules."
         emptyAction={
-          canManage ? (
+          canCreate ? (
             <button
               type="button"
               onClick={openCreate}

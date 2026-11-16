@@ -1,7 +1,10 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import type { AuthUser, RoleName } from '../types/opd';
+import type { AuthUser, ModuleKey, PermissionAction, RoleName } from '../types/opd';
 import { apiClient, type RegisterPatientInput } from '../services/apiClient';
-import { hasPermission as checkPermission } from '../utils/permissions';
+import {
+  hasModulePermission as checkModulePermission,
+  hasPermission as checkPermission,
+} from '../utils/permissions';
 
 interface AuthContextValue {
   user: AuthUser | null;
@@ -14,7 +17,9 @@ interface AuthContextValue {
   }) => Promise<AuthUser>;
   registerPatient: (input: RegisterPatientInput) => Promise<AuthUser>;
   logout: () => Promise<void>;
+  refreshUser: () => Promise<void>;
   hasPermission: (permission?: string) => boolean;
+  hasModulePermission: (moduleKey: ModuleKey, action: PermissionAction) => boolean;
   hasRole: (role: RoleName) => boolean;
 }
 
@@ -23,6 +28,15 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [loading, setLoading] = useState(true);
+
+  const refreshUser = useCallback(async () => {
+    try {
+      const current = await apiClient.getCurrentUser();
+      setUser(current);
+    } catch {
+      setUser(null);
+    }
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -72,6 +86,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [user],
   );
 
+  const hasModulePermission = useCallback(
+    (moduleKey: ModuleKey, action: PermissionAction) =>
+      checkModulePermission(user, moduleKey, action),
+    [user],
+  );
+
   const hasRole = useCallback(
     (role: RoleName) => Boolean(user && (user.role === role || user.roles.includes(role))),
     [user],
@@ -79,7 +99,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, loading, login, registerPatient, logout, hasPermission, hasRole }}
+      value={{
+        user,
+        loading,
+        login,
+        registerPatient,
+        logout,
+        refreshUser,
+        hasPermission,
+        hasModulePermission,
+        hasRole,
+      }}
     >
       {children}
     </AuthContext.Provider>

@@ -2,7 +2,9 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { CalendarOff, Check, Clock, X } from 'lucide-react';
 import type { Doctor, DoctorLeave, ShiftChangeRequest } from '../../types/opd';
 import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient';
+import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { hasModulePermission } from '../../utils/permissions';
 import { formatDisplayDate, formatDisplayDateTime } from '../../utils/rules';
 import { formatShiftSummary } from '../../utils/calendar';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
@@ -11,7 +13,12 @@ import { MissingEndpointBanner } from '../../components/common/MissingEndpointBa
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 
 export function ApprovalsPage() {
+  const { user } = useAuth();
   const { notify } = useToast();
+  const canDecide =
+    hasModulePermission(user, 'SLOTS', 'UPDATE') &&
+    user?.role !== 'DOCTOR' &&
+    user?.role !== 'PATIENT';
 
   const [shiftRequests, setShiftRequests] = useState<ShiftChangeRequest[]>([]);
   const [leaves, setLeaves] = useState<DoctorLeave[]>([]);
@@ -199,42 +206,46 @@ export function ApprovalsPage() {
       header: 'Status',
       render: (row) => <StatusIndicator status={row.status} />,
     },
-    {
-      key: 'actions',
-      header: 'Decision',
-      align: 'right',
-      render: (row) =>
-        row.status === 'PENDING' ? (
-          <div className="inline-flex items-center gap-1.5">
-            <button
-              type="button"
-              onClick={() => {
-                setReviewComments('');
-                setShiftReviewTarget({ req: row, decision: 'APPROVED' });
-              }}
-              className="inline-flex items-center gap-1 rounded-md border border-emerald-200 bg-white px-2.5 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-50"
-            >
-              <Check className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Approve</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setReviewComments('');
-                setShiftReviewTarget({ req: row, decision: 'REJECTED' });
-              }}
-              className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:bg-red-50"
-            >
-              <X className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Reject</span>
-            </button>
-          </div>
-        ) : (
-          <span className="font-mono text-xs text-slate-500 tabular-nums">
-            {formatDisplayDateTime(row.decided_on)}
-          </span>
-        ),
-    },
+    ...(canDecide
+      ? [
+          {
+            key: 'actions',
+            header: 'Decision',
+            align: 'right' as const,
+            render: (row: ShiftChangeRequest) =>
+              row.status === 'PENDING' ? (
+                <div className="inline-flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReviewComments('');
+                      setShiftReviewTarget({ req: row, decision: 'APPROVED' });
+                    }}
+                    className="inline-flex items-center gap-1 rounded-md border border-emerald-200 bg-white px-2.5 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-50"
+                  >
+                    <Check className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Approve</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReviewComments('');
+                      setShiftReviewTarget({ req: row, decision: 'REJECTED' });
+                    }}
+                    className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:bg-red-50"
+                  >
+                    <X className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Reject</span>
+                  </button>
+                </div>
+              ) : (
+                <span className="font-mono text-xs text-slate-500 tabular-nums">
+                  {formatDisplayDateTime(row.decided_on)}
+                </span>
+              ),
+          },
+        ]
+      : []),
   ];
 
   const leaveColumns: DataColumn<DoctorLeave>[] = [
@@ -282,42 +293,46 @@ export function ApprovalsPage() {
       header: 'Status',
       render: (row) => <StatusIndicator status={row.leave_status} />,
     },
-    {
-      key: 'actions',
-      header: 'Decision',
-      align: 'right',
-      render: (row) =>
-        row.leave_status === 'PENDING' ? (
-          <div className="inline-flex items-center gap-1.5">
-            <button
-              type="button"
-              onClick={() => {
-                setReviewComments('');
-                setLeaveReviewTarget({ leave: row, decision: 'APPROVED' });
-              }}
-              className="inline-flex items-center gap-1 rounded-md border border-emerald-200 bg-white px-2.5 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-50"
-            >
-              <Check className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Approve</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setReviewComments('');
-                setLeaveReviewTarget({ leave: row, decision: 'REJECTED' });
-              }}
-              className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:bg-red-50"
-            >
-              <X className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Reject</span>
-            </button>
-          </div>
-        ) : (
-          <span className="font-mono text-xs text-slate-500 tabular-nums">
-            {formatDisplayDateTime(row.approved_on || row.requested_on)}
-          </span>
-        ),
-    },
+    ...(canDecide
+      ? [
+          {
+            key: 'actions',
+            header: 'Decision',
+            align: 'right' as const,
+            render: (row: DoctorLeave) =>
+              row.leave_status === 'PENDING' ? (
+                <div className="inline-flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReviewComments('');
+                      setLeaveReviewTarget({ leave: row, decision: 'APPROVED' });
+                    }}
+                    className="inline-flex items-center gap-1 rounded-md border border-emerald-200 bg-white px-2.5 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-50"
+                  >
+                    <Check className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Approve</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReviewComments('');
+                      setLeaveReviewTarget({ leave: row, decision: 'REJECTED' });
+                    }}
+                    className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:bg-red-50"
+                  >
+                    <X className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Reject</span>
+                  </button>
+                </div>
+              ) : (
+                <span className="font-mono text-xs text-slate-500 tabular-nums">
+                  {formatDisplayDateTime(row.approved_on || row.requested_on)}
+                </span>
+              ),
+          },
+        ]
+      : []),
   ];
 
   return (

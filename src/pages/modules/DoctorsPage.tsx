@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { CalendarClock, Pencil, Plus, Trash2 } from 'lucide-react';
+import { CalendarClock, Download, Pencil, Plus, Trash2 } from 'lucide-react';
 import type { Appointment, Department, Doctor, DoctorShiftConfig, Slot, SlotTemplate } from '../../types/opd';
 import { apiClient } from '../../services/apiClient';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { hasModulePermission } from '../../utils/permissions';
+import { buildCsvString, downloadCsvFile } from '../../utils/csv';
 import { enrichAppointments, enrichSlots, formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
 import { formatShiftSummary } from '../../utils/calendar';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
@@ -14,7 +16,10 @@ import { StatusIndicator } from '../../components/layout/StatusIndicator';
 export function DoctorsPage() {
   const { user } = useAuth();
   const { notify } = useToast();
-  const canManage = user?.role === 'ADMIN';
+  const canCreate = hasModulePermission(user, 'DOCTORS', 'CREATE');
+  const canEdit = hasModulePermission(user, 'DOCTORS', 'UPDATE');
+  const canDelete = hasModulePermission(user, 'DOCTORS', 'DELETE');
+  const canExport = hasModulePermission(user, 'DOCTORS', 'EXPORT');
 
   const [doctors, setDoctors] = useState<Doctor[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
@@ -272,27 +277,27 @@ export function DoctorsPage() {
             <CalendarClock className="h-3.5 w-3.5" aria-hidden="true" />
             <span>Slots</span>
           </button>
-          {canManage && (
-            <>
-              <button
-                type="button"
-                onClick={() => openEdit(row)}
-                aria-label={`Edit Dr. ${row.first_name} ${row.last_name}`}
-                className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
-              >
-                <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>Edit</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setDeactivateTarget(row)}
-                aria-label={`Deactivate Dr. ${row.first_name} ${row.last_name}`}
-                className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:bg-red-50"
-              >
-                <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>Deactivate</span>
-              </button>
-            </>
+          {canEdit && (
+            <button
+              type="button"
+              onClick={() => openEdit(row)}
+              aria-label={`Edit Dr. ${row.first_name} ${row.last_name}`}
+              className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+            >
+              <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Edit</span>
+            </button>
+          )}
+          {canDelete && (
+            <button
+              type="button"
+              onClick={() => setDeactivateTarget(row)}
+              aria-label={`Deactivate Dr. ${row.first_name} ${row.last_name}`}
+              className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:bg-red-50"
+            >
+              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Deactivate</span>
+            </button>
           )}
         </div>
       ),
@@ -308,16 +313,43 @@ export function DoctorsPage() {
             Active physicians, department assignments, and consultation fees from GIRISH_DOCTORS.
           </p>
         </div>
-        {canManage && (
-          <button
-            type="button"
-            onClick={openCreate}
-            className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap shrink-0"
-          >
-            <Plus className="h-4 w-4" aria-hidden="true" />
-            <span>Register Doctor</span>
-          </button>
-        )}
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {canExport && (
+            <button
+              type="button"
+              onClick={() => {
+                const csv = buildCsvString(
+                  ['Doctor ID', 'Name', 'Department', 'Specialization', 'Fee INR', 'Employment', 'Tele-Consult'],
+                  filtered.map((d) => [
+                    d.doctor_id,
+                    `Dr. ${d.first_name} ${d.last_name}`,
+                    deptMap.get(d.department_id) || d.department_id,
+                    d.specialization || '',
+                    d.consultation_fee,
+                    d.employment_type || 'FULL_TIME',
+                    d.tele_consult_flag,
+                  ]),
+                );
+                downloadCsvFile('carepulse-doctors.csv', csv);
+                notify('Doctors roster exported as CSV', 'success');
+              }}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+            >
+              <Download className="h-4 w-4" aria-hidden="true" />
+              <span>Export CSV</span>
+            </button>
+          )}
+          {canCreate && (
+            <button
+              type="button"
+              onClick={openCreate}
+              className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap"
+            >
+              <Plus className="h-4 w-4" aria-hidden="true" />
+              <span>Register Doctor</span>
+            </button>
+          )}
+        </div>
       </div>
 
       <DataTable

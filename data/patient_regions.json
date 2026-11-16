@@ -1,0 +1,26 @@
+{
+  "1": {
+    "city": "Bengaluru",
+    "locality": "Indiranagar"
+  },
+  "22": {
+    "city": "Bengaluru",
+    "locality": "Koramangala"
+  },
+  "23": {
+    "city": "Bengaluru",
+    "locality": "Whitefield"
+  },
+  "24": {
+    "city": "Bengaluru",
+    "locality": "Jayanagar"
+  },
+  "61": {
+    "city": "Mysuru",
+    "locality": "Vijayanagar"
+  },
+  "101": {
+    "city": "Bengaluru",
+    "locality": "Malleshwaram"
+  }
+}

@@ -7,6 +7,7 @@ import { useToast } from '../../context/ToastContext';
 import { ROLE_LABELS } from '../../utils/permissions';
 import { formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
 import { formatShiftSummary } from '../../utils/calendar';
+import { RegionFields } from '../../components/common/RegionFields';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 import { DoctorShiftModal } from '../../components/modals/DoctorShiftModal';
 
@@ -26,6 +27,8 @@ export function ProfilePage() {
   const [lastName, setLastName] = useState('');
   const [phoneNumber, setPhoneNumber] = useState('');
   const [email, setEmail] = useState('');
+  const [city, setCity] = useState('');
+  const [locality, setLocality] = useState('');
   const [dob, setDob] = useState('');
   const [gender, setGender] = useState<'MALE' | 'FEMALE' | 'OTHER' | ''>('');
   const [bloodGroup, setBloodGroup] = useState('');
@@ -47,6 +50,8 @@ export function ProfilePage() {
           setLastName(found.last_name || '');
           setPhoneNumber(found.phone_number || '');
           setEmail(found.email || '');
+          setCity(found.city || '');
+          setLocality(found.locality || '');
           setDob(found.date_of_birth ? found.date_of_birth.slice(0, 10) : '');
           setGender((found.gender as 'MALE' | 'FEMALE' | 'OTHER' | '') || '');
           setBloodGroup(found.blood_group || '');
@@ -83,8 +88,8 @@ export function ProfilePage() {
   const handleSavePatient = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!patient) return;
-    if (!firstName.trim() || !lastName.trim() || !phoneNumber.trim()) {
-      notify('First name, last name, and phone number are required', 'error');
+    if (!firstName.trim() || !lastName.trim() || !phoneNumber.trim() || !city.trim() || !locality.trim()) {
+      notify('First name, last name, phone number, city, and locality are required', 'error');
       return;
     }
     setSaving(true);
@@ -94,6 +99,8 @@ export function ProfilePage() {
         last_name: lastName.trim(),
         phone_number: phoneNumber.trim(),
         email: email.trim(),
+        city: city.trim(),
+        locality: locality.trim(),
         date_of_birth: dob || undefined,
         gender: gender || undefined,
         blood_group: bloodGroup.trim() || undefined,
@@ -206,6 +213,14 @@ export function ProfilePage() {
                 />
               </div>
             </div>
+
+            <RegionFields
+              idPrefix="prof"
+              city={city}
+              locality={locality}
+              onCityChange={setCity}
+              onLocalityChange={setLocality}
+            />
 
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
               <div>

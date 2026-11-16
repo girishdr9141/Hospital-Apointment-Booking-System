@@ -1,5 +1,6 @@
 import { Building2, Calendar, CalendarPlus, CreditCard, ListOrdered, RefreshCw } from 'lucide-react';
 import type { AuthUser, DashboardSummaryResponse, RouteKey } from '../../types/opd';
+import { canAccessRoute, hasModulePermission } from '../../utils/permissions';
 import { formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 
@@ -19,6 +20,9 @@ export function PatientDashboard({
   onNavigate,
 }: PatientDashboardProps) {
   const { metrics, patient_profile } = data;
+  const canBook = canAccessRoute(user, 'book-appointment');
+  const showAppointments = canAccessRoute(user, 'appointments');
+  const showPayments = hasModulePermission(user, 'PAYMENTS', 'VIEW');
 
   return (
     <div className="space-y-6">
@@ -34,14 +38,16 @@ export function PatientDashboard({
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={() => onNavigate('book-appointment')}
-            className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap"
-          >
-            <CalendarPlus className="h-4 w-4" aria-hidden="true" />
-            <span>Book Appointment</span>
-          </button>
+          {canBook && (
+            <button
+              type="button"
+              onClick={() => onNavigate('book-appointment')}
+              className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap"
+            >
+              <CalendarPlus className="h-4 w-4" aria-hidden="true" />
+              <span>Book Appointment</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={onRefresh}
@@ -92,42 +98,48 @@ export function PatientDashboard({
           <p className="mt-1 text-xs text-slate-500">Active queue tokens</p>
         </div>
 
-        <div className="rounded-xl border border-slate-200 bg-white p-5">
-          <div className="flex items-center justify-between text-xs font-medium text-slate-500">
-            <span>Payments</span>
-            <CreditCard className="h-4 w-4 text-slate-400" aria-hidden="true" />
+        {showPayments && (
+          <div className="rounded-xl border border-slate-200 bg-white p-5">
+            <div className="flex items-center justify-between text-xs font-medium text-slate-500">
+              <span>Payments</span>
+              <CreditCard className="h-4 w-4 text-slate-400" aria-hidden="true" />
+            </div>
+            <p className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
+              {formatCurrencyInr(metrics.total_payments_amount)}
+            </p>
+            <p className="mt-1 text-xs text-slate-500 tabular-nums">
+              {metrics.payments_count} receipts
+            </p>
           </div>
-          <p className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
-            {formatCurrencyInr(metrics.total_payments_amount)}
-          </p>
-          <p className="mt-1 text-xs text-slate-500 tabular-nums">
-            {metrics.payments_count} receipts
-          </p>
-        </div>
+        )}
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <section className="rounded-xl border border-slate-200 bg-white lg:col-span-2">
           <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
             <h3 className="text-base font-semibold text-slate-900">My Appointments</h3>
-            <button
-              type="button"
-              onClick={() => onNavigate('appointments')}
-              className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
-            >
-              View All
-            </button>
+            {showAppointments && (
+              <button
+                type="button"
+                onClick={() => onNavigate('appointments')}
+                className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
+              >
+                View All
+              </button>
+            )}
           </div>
           {data.recent_appointments.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-slate-600">You have no appointments booked yet.</p>
-              <button
-                type="button"
-                onClick={() => onNavigate('book-appointment')}
-                className="mt-4 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white hover:bg-teal-800"
-              >
-                Book your first appointment
-              </button>
+              {canBook && (
+                <button
+                  type="button"
+                  onClick={() => onNavigate('book-appointment')}
+                  className="mt-4 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white hover:bg-teal-800"
+                >
+                  Book your first appointment
+                </button>
+              )}
             </div>
           ) : (
             <div className="overflow-x-auto">
@@ -168,13 +180,15 @@ export function PatientDashboard({
         <section className="rounded-xl border border-slate-200 bg-white">
           <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
             <h3 className="text-base font-semibold text-slate-900">Hospital Departments</h3>
-            <button
-              type="button"
-              onClick={() => onNavigate('book-appointment')}
-              className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
-            >
-              Open Booking Calendar
-            </button>
+            {canBook && (
+              <button
+                type="button"
+                onClick={() => onNavigate('book-appointment')}
+                className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
+              >
+                Open Booking Calendar
+              </button>
+            )}
           </div>
           <div className="divide-y divide-slate-100">
             {data.departments.map((dept) => {

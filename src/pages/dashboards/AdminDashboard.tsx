@@ -1,5 +1,7 @@
-import { Calendar, CreditCard, RefreshCw, Stethoscope, Users } from 'lucide-react';
+import { BarChart3, Calendar, CreditCard, RefreshCw, Stethoscope, Users } from 'lucide-react';
 import type { DashboardSummaryResponse, RouteKey } from '../../types/opd';
+import { useAuth } from '../../context/AuthContext';
+import { canAccessRoute, hasModulePermission } from '../../utils/permissions';
 import { formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 
@@ -11,7 +13,13 @@ interface DashboardProps {
 }
 
 export function AdminDashboard({ data, onRefresh, refreshing, onNavigate }: DashboardProps) {
+  const { user } = useAuth();
   const { metrics } = data;
+  const showAnalytics = canAccessRoute(user, 'analytics');
+  const showSlots = canAccessRoute(user, 'slots');
+  const showApprovals = canAccessRoute(user, 'approvals');
+  const showAppointments = canAccessRoute(user, 'appointments');
+  const showPayments = hasModulePermission(user, 'PAYMENTS', 'VIEW');
 
   return (
     <div className="space-y-6">
@@ -22,15 +30,27 @@ export function AdminDashboard({ data, onRefresh, refreshing, onNavigate }: Dash
             Live metrics from Oracle APEX ORDS across departments, appointments, slots, and payments.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={onRefresh}
-          disabled={refreshing}
-          className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:opacity-60 whitespace-nowrap shrink-0"
-        >
-          <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} aria-hidden="true" />
-          <span>{refreshing ? 'Refreshing...' : 'Refresh data'}</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {showAnalytics && (
+            <button
+              type="button"
+              onClick={() => onNavigate('analytics')}
+              className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap shrink-0"
+            >
+              <BarChart3 className="h-4 w-4" aria-hidden="true" />
+              <span>Analytics &amp; Insights</span>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={refreshing}
+            className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:opacity-60 whitespace-nowrap shrink-0"
+          >
+            <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} aria-hidden="true" />
+            <span>{refreshing ? 'Refreshing...' : 'Refresh data'}</span>
+          </button>
+        </div>
       </div>
 
       {/* 4-column KPI strip */}
@@ -73,18 +93,33 @@ export function AdminDashboard({ data, onRefresh, refreshing, onNavigate }: Dash
           </p>
         </div>
 
-        <div className="rounded-xl border border-slate-200 bg-white p-5">
-          <div className="flex items-center justify-between text-xs font-medium text-slate-500">
-            <span>Payments Collected</span>
-            <CreditCard className="h-4 w-4 text-slate-400" aria-hidden="true" />
+        {showPayments ? (
+          <div className="rounded-xl border border-slate-200 bg-white p-5">
+            <div className="flex items-center justify-between text-xs font-medium text-slate-500">
+              <span>Payments Collected</span>
+              <CreditCard className="h-4 w-4 text-slate-400" aria-hidden="true" />
+            </div>
+            <p className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
+              {formatCurrencyInr(metrics.total_payments_amount)}
+            </p>
+            <p className="mt-1 text-xs text-slate-500 tabular-nums">
+              {metrics.payments_count} recorded transactions
+            </p>
           </div>
-          <p className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
-            {formatCurrencyInr(metrics.total_payments_amount)}
-          </p>
-          <p className="mt-1 text-xs text-slate-500 tabular-nums">
-            {metrics.payments_count} recorded transactions
-          </p>
-        </div>
+        ) : (
+          <div className="rounded-xl border border-slate-200 bg-white p-5">
+            <div className="flex items-center justify-between text-xs font-medium text-slate-500">
+              <span>Pending Approvals</span>
+              <CreditCard className="h-4 w-4 text-slate-400" aria-hidden="true" />
+            </div>
+            <p className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
+              {metrics.pending_approvals ?? 0}
+            </p>
+            <p className="mt-1 text-xs text-slate-500 tabular-nums">
+              Awaiting review
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Operational breakdown strip */}
@@ -92,13 +127,15 @@ export function AdminDashboard({ data, onRefresh, refreshing, onNavigate }: Dash
         <div className="rounded-xl border border-slate-200 bg-white p-4">
           <div className="flex items-center justify-between gap-2">
             <p className="text-xs font-medium text-slate-500">Slot Availability</p>
-            <button
-              type="button"
-              onClick={() => onNavigate('slots')}
-              className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
-            >
-              View doctor shifts
-            </button>
+            {showSlots && (
+              <button
+                type="button"
+                onClick={() => onNavigate('slots')}
+                className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
+              >
+                View doctor shifts
+              </button>
+            )}
           </div>
           <p className="mt-1.5 font-mono text-lg font-semibold text-slate-900 tabular-nums">
             {metrics.available_slots_today} / {metrics.total_slots_today}
@@ -115,13 +152,15 @@ export function AdminDashboard({ data, onRefresh, refreshing, onNavigate }: Dash
         <div className="rounded-xl border border-slate-200 bg-white p-4">
           <div className="flex items-center justify-between gap-2">
             <p className="text-xs font-medium text-slate-500">Cancellations &amp; Approvals</p>
-            <button
-              type="button"
-              onClick={() => onNavigate('approvals')}
-              className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
-            >
-              Review
-            </button>
+            {showApprovals && (
+              <button
+                type="button"
+                onClick={() => onNavigate('approvals')}
+                className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
+              >
+                Review
+              </button>
+            )}
           </div>
           <p className="mt-1.5 font-mono text-lg font-semibold text-slate-900 tabular-nums">
             {metrics.pending_approvals ?? 0} pending · {metrics.cancelled_appointments} cancelled
@@ -137,13 +176,15 @@ export function AdminDashboard({ data, onRefresh, refreshing, onNavigate }: Dash
         <section className="rounded-xl border border-slate-200 bg-white lg:col-span-2">
           <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
             <h3 className="text-base font-semibold text-slate-900">Recent Appointments</h3>
-            <button
-              type="button"
-              onClick={() => onNavigate('appointments')}
-              className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
-            >
-              Open Appointments
-            </button>
+            {showAppointments && (
+              <button
+                type="button"
+                onClick={() => onNavigate('appointments')}
+                className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
+              >
+                Open Appointments
+              </button>
+            )}
           </div>
           {data.recent_appointments.length === 0 ? (
             <div className="p-8 text-center text-sm text-slate-500">
@@ -193,13 +234,15 @@ export function AdminDashboard({ data, onRefresh, refreshing, onNavigate }: Dash
         <section className="rounded-xl border border-slate-200 bg-white">
           <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
             <h3 className="text-base font-semibold text-slate-900">Doctor Slot Utilisation</h3>
-            <button
-              type="button"
-              onClick={() => onNavigate('slots')}
-              className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
-            >
-              View Slots
-            </button>
+            {showSlots && (
+              <button
+                type="button"
+                onClick={() => onNavigate('slots')}
+                className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
+              >
+                View Slots
+              </button>
+            )}
           </div>
           {data.utilisation.length === 0 ? (
             <div className="p-8 text-center text-sm text-slate-500">

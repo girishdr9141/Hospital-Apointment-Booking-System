@@ -4,15 +4,17 @@ import type { Appointment, Department, TokenQueueItem } from '../../types/opd';
 import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { hasModulePermission } from '../../utils/permissions';
 import { formatDisplayDate } from '../../utils/rules';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 
 export function TokenQueuePage() {
-  const { user, hasPermission } = useAuth();
+  const { user } = useAuth();
   const { notify } = useToast();
-  const canManage = hasPermission('MANAGE_TOKENS') && user?.role !== 'PATIENT';
+  const canIssue = hasModulePermission(user, 'TOKEN_QUEUE', 'CREATE') && user?.role !== 'PATIENT';
+  const canAdvance = hasModulePermission(user, 'TOKEN_QUEUE', 'UPDATE') && user?.role !== 'PATIENT';
 
   const [tokens, setTokens] = useState<TokenQueueItem[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
@@ -32,7 +34,9 @@ export function TokenQueuePage() {
       const [queue, depts, appts] = await Promise.all([
         apiClient.getTokenQueue(),
         apiClient.getDepartments(),
-        canManage ? apiClient.getAppointments() : Promise.resolve([] as Appointment[]),
+        canIssue
+          ? apiClient.getAppointments().catch(() => [] as Appointment[])
+          : Promise.resolve([] as Appointment[]),
       ]);
       setTokens(queue);
       setDepartments(depts);
@@ -46,7 +50,7 @@ export function TokenQueuePage() {
     } finally {
       setLoading(false);
     }
-  }, [notify, canManage, selectedApptId]);
+  }, [notify, canIssue, selectedApptId]);
 
   useEffect(() => {
     loadData();
@@ -139,7 +143,7 @@ export function TokenQueuePage() {
       header: 'Status',
       render: (row) => <StatusIndicator status={row.status} />,
     },
-    ...(canManage
+    ...(canAdvance
       ? [
           {
             key: 'actions',
@@ -194,7 +198,7 @@ export function TokenQueuePage() {
             Track daily check-ins and consultation room progression from GIRISH_TOKEN_QUEUE.
           </p>
         </div>
-        {canManage && (
+        {canIssue && (
           <button
             type="button"
             onClick={() => setIssueOpen(true)}

@@ -117,7 +117,7 @@ export function PatientForgotPasswordPage({
                   autoComplete="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="john.doe@example.com"
+                  placeholder="patient@example.com"
                   className="w-full rounded-lg border border-slate-300 bg-white py-2.5 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
                 />
               </div>

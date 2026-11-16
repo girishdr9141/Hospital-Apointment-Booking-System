@@ -1,7 +1,9 @@
-import React, { useState } from 'react';
-import { ArrowLeft, Stethoscope } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { ArrowLeft, ShieldAlert, Stethoscope } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { RegionFields } from '../../components/common/RegionFields';
+import { apiClient } from '../../services/apiClient';
 
 interface RegisterPatientPageProps {
   onSwitchToLogin: () => void;
@@ -15,10 +17,15 @@ export function RegisterPatientPage({
   const { registerPatient } = useAuth();
   const { notify } = useToast();
 
+  const [allowRegistration, setAllowRegistration] = useState(true);
+  const [minPasswordLen, setMinPasswordLen] = useState(6);
+
   const [firstName, setFirstName] = useState('');
   const [lastName, setLastName] = useState('');
   const [phoneNumber, setPhoneNumber] = useState('');
   const [email, setEmail] = useState('');
+  const [city, setCity] = useState('');
+  const [locality, setLocality] = useState('');
   const [dateOfBirth, setDateOfBirth] = useState('');
   const [gender, setGender] = useState<'MALE' | 'FEMALE' | 'OTHER' | ''>('');
   const [bloodGroup, setBloodGroup] = useState('');
@@ -26,17 +33,37 @@ export function RegisterPatientPage({
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  useEffect(() => {
+    apiClient
+      .getSecurityPolicy()
+      .then((res) => {
+        setAllowRegistration(res.allow_patient_registration);
+        setMinPasswordLen(Math.max(6, Number(res.min_password_length || 6)));
+      })
+      .catch(() => null);
+  }, []);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
 
-    if (!firstName.trim() || !lastName.trim() || !phoneNumber.trim() || !email.trim() || !password) {
-      setErrorMsg('First name, last name, phone number, email, and password are required.');
+    if (
+      !firstName.trim() ||
+      !lastName.trim() ||
+      !phoneNumber.trim() ||
+      !email.trim() ||
+      !city.trim() ||
+      !locality.trim() ||
+      !password
+    ) {
+      setErrorMsg(
+        'First name, last name, phone number, email, city, locality, and password are required.',
+      );
       return;
     }
 
-    if (password.length < 6) {
-      setErrorMsg('Password must be at least 6 characters.');
+    if (password.length < minPasswordLen) {
+      setErrorMsg(`Password must be at least ${minPasswordLen} characters.`);
       return;
     }
 
@@ -47,6 +74,8 @@ export function RegisterPatientPage({
         last_name: lastName.trim(),
         phone_number: phoneNumber.trim(),
         email: email.trim(),
+        city: city.trim(),
+        locality: locality.trim(),
         date_of_birth: dateOfBirth || undefined,
         gender: gender || undefined,
         blood_group: bloodGroup.trim() || undefined,
@@ -96,145 +125,186 @@ export function RegisterPatientPage({
         </div>
 
         <div className="mt-6 rounded-xl border border-slate-200 bg-white p-6 sm:p-8">
-          <h2 className="text-xl font-semibold text-slate-900">Register as a new patient</h2>
-          <p className="mt-1 text-sm text-slate-600">
-            Creates your outpatient record directly in the hospital Oracle database.
-          </p>
-
-          {errorMsg && (
-            <div
-              role="alert"
-              className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-sm text-red-800"
-            >
-              {errorMsg}
+          {!allowRegistration ? (
+            <div className="py-6 text-center">
+              <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-amber-50 text-amber-700">
+                <ShieldAlert className="h-6 w-6" aria-hidden="true" />
+              </div>
+              <h2 className="mt-3 text-lg font-semibold text-slate-900">
+                Patient Self-Registration Disabled
+              </h2>
+              <p className="mt-1.5 text-sm text-slate-600">
+                The hospital Super Admin has disabled public patient self-registration in Security
+                Settings. Please contact front-desk reception to create your patient profile.
+              </p>
+              <button
+                type="button"
+                onClick={onSwitchToLogin}
+                className="mt-5 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white hover:bg-teal-800"
+              >
+                Return to Login
+              </button>
             </div>
-          )}
+          ) : (
+            <>
+              <h2 className="text-xl font-semibold text-slate-900">Register as a new patient</h2>
+              <p className="mt-1 text-sm text-slate-600">
+                Creates your outpatient record directly in the hospital Oracle database.
+              </p>
 
-          <form onSubmit={handleSubmit} className="mt-6 space-y-4" noValidate>
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div>
-                <label htmlFor="reg-first-name" className="block text-sm font-medium text-slate-700">
-                  First name *
-                </label>
-                <input
-                  id="reg-first-name"
-                  type="text"
-                  value={firstName}
-                  onChange={(e) => setFirstName(e.target.value)}
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
-                />
-              </div>
-              <div>
-                <label htmlFor="reg-last-name" className="block text-sm font-medium text-slate-700">
-                  Last name *
-                </label>
-                <input
-                  id="reg-last-name"
-                  type="text"
-                  value={lastName}
-                  onChange={(e) => setLastName(e.target.value)}
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div>
-                <label htmlFor="reg-phone" className="block text-sm font-medium text-slate-700">
-                  Phone number *
-                </label>
-                <input
-                  id="reg-phone"
-                  type="tel"
-                  value={phoneNumber}
-                  onChange={(e) => setPhoneNumber(e.target.value)}
-                  placeholder="9876543211"
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
-                />
-              </div>
-              <div>
-                <label htmlFor="reg-email" className="block text-sm font-medium text-slate-700">
-                  Email address *
-                </label>
-                <input
-                  id="reg-email"
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="patient@example.com"
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-              <div>
-                <label htmlFor="reg-dob" className="block text-sm font-medium text-slate-700">
-                  Date of birth
-                </label>
-                <input
-                  id="reg-dob"
-                  type="date"
-                  value={dateOfBirth}
-                  onChange={(e) => setDateOfBirth(e.target.value)}
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
-                />
-              </div>
-              <div>
-                <label htmlFor="reg-gender" className="block text-sm font-medium text-slate-700">
-                  Gender
-                </label>
-                <select
-                  id="reg-gender"
-                  value={gender}
-                  onChange={(e) =>
-                    setGender(e.target.value as 'MALE' | 'FEMALE' | 'OTHER' | '')
-                  }
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
+              {errorMsg && (
+                <div
+                  role="alert"
+                  className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-sm text-red-800"
                 >
-                  <option value="">Select</option>
-                  <option value="MALE">Male</option>
-                  <option value="FEMALE">Female</option>
-                  <option value="OTHER">Other</option>
-                </select>
-              </div>
-              <div>
-                <label htmlFor="reg-blood" className="block text-sm font-medium text-slate-700">
-                  Blood group
-                </label>
-                <input
-                  id="reg-blood"
-                  type="text"
-                  value={bloodGroup}
-                  onChange={(e) => setBloodGroup(e.target.value)}
-                  placeholder="O+"
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
+                  {errorMsg}
+                </div>
+              )}
+
+              <form onSubmit={handleSubmit} className="mt-6 space-y-4" noValidate>
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <div>
+                    <label
+                      htmlFor="reg-first-name"
+                      className="block text-sm font-medium text-slate-700"
+                    >
+                      First name *
+                    </label>
+                    <input
+                      id="reg-first-name"
+                      type="text"
+                      value={firstName}
+                      onChange={(e) => setFirstName(e.target.value)}
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
+                    />
+                  </div>
+                  <div>
+                    <label
+                      htmlFor="reg-last-name"
+                      className="block text-sm font-medium text-slate-700"
+                    >
+                      Last name *
+                    </label>
+                    <input
+                      id="reg-last-name"
+                      type="text"
+                      value={lastName}
+                      onChange={(e) => setLastName(e.target.value)}
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <div>
+                    <label htmlFor="reg-phone" className="block text-sm font-medium text-slate-700">
+                      Phone number *
+                    </label>
+                    <input
+                      id="reg-phone"
+                      type="tel"
+                      value={phoneNumber}
+                      onChange={(e) => setPhoneNumber(e.target.value)}
+                      placeholder="9876543211"
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="reg-email" className="block text-sm font-medium text-slate-700">
+                      Email address *
+                    </label>
+                    <input
+                      id="reg-email"
+                      type="email"
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      placeholder="patient@example.com"
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
+                    />
+                  </div>
+                </div>
+
+                <RegionFields
+                  idPrefix="reg"
+                  city={city}
+                  locality={locality}
+                  onCityChange={setCity}
+                  onLocalityChange={setLocality}
                 />
-              </div>
-            </div>
 
-            <div>
-              <label htmlFor="reg-password" className="block text-sm font-medium text-slate-700">
-                Create password *
-              </label>
-              <input
-                id="reg-password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="At least 6 characters"
-                className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
-              />
-            </div>
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                  <div>
+                    <label htmlFor="reg-dob" className="block text-sm font-medium text-slate-700">
+                      Date of birth
+                    </label>
+                    <input
+                      id="reg-dob"
+                      type="date"
+                      value={dateOfBirth}
+                      onChange={(e) => setDateOfBirth(e.target.value)}
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="reg-gender" className="block text-sm font-medium text-slate-700">
+                      Gender
+                    </label>
+                    <select
+                      id="reg-gender"
+                      value={gender}
+                      onChange={(e) =>
+                        setGender(e.target.value as 'MALE' | 'FEMALE' | 'OTHER' | '')
+                      }
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
+                    >
+                      <option value="">Select</option>
+                      <option value="MALE">Male</option>
+                      <option value="FEMALE">Female</option>
+                      <option value="OTHER">Other</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label htmlFor="reg-blood" className="block text-sm font-medium text-slate-700">
+                      Blood group
+                    </label>
+                    <input
+                      id="reg-blood"
+                      type="text"
+                      value={bloodGroup}
+                      onChange={(e) => setBloodGroup(e.target.value)}
+                      placeholder="O+"
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
+                    />
+                  </div>
+                </div>
 
-            <button
-              type="submit"
-              disabled={submitting}
-              className="w-full rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-teal-800 disabled:opacity-60"
-            >
-              {submitting ? 'Registering patient...' : 'Register and continue'}
-            </button>
-          </form>
+                <div>
+                  <label
+                    htmlFor="reg-password"
+                    className="block text-sm font-medium text-slate-700"
+                  >
+                    Create password *
+                  </label>
+                  <input
+                    id="reg-password"
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder={`At least ${minPasswordLen} characters`}
+                    className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="w-full rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-teal-800 disabled:opacity-60"
+                >
+                  {submitting ? 'Registering patient...' : 'Register and continue'}
+                </button>
+              </form>
+            </>
+          )}
         </div>
       </div>
     </div>

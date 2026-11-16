@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Eye } from 'lucide-react';
-import type { AuditLogRecord, ErrorLogRecord } from '../../types/opd';
+import { Download, Eye, ShieldAlert } from 'lucide-react';
+import type { AuditLogRecord, ErrorLogRecord, RbacAuditLogEntry } from '../../types/opd';
 import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient';
+import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { buildCsvString, downloadCsvFile } from '../../utils/csv';
+import { hasModulePermission } from '../../utils/permissions';
 import { formatDisplayDateTime } from '../../utils/rules';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
@@ -12,47 +15,91 @@ interface LogsPageProps {
   mode: 'audit' | 'error';
 }
 
+const AUDIT_CATEGORIES: Array<'ALL' | RbacAuditLogEntry['category']> = [
+  'ALL',
+  'AUTH',
+  'USER',
+  'ROLE',
+  'PERMISSION',
+  'SECURITY',
+  'CLINICAL',
+];
+
 export function LogsPage({ mode }: LogsPageProps) {
+  const { user } = useAuth();
   const { notify } = useToast();
 
+  const [auditTab, setAuditTab] = useState<'rbac' | 'oracle'>('rbac');
+  const [rbacLogs, setRbacLogs] = useState<RbacAuditLogEntry[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogRecord[]>([]);
   const [errorLogs, setErrorLogs] = useState<ErrorLogRecord[]>([]);
   const [loading, setLoading] = useState(true);
-  const [missingEndpoint, setMissingEndpoint] = useState(false);
+  const [missingOracleEndpoint, setMissingOracleEndpoint] = useState(false);
 
   const [search, setSearch] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState<'ALL' | RbacAuditLogEntry['category']>('ALL');
   const [selectedError, setSelectedError] = useState<ErrorLogRecord | null>(null);
+
+  const canExportAudit = hasModulePermission(user, 'SYSTEM_SETTINGS', 'VIEW');
 
   const loadData = useCallback(async () => {
     setLoading(true);
-    setMissingEndpoint(false);
+    setMissingOracleEndpoint(false);
     try {
       if (mode === 'audit') {
-        const list = await apiClient.getAuditLogs();
-        setAuditLogs(list);
+        if (auditTab === 'rbac') {
+          const res = await apiClient.getRbacAuditLogs();
+          setRbacLogs(res.logs || []);
+        } else {
+          try {
+            const list = await apiClient.getAuditLogs();
+            setAuditLogs(list);
+          } catch (err) {
+            if (isEndpointNotDeployedError(err)) {
+              setMissingOracleEndpoint(true);
+              setAuditLogs([]);
+            } else {
+              throw err;
+            }
+          }
+        }
       } else {
-        const list = await apiClient.getErrorLogs();
-        setErrorLogs(list);
+        try {
+          const list = await apiClient.getErrorLogs();
+          setErrorLogs(list);
+        } catch (err) {
+          if (isEndpointNotDeployedError(err)) {
+            setMissingOracleEndpoint(true);
+            setErrorLogs([]);
+          } else {
+            throw err;
+          }
+        }
       }
     } catch (err) {
-      if (isEndpointNotDeployedError(err)) {
-        setMissingEndpoint(true);
-        if (mode === 'audit') setAuditLogs([]);
-        else setErrorLogs([]);
-      } else {
-        notify(
-          err instanceof Error ? err.message : `Failed to load ${mode} logs`,
-          'error',
-        );
-      }
+      notify(err instanceof Error ? err.message : `Failed to load ${mode} logs`, 'error');
     } finally {
       setLoading(false);
     }
-  }, [mode, notify]);
+  }, [mode, auditTab, notify]);
 
   useEffect(() => {
-    loadData();
+    void loadData();
   }, [loadData]);
+
+  const filteredRbacLogs = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return rbacLogs.filter((l) => {
+      if (categoryFilter !== 'ALL' && l.category !== categoryFilter) return false;
+      if (!q) return true;
+      return (
+        l.action.toLowerCase().includes(q) ||
+        l.actor_name.toLowerCase().includes(q) ||
+        (l.target_label || '').toLowerCase().includes(q) ||
+        l.details.toLowerCase().includes(q)
+      );
+    });
+  }, [rbacLogs, categoryFilter, search]);
 
   const filteredAudit = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -77,6 +124,103 @@ export function LogsPage({ mode }: LogsPageProps) {
         String(e.oracle_error_code ?? '').includes(q),
     );
   }, [errorLogs, search]);
+
+  const handleExportRbacCsv = () => {
+    if (filteredRbacLogs.length === 0) {
+      notify('No RBAC audit records to export', 'info');
+      return;
+    }
+    const headers = [
+      'Timestamp',
+      'Action',
+      'Category',
+      'Severity',
+      'Actor',
+      'Actor Role',
+      'Target',
+      'Previous Value',
+      'New Value',
+      'Details',
+    ];
+    const rows = filteredRbacLogs.map((l) => [
+      l.timestamp,
+      l.action,
+      l.category,
+      l.severity,
+      l.actor_name,
+      l.actor_role,
+      l.target_label || '',
+      l.previous_value || '',
+      l.new_value || '',
+      l.details,
+    ]);
+    downloadCsvFile('carepulse-rbac-security-audit.csv', buildCsvString(headers, rows));
+    notify(`Exported ${filteredRbacLogs.length} audit log entry(ies)`, 'success');
+  };
+
+  const rbacColumns: DataColumn<RbacAuditLogEntry>[] = [
+    {
+      key: 'time',
+      header: 'Timestamp',
+      render: (row) => (
+        <span className="font-mono text-xs text-slate-500 tabular-nums whitespace-nowrap">
+          {formatDisplayDateTime(row.timestamp)}
+        </span>
+      ),
+    },
+    {
+      key: 'action',
+      header: 'Event',
+      render: (row) => (
+        <div>
+          <span
+            className={`font-mono text-xs font-semibold ${
+              row.severity === 'critical'
+                ? 'text-red-700'
+                : row.severity === 'warning'
+                  ? 'text-amber-800'
+                  : 'text-slate-900'
+            }`}
+          >
+            {row.action}
+          </span>
+          <p className="text-[11px] text-slate-500">
+            {row.category} · {row.severity}
+          </p>
+        </div>
+      ),
+    },
+    {
+      key: 'actor',
+      header: 'Actor',
+      render: (row) => (
+        <div className="text-xs">
+          <p className="font-medium text-slate-900">{row.actor_name}</p>
+          <p className="font-mono text-[11px] text-slate-500">{row.actor_role}</p>
+        </div>
+      ),
+    },
+    {
+      key: 'target',
+      header: 'Target & Diff',
+      render: (row) => (
+        <div className="max-w-xs text-xs">
+          <p className="font-medium text-slate-800 truncate">{row.target_label || '—'}</p>
+          {(row.previous_value || row.new_value) && (
+            <p className="mt-0.5 font-mono text-[11px] text-slate-500 truncate">
+              {row.previous_value ? `${row.previous_value} → ` : ''}
+              {row.new_value || ''}
+            </p>
+          )}
+        </div>
+      ),
+    },
+    {
+      key: 'details',
+      header: 'Details',
+      render: (row) => <span className="text-xs text-slate-600">{row.details}</span>,
+    },
+  ];
 
   const auditColumns: DataColumn<AuditLogRecord>[] = [
     {
@@ -105,7 +249,9 @@ export function LogsPage({ mode }: LogsPageProps) {
       key: 'user',
       header: 'Actor',
       render: (row) => (
-        <span className="text-slate-700">{row.username || (row.user_id ? `User #${row.user_id}` : 'SYSTEM')}</span>
+        <span className="text-slate-700">
+          {row.username || (row.user_id ? `User #${row.user_id}` : 'SYSTEM')}
+        </span>
       ),
     },
     {
@@ -190,18 +336,69 @@ export function LogsPage({ mode }: LogsPageProps) {
 
   return (
     <div className="space-y-5">
-      <div>
-        <h2 className="text-xl font-semibold text-slate-900">
-          {mode === 'audit' ? 'System Audit Logs' : 'Oracle PL/SQL Error Logs'}
-        </h2>
-        <p className="mt-0.5 text-sm text-slate-600">
-          {mode === 'audit'
-            ? 'Read-only record of state mutations and administrative actions from GIRISH_AUDIT_LOGS.'
-            : 'Diagnostic exception entries captured by PL/SQL procedures in GIRISH_ERROR_LOG.'}
-        </p>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h2 className="text-xl font-semibold text-slate-900">
+            {mode === 'audit' ? 'Audit Logs & Security Trail' : 'Oracle PL/SQL Error Logs'}
+          </h2>
+          <p className="mt-0.5 text-sm text-slate-600">
+            {mode === 'audit'
+              ? 'Read-only governance trail tracking authentication, role/permission mutations, unauthorized access attempts, and clinical writes.'
+              : 'Diagnostic exception entries captured by PL/SQL procedures in GIRISH_ERROR_LOG.'}
+          </p>
+        </div>
+        {mode === 'audit' && auditTab === 'rbac' && canExportAudit && (
+          <button
+            type="button"
+            onClick={handleExportRbacCsv}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
+          >
+            <Download className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>Export Audit CSV</span>
+          </button>
+        )}
       </div>
 
-      {missingEndpoint && (
+      {mode === 'audit' && (
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="inline-flex items-center gap-1 rounded-lg bg-slate-200/70 p-1">
+            <button
+              type="button"
+              onClick={() => {
+                setAuditTab('rbac');
+                setSearch('');
+              }}
+              className={`rounded-md px-3.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
+                auditTab === 'rbac'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              RBAC &amp; Security Trail
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAuditTab('oracle');
+                setSearch('');
+              }}
+              className={`rounded-md px-3.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
+                auditTab === 'oracle'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Oracle DB Audit Trail
+            </button>
+          </div>
+          <span className="inline-flex items-center gap-1.5 text-xs text-slate-500">
+            <ShieldAlert className="h-3.5 w-3.5 text-teal-700" aria-hidden="true" />
+            Immutable read-only audit stream
+          </span>
+        </div>
+      )}
+
+      {missingOracleEndpoint && (mode === 'error' || auditTab === 'oracle') && (
         <MissingEndpointBanner
           endpoint={mode === 'audit' ? 'GET /audit-logs' : 'GET /error-logs'}
           description={
@@ -213,17 +410,47 @@ export function LogsPage({ mode }: LogsPageProps) {
       )}
 
       {mode === 'audit' ? (
-        <DataTable
-          rows={filteredAudit}
-          columns={auditColumns}
-          getRowKey={(row) => row.audit_id}
-          loading={loading}
-          searchValue={search}
-          onSearchChange={setSearch}
-          searchPlaceholder="Search action, table, or actor..."
-          emptyTitle="No audit log entries found"
-          emptyDescription="Audit events from GIRISH_AUDIT_LOGS will appear here."
-        />
+        auditTab === 'rbac' ? (
+          <DataTable
+            rows={filteredRbacLogs}
+            columns={rbacColumns}
+            getRowKey={(row) => row.id}
+            loading={loading}
+            searchValue={search}
+            onSearchChange={setSearch}
+            searchPlaceholder="Search action, actor, target, or details..."
+            filters={
+              <select
+                aria-label="Filter audit logs by category"
+                value={categoryFilter}
+                onChange={(e) =>
+                  setCategoryFilter(e.target.value as 'ALL' | RbacAuditLogEntry['category'])
+                }
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 focus:border-teal-700 focus:outline-none"
+              >
+                {AUDIT_CATEGORIES.map((cat) => (
+                  <option key={cat} value={cat}>
+                    {cat === 'ALL' ? 'All Categories' : cat}
+                  </option>
+                ))}
+              </select>
+            }
+            emptyTitle="No security or RBAC events recorded yet"
+            emptyDescription="Sign-ins, permission changes, role updates, and blocked 403 attempts appear here automatically."
+          />
+        ) : (
+          <DataTable
+            rows={filteredAudit}
+            columns={auditColumns}
+            getRowKey={(row) => row.audit_id}
+            loading={loading}
+            searchValue={search}
+            onSearchChange={setSearch}
+            searchPlaceholder="Search action, table, or actor..."
+            emptyTitle="No Oracle audit entries found"
+            emptyDescription="Audit events from GIRISH_AUDIT_LOGS will appear here."
+          />
+        )
       ) : (
         <DataTable
           rows={filteredErrors}

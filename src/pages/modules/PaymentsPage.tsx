@@ -1,18 +1,21 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Plus } from 'lucide-react';
+import { Download, Plus } from 'lucide-react';
 import type { Appointment, Payment } from '../../types/opd';
 import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { hasModulePermission } from '../../utils/permissions';
+import { buildCsvString, downloadCsvFile } from '../../utils/csv';
 import { formatCurrencyInr, formatDisplayDateTime } from '../../utils/rules';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 
 export function PaymentsPage() {
-  const { hasPermission } = useAuth();
+  const { user } = useAuth();
   const { notify } = useToast();
-  const canRecord = hasPermission('RECORD_PAYMENTS');
+  const canRecord = hasModulePermission(user, 'PAYMENTS', 'CREATE');
+  const canExport = hasModulePermission(user, 'PAYMENTS', 'EXPORT');
 
   const [payments, setPayments] = useState<Payment[]>([]);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
@@ -32,7 +35,9 @@ export function PaymentsPage() {
     try {
       const [payList, apptList] = await Promise.all([
         apiClient.getPayments(),
-        canRecord ? apiClient.getAppointments() : Promise.resolve([] as Appointment[]),
+        canRecord
+          ? apiClient.getAppointments().catch(() => [] as Appointment[])
+          : Promise.resolve([] as Appointment[]),
       ]);
       setPayments(payList);
       setAppointments(apptList);
@@ -150,16 +155,42 @@ export function PaymentsPage() {
             Consultation fee records and transaction statuses stored in Oracle GIRISH_PAYMENTS.
           </p>
         </div>
-        {canRecord && (
-          <button
-            type="button"
-            onClick={() => setModalOpen(true)}
-            className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white hover:bg-teal-800 whitespace-nowrap shrink-0"
-          >
-            <Plus className="h-4 w-4" aria-hidden="true" />
-            <span>Record Payment</span>
-          </button>
-        )}
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {canExport && (
+            <button
+              type="button"
+              onClick={() => {
+                const csv = buildCsvString(
+                  ['Payment Ref', 'Appointment Ref', 'Method', 'Amount INR', 'Status', 'Recorded On'],
+                  filtered.map((p) => [
+                    p.payment_ref,
+                    p.appointment_ref,
+                    p.payment_method || '',
+                    p.amount,
+                    p.status,
+                    p.created_on,
+                  ]),
+                );
+                downloadCsvFile('carepulse-payments.csv', csv);
+                notify('Payments ledger exported as CSV', 'success');
+              }}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+            >
+              <Download className="h-4 w-4" aria-hidden="true" />
+              <span>Export CSV</span>
+            </button>
+          )}
+          {canRecord && (
+            <button
+              type="button"
+              onClick={() => setModalOpen(true)}
+              className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white hover:bg-teal-800 whitespace-nowrap"
+            >
+              <Plus className="h-4 w-4" aria-hidden="true" />
+              <span>Record Payment</span>
+            </button>
+          )}
+        </div>
       </div>
 
       <DataTable

@@ -21,6 +21,7 @@ import { Modal } from './components/common/Modal';
 import { DashboardSkeleton } from './components/layout/SkeletonBlock';
 import { UnauthorizedView } from './components/layout/UnauthorizedView';
 import { AdminDashboard } from './pages/dashboards/AdminDashboard';
+import { SuperAdminDashboard } from './pages/dashboards/SuperAdminDashboard';
 import { DoctorDashboard } from './pages/dashboards/DoctorDashboard';
 import { PatientDashboard } from './pages/dashboards/PatientDashboard';
 import { ReceptionistDashboard } from './pages/dashboards/ReceptionistDashboard';
@@ -34,13 +35,20 @@ import { DoctorLeavesPage } from './pages/modules/DoctorLeavesPage';
 import { ApprovalsPage } from './pages/modules/ApprovalsPage';
 import { PaymentsPage } from './pages/modules/PaymentsPage';
 import { TokenQueuePage } from './pages/modules/TokenQueuePage';
+import { MedicalRecordsPage } from './pages/modules/MedicalRecordsPage';
+import { PrescriptionsPage } from './pages/modules/PrescriptionsPage';
 import { UsersRolesPage } from './pages/modules/UsersRolesPage';
+import { RoleManagementPage } from './pages/modules/RoleManagementPage';
+import { PermissionManagementPage } from './pages/modules/PermissionManagementPage';
+import { SecuritySettingsPage } from './pages/modules/SecuritySettingsPage';
 import { LogsPage } from './pages/modules/LogsPage';
 import { ProfilePage } from './pages/modules/ProfilePage';
+import { AnalyticsPage } from './pages/modules/AnalyticsPage';
 import { DoctorShiftModal } from './components/modals/DoctorShiftModal';
 
 const VALID_ROUTES: RouteKey[] = [
   'dashboard',
+  'analytics',
   'patients',
   'register-patient',
   'doctors',
@@ -54,7 +62,12 @@ const VALID_ROUTES: RouteKey[] = [
   'approvals',
   'payments',
   'token-queue',
+  'medical-records',
+  'prescriptions',
   'users-roles',
+  'role-management',
+  'permission-management',
+  'security-settings',
   'audit-logs',
   'error-logs',
   'profile',
@@ -77,6 +90,7 @@ function PortalContent() {
   const [authBanner, setAuthBanner] = useState<string | null>(null);
   const [prefillEmail, setPrefillEmail] = useState<string>('');
   const [activeRoute, setActiveRoute] = useState<RouteKey>(() => parseHashRoute());
+  const [selectedMatrixRole, setSelectedMatrixRole] = useState<RoleName | undefined>(undefined);
   const [dashboardData, setDashboardData] = useState<DashboardSummaryResponse | null>(null);
   const [dashLoading, setDashLoading] = useState(false);
   const [dashError, setDashError] = useState<string | null>(null);
@@ -102,7 +116,7 @@ function PortalContent() {
   }, []);
 
   const loadNotifications = useCallback(async () => {
-    if (!user || (user.role !== 'ADMIN' && user.role !== 'DOCTOR')) {
+    if (!user || (user.role !== 'SUPER_ADMIN' && user.role !== 'ADMIN' && user.role !== 'DOCTOR')) {
       setNotifications([]);
       return;
     }
@@ -116,6 +130,10 @@ function PortalContent() {
 
   const loadDashboard = useCallback(async () => {
     if (!user) return;
+    if (user.role === 'SUPER_ADMIN') {
+      void loadNotifications();
+      return;
+    }
     setDashLoading(true);
     setDashError(null);
     try {
@@ -262,7 +280,7 @@ function PortalContent() {
 
   const unreadNotifications = notifications.filter((n) => !n.read);
   const showLoginNotifModal =
-    (user.role === 'ADMIN' || user.role === 'DOCTOR') &&
+    (user.role === 'SUPER_ADMIN' || user.role === 'ADMIN' || user.role === 'DOCTOR') &&
     !showShiftRegistrationModal &&
     unreadNotifications.length > 0 &&
     notifPopupDismissedForUser !== user.user_id;
@@ -318,6 +336,9 @@ function PortalContent() {
   const authorized = canAccessRoute(user, activeRoute);
 
   const renderDashboard = () => {
+    if (user.role === 'SUPER_ADMIN') {
+      return <SuperAdminDashboard onNavigate={navigate} />;
+    }
     if (dashLoading && !dashboardData) {
       return <DashboardSkeleton />;
     }
@@ -395,6 +416,8 @@ function PortalContent() {
     switch (activeRoute) {
       case 'dashboard':
         return renderDashboard();
+      case 'analytics':
+        return <AnalyticsPage />;
       case 'patients':
         return <PatientsPage key="patients" mode="directory" />;
       case 'register-patient':
@@ -433,8 +456,23 @@ function PortalContent() {
         return <PaymentsPage />;
       case 'token-queue':
         return <TokenQueuePage />;
+      case 'medical-records':
+        return <MedicalRecordsPage />;
+      case 'prescriptions':
+        return <PrescriptionsPage />;
       case 'users-roles':
         return <UsersRolesPage />;
+      case 'role-management':
+        return (
+          <RoleManagementPage
+            onNavigate={navigate}
+            onSelectRoleForMatrix={(role) => setSelectedMatrixRole(role)}
+          />
+        );
+      case 'permission-management':
+        return <PermissionManagementPage initialRole={selectedMatrixRole} />;
+      case 'security-settings':
+        return <SecuritySettingsPage />;
       case 'audit-logs':
         return <LogsPage key="audit-logs" mode="audit" />;
       case 'error-logs':
@@ -540,7 +578,7 @@ function PortalContent() {
       <Modal
         open={showLoginNotifModal}
         title={
-          user.role === 'ADMIN'
+          user.role === 'ADMIN' || user.role === 'SUPER_ADMIN'
             ? `New Requests Awaiting Review (${unreadNotifications.length})`
             : `New Updates & Appointments (${unreadNotifications.length})`
         }

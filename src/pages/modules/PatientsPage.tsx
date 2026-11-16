@@ -1,12 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Eye, UserPlus } from 'lucide-react';
+import { Download, Eye, UserPlus } from 'lucide-react';
 import type { Appointment, Patient } from '../../types/opd';
 import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { hasModulePermission } from '../../utils/permissions';
+import { buildCsvString, downloadCsvFile } from '../../utils/csv';
 import { formatDisplayDate } from '../../utils/rules';
+import { formatPatientRegion } from '../../utils/regions';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
+import { RegionFields } from '../../components/common/RegionFields';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 
 interface PatientsPageProps {
@@ -15,16 +19,19 @@ interface PatientsPageProps {
 }
 
 export function PatientsPage({ mode = 'directory', onRegistered }: PatientsPageProps) {
-  const { user, hasPermission } = useAuth();
+  const { user } = useAuth();
   const { notify } = useToast();
   const isDoctor = user?.role === 'DOCTOR';
-  const canManage = hasPermission('MANAGE_PATIENTS') && user?.role !== 'ADMIN';
+  const canCreate = hasModulePermission(user, 'PATIENTS', 'CREATE');
+  const canEdit = hasModulePermission(user, 'PATIENTS', 'UPDATE');
+  const canExport = hasModulePermission(user, 'PATIENTS', 'EXPORT');
 
   const [patients, setPatients] = useState<Patient[]>([]);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [genderFilter, setGenderFilter] = useState('ALL');
+  const [cityFilter, setCityFilter] = useState('ALL');
 
   const [selectedPatient, setSelectedPatient] = useState<Patient | null>(null);
   const [createOpen, setCreateOpen] = useState(mode === 'register');
@@ -35,6 +42,8 @@ export function PatientsPage({ mode = 'directory', onRegistered }: PatientsPageP
   const [lastName, setLastName] = useState('');
   const [phoneNumber, setPhoneNumber] = useState('');
   const [email, setEmail] = useState('');
+  const [city, setCity] = useState('');
+  const [locality, setLocality] = useState('');
   const [dob, setDob] = useState('');
   const [gender, setGender] = useState<'MALE' | 'FEMALE' | 'OTHER' | ''>('');
   const [bloodGroup, setBloodGroup] = useState('');
@@ -52,7 +61,7 @@ export function PatientsPage({ mode = 'directory', onRegistered }: PatientsPageP
     try {
       const [patList, apptList] = await Promise.all([
         apiClient.getPatients(),
-        apiClient.getAppointments(),
+        apiClient.getAppointments().catch(() => [] as Appointment[]),
       ]);
       setPatients(patList);
       setAppointments(apptList);
@@ -73,6 +82,8 @@ export function PatientsPage({ mode = 'directory', onRegistered }: PatientsPageP
     setLastName(pat?.last_name || '');
     setPhoneNumber(pat?.phone_number || '');
     setEmail(pat?.email || '');
+    setCity(pat?.city || '');
+    setLocality(pat?.locality || '');
     setDob(pat?.date_of_birth ? pat.date_of_birth.slice(0, 10) : '');
     setGender((pat?.gender as 'MALE' | 'FEMALE' | 'OTHER' | '') || '');
     setBloodGroup(pat?.blood_group || '');
@@ -90,8 +101,8 @@ export function PatientsPage({ mode = 'directory', onRegistered }: PatientsPageP
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!firstName.trim() || !lastName.trim() || !phoneNumber.trim()) {
-      notify('First name, last name, and phone number are required', 'error');
+    if (!firstName.trim() || !lastName.trim() || !phoneNumber.trim() || !city.trim() || !locality.trim()) {
+      notify('First name, last name, phone number, city, and locality are required', 'error');
       return;
     }
     setSaving(true);
@@ -101,6 +112,8 @@ export function PatientsPage({ mode = 'directory', onRegistered }: PatientsPageP
         last_name: lastName.trim(),
         phone_number: phoneNumber.trim(),
         email: email.trim(),
+        city: city.trim(),
+        locality: locality.trim(),
         date_of_birth: dob || undefined,
         gender: gender || undefined,
         blood_group: bloodGroup.trim() || undefined,
@@ -127,19 +140,30 @@ export function PatientsPage({ mode = 'directory', onRegistered }: PatientsPageP
     }
   };
 
+  const availableCities = useMemo(() => {
+    const set = new Set<string>();
+    for (const p of patients) {
+      if (p.city) set.add(p.city);
+    }
+    return Array.from(set).sort();
+  }, [patients]);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return patients.filter((p) => {
       if (genderFilter !== 'ALL' && (p.gender || '') !== genderFilter) return false;
+      if (cityFilter !== 'ALL' && (p.city || '').toLowerCase() !== cityFilter.toLowerCase()) return false;
       if (!q) return true;
       const full = `${p.first_name} ${p.last_name}`.toLowerCase();
       return (
         full.includes(q) ||
         p.phone_number.toLowerCase().includes(q) ||
-        (p.email || '').toLowerCase().includes(q)
+        (p.email || '').toLowerCase().includes(q) ||
+        (p.city || '').toLowerCase().includes(q) ||
+        (p.locality || '').toLowerCase().includes(q)
       );
     });
-  }, [patients, genderFilter, search]);
+  }, [patients, genderFilter, cityFilter, search]);
 
   const selectedAppointments = useMemo(() => {
     if (!selectedPatient) return [];
@@ -174,6 +198,13 @@ export function PatientsPage({ mode = 'directory', onRegistered }: PatientsPageP
       ),
     },
     {
+      key: 'region',
+      header: 'City / Locality',
+      render: (row) => (
+        <span className="text-xs text-slate-700">{formatPatientRegion(row.city, row.locality)}</span>
+      ),
+    },
+    {
       key: 'demographics',
       header: 'Gender / Blood',
       render: (row) => (
@@ -205,7 +236,7 @@ export function PatientsPage({ mode = 'directory', onRegistered }: PatientsPageP
             <Eye className="h-3.5 w-3.5" aria-hidden="true" />
             <span>Profile</span>
           </button>
-          {canManage && (
+          {canEdit && (
             <button
               type="button"
               onClick={() => openEdit(row)}
@@ -238,16 +269,46 @@ export function PatientsPage({ mode = 'directory', onRegistered }: PatientsPageP
                 : 'Search outpatient records, inspect appointment histories, and register patients in GIRISH_PATIENTS.'}
           </p>
         </div>
-        {canManage && (
-          <button
-            type="button"
-            onClick={openCreate}
-            className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap shrink-0"
-          >
-            <UserPlus className="h-4 w-4" aria-hidden="true" />
-            <span>Register Patient</span>
-          </button>
-        )}
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {canExport && (
+            <button
+              type="button"
+              onClick={() => {
+                const csv = buildCsvString(
+                  ['Patient ID', 'First Name', 'Last Name', 'Phone', 'Email', 'City', 'Locality', 'Gender', 'Blood Group', 'DOB'],
+                  filtered.map((p) => [
+                    p.patient_id,
+                    p.first_name,
+                    p.last_name,
+                    p.phone_number,
+                    p.email || '',
+                    p.city || '',
+                    p.locality || '',
+                    p.gender || '',
+                    p.blood_group || '',
+                    p.date_of_birth || '',
+                  ]),
+                );
+                downloadCsvFile('carepulse-patients.csv', csv);
+                notify('Patient directory exported as CSV', 'success');
+              }}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+            >
+              <Download className="h-4 w-4" aria-hidden="true" />
+              <span>Export CSV</span>
+            </button>
+          )}
+          {canCreate && (
+            <button
+              type="button"
+              onClick={openCreate}
+              className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap"
+            >
+              <UserPlus className="h-4 w-4" aria-hidden="true" />
+              <span>Register Patient</span>
+            </button>
+          )}
+        </div>
       </div>
 
       <DataTable
@@ -257,25 +318,40 @@ export function PatientsPage({ mode = 'directory', onRegistered }: PatientsPageP
         loading={loading}
         searchValue={search}
         onSearchChange={setSearch}
-        searchPlaceholder="Search by name, phone, or email..."
+        searchPlaceholder="Search by name, phone, email, or locality..."
         filters={
-          <select
-            aria-label="Filter by gender"
-            value={genderFilter}
-            onChange={(e) => setGenderFilter(e.target.value)}
-            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 focus:border-teal-700 focus:outline-none"
-          >
-            <option value="ALL">All Genders</option>
-            <option value="MALE">Male</option>
-            <option value="FEMALE">Female</option>
-            <option value="OTHER">Other</option>
-          </select>
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              aria-label="Filter by city"
+              value={cityFilter}
+              onChange={(e) => setCityFilter(e.target.value)}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 focus:border-teal-700 focus:outline-none"
+            >
+              <option value="ALL">All Cities</option>
+              {availableCities.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
+            <select
+              aria-label="Filter by gender"
+              value={genderFilter}
+              onChange={(e) => setGenderFilter(e.target.value)}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 focus:border-teal-700 focus:outline-none"
+            >
+              <option value="ALL">All Genders</option>
+              <option value="MALE">Male</option>
+              <option value="FEMALE">Female</option>
+              <option value="OTHER">Other</option>
+            </select>
+          </div>
         }
         emptyTitle={isDoctor ? 'No booked patients yet' : 'No patient records found'}
         emptyDescription={
           isDoctor
             ? 'Patients will appear here automatically once they book an appointment with you.'
-            : canManage
+            : canCreate
               ? 'Register a new patient or clear active search filters.'
               : 'Clear active search filters to view patient records.'
         }
@@ -293,11 +369,17 @@ export function PatientsPage({ mode = 'directory', onRegistered }: PatientsPageP
       >
         {selectedPatient && (
           <div className="space-y-5">
-            <div className="grid grid-cols-2 gap-4 rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm sm:grid-cols-4">
+            <div className="grid grid-cols-2 gap-4 rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm sm:grid-cols-5">
               <div>
                 <p className="text-xs text-slate-500">Phone</p>
                 <p className="mt-0.5 font-mono text-xs font-medium text-slate-900">
                   {selectedPatient.phone_number}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">City &amp; Locality</p>
+                <p className="mt-0.5 text-xs font-medium text-slate-900">
+                  {formatPatientRegion(selectedPatient.city, selectedPatient.locality)}
                 </p>
               </div>
               <div>
@@ -414,6 +496,14 @@ export function PatientsPage({ mode = 'directory', onRegistered }: PatientsPageP
               />
             </div>
           </div>
+
+          <RegionFields
+            idPrefix="pat"
+            city={city}
+            locality={locality}
+            onCityChange={setCity}
+            onLocalityChange={setLocality}
+          />
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
             <div>

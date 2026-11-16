@@ -1,4 +1,6 @@
 import type {
+  AccountStatus,
+  AnalyticsDatasetResponse,
   Appointment,
   AuditLogRecord,
   AuthUser,
@@ -10,16 +12,24 @@ import type {
   DoctorLeave,
   DoctorShiftConfig,
   ErrorLogRecord,
+  ManagedUserRecord,
+  MedicalRecordEntry,
+  ModuleDefinition,
   Patient,
   Payment,
   PermissionRecord,
   PortalNotification,
+  PrescriptionEntry,
+  RbacAuditLogEntry,
+  RoleDefinition,
   RoleName,
   RoleRecord,
+  SecuritySettings,
   ShiftChangeRequest,
   ShiftSession,
   Slot,
   SlotTemplate,
+  SuperAdminOverviewResponse,
   TokenQueueItem,
   UserAccount,
 } from '../types/opd';
@@ -116,6 +126,8 @@ export interface RegisterPatientInput {
   last_name: string;
   phone_number: string;
   email: string;
+  city: string;
+  locality: string;
   date_of_birth?: string;
   gender?: 'MALE' | 'FEMALE' | 'OTHER' | '';
   blood_group?: string;
@@ -129,21 +141,7 @@ export interface OrdsActionResponse {
   expired_count?: number;
 }
 
-export interface DirectoryAccountEntry {
-  role: RoleName;
-  full_name: string;
-  email: string;
-  detail?: string;
-}
-
 export const apiClient = {
-  async getLoginDirectory(role?: RoleName): Promise<DirectoryAccountEntry[]> {
-    const qs = role ? `?role=${encodeURIComponent(role)}` : '';
-    const res = await requestJson<{ status: string; accounts?: DirectoryAccountEntry[] }>(
-      `/api/auth/directory${qs}`,
-    );
-    return Array.isArray(res.accounts) ? res.accounts : [];
-  },
 
   async login(input: {
     full_name: string;
@@ -210,6 +208,10 @@ export const apiClient = {
 
   async getDashboardSummary(): Promise<DashboardSummaryResponse> {
     return requestJson<DashboardSummaryResponse>('/api/dashboard/summary');
+  },
+
+  async getAnalytics(): Promise<AnalyticsDatasetResponse> {
+    return requestJson<AnalyticsDatasetResponse>('/api/analytics');
   },
 
   async getNotifications(): Promise<{
@@ -520,7 +522,7 @@ export const apiClient = {
       body: JSON.stringify({ decision, comments }),
     }),
 
-  // Users, Roles & Logs (Admin)
+  // Users, Roles & Logs (Legacy ORDS + Super Admin RBAC)
   getUsers: () => fetchCollection<UserAccount>('users'),
   createUser: (payload: {
     username: string;
@@ -539,4 +541,185 @@ export const apiClient = {
   getPermissions: () => fetchCollection<PermissionRecord>('permissions'),
   getAuditLogs: () => fetchCollection<AuditLogRecord>('audit-logs'),
   getErrorLogs: () => fetchCollection<ErrorLogRecord>('error-logs'),
+
+  // Security Policy (Public auth metadata)
+  getSecurityPolicy: () =>
+    requestJson<{
+      status: string;
+      allow_patient_registration: boolean;
+      min_password_length: number;
+      enforce_strict_role_portal: boolean;
+    }>('/api/auth/security-policy'),
+
+  // Super Admin & Dynamic RBAC Management
+  getRbacOverview: () => requestJson<SuperAdminOverviewResponse>('/api/rbac/overview'),
+  getRbacUsers: () =>
+    requestJson<{ status: string; users: ManagedUserRecord[]; roles: RoleDefinition[] }>(
+      '/api/rbac/users',
+    ),
+  createRbacUser: (payload: {
+    full_name: string;
+    email: string;
+    password: string;
+    role_name: 'ADMIN' | 'DOCTOR' | 'RECEPTIONIST';
+    phone_number?: string;
+    doctor_id?: number | null;
+    department_id?: number;
+    specialization?: string;
+    consultation_fee?: number;
+    tele_consult_flag?: 'Y' | 'N';
+    employment_type?: 'FULL_TIME' | 'PART_TIME';
+  }) =>
+    requestJson<{ status: string; message: string; user?: ManagedUserRecord }>('/api/rbac/users', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  updateUserStatus: (userKey: string, status: AccountStatus) =>
+    requestJson<{ status: string; message: string; user?: ManagedUserRecord }>(
+      `/api/rbac/users/${encodeURIComponent(userKey)}/status`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ status }),
+      },
+    ),
+  updateUserRole: (userKey: string, role: RoleName) =>
+    requestJson<{ status: string; message: string; user?: ManagedUserRecord }>(
+      `/api/rbac/users/${encodeURIComponent(userKey)}/role`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ role }),
+      },
+    ),
+  updateUserPermissions: (
+    userKey: string,
+    payload: { grants?: string[]; revokes?: string[]; effective_permissions?: string[] },
+  ) =>
+    requestJson<{
+      status: string;
+      message: string;
+      diff: { added: string[]; removed: string[] };
+      user?: ManagedUserRecord;
+    }>(`/api/rbac/users/${encodeURIComponent(userKey)}/permissions`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  resetUserPermissions: (userKey: string) =>
+    requestJson<{ status: string; message: string; user?: ManagedUserRecord }>(
+      `/api/rbac/users/${encodeURIComponent(userKey)}/reset-permissions`,
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
+  resetUserPassword: (userKey: string, newPassword: string) =>
+    requestJson<{ status: string; message: string }>(
+      `/api/rbac/users/${encodeURIComponent(userKey)}/reset-password`,
+      { method: 'POST', body: JSON.stringify({ new_password: newPassword }) },
+    ),
+  getRbacRoles: () =>
+    requestJson<{
+      status: string;
+      roles: RoleDefinition[];
+      modules: ModuleDefinition[];
+      defaults: Record<RoleName, string[]>;
+    }>('/api/rbac/roles'),
+  updateRolePermissions: (role: RoleName, permissions: string[]) =>
+    requestJson<{
+      status: string;
+      message: string;
+      diff: { added: string[]; removed: string[] };
+      roles: RoleDefinition[];
+    }>(`/api/rbac/roles/${encodeURIComponent(role)}/permissions`, {
+      method: 'PUT',
+      body: JSON.stringify({ permissions }),
+    }),
+  resetRolePermissions: (role: RoleName) =>
+    requestJson<{ status: string; message: string; roles: RoleDefinition[] }>(
+      `/api/rbac/roles/${encodeURIComponent(role)}/reset`,
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
+  getRbacAuditLogs: () =>
+    requestJson<{ status: string; logs: RbacAuditLogEntry[] }>('/api/rbac/audit-logs'),
+  getSecuritySettings: () =>
+    requestJson<{ status: string; settings: SecuritySettings }>('/api/rbac/security-settings'),
+  updateSecuritySettings: (payload: Partial<SecuritySettings>) =>
+    requestJson<{ status: string; message: string; settings: SecuritySettings }>(
+      '/api/rbac/security-settings',
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+    ),
+
+  // Clinical Modules (Medical Records & Prescriptions)
+  getMedicalRecords: () =>
+    requestJson<{ status: string; records: MedicalRecordEntry[] }>('/api/clinical/records'),
+  createMedicalRecord: (payload: {
+    patient_id: number;
+    patient_name?: string;
+    doctor_id?: number;
+    doctor_name?: string;
+    appointment_ref?: string;
+    visit_date?: string;
+    chief_complaint: string;
+    diagnosis: string;
+    vitals_summary?: string;
+    clinical_notes?: string;
+  }) =>
+    requestJson<{ status: string; record: MedicalRecordEntry }>('/api/clinical/records', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  updateMedicalRecord: (
+    id: string,
+    payload: {
+      chief_complaint?: string;
+      diagnosis?: string;
+      vitals_summary?: string;
+      clinical_notes?: string;
+    },
+  ) =>
+    requestJson<{ status: string; record: MedicalRecordEntry }>(
+      `/api/clinical/records/${encodeURIComponent(id)}`,
+      { method: 'PUT', body: JSON.stringify(payload) },
+    ),
+  deleteMedicalRecord: (id: string) =>
+    requestJson<{ status: string; message: string }>(
+      `/api/clinical/records/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    ),
+  getPrescriptions: () =>
+    requestJson<{ status: string; prescriptions: PrescriptionEntry[] }>(
+      '/api/clinical/prescriptions',
+    ),
+  createPrescription: (payload: {
+    patient_id: number;
+    patient_name?: string;
+    doctor_id?: number;
+    doctor_name?: string;
+    appointment_ref?: string;
+    prescribed_date?: string;
+    diagnosis: string;
+    medications: Array<{ name: string; dosage: string; frequency: string; duration: string }>;
+    instructions?: string;
+  }) =>
+    requestJson<{ status: string; prescription: PrescriptionEntry }>(
+      '/api/clinical/prescriptions',
+      { method: 'POST', body: JSON.stringify(payload) },
+    ),
+  updatePrescription: (
+    id: string,
+    payload: {
+      diagnosis?: string;
+      instructions?: string;
+      status?: 'ACTIVE' | 'COMPLETED';
+      medications?: Array<{ name: string; dosage: string; frequency: string; duration: string }>;
+    },
+  ) =>
+    requestJson<{ status: string; prescription: PrescriptionEntry }>(
+      `/api/clinical/prescriptions/${encodeURIComponent(id)}`,
+      { method: 'PUT', body: JSON.stringify(payload) },
+    ),
+  deletePrescription: (id: string) =>
+    requestJson<{ status: string; message: string }>(
+      `/api/clinical/prescriptions/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    ),
 };

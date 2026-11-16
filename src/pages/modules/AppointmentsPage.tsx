@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { CalendarPlus, Check, Clock, RefreshCw, XCircle } from 'lucide-react';
+import { CalendarPlus, Check, Clock, Download, RefreshCw, XCircle } from 'lucide-react';
 import type { Appointment, CancellationRule, Department, Doctor, Patient, Slot } from '../../types/opd';
 import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { hasModulePermission } from '../../utils/permissions';
+import { buildCsvString, downloadCsvFile } from '../../utils/csv';
 import {
   enrichAppointments,
   enrichSlots,
@@ -24,7 +26,7 @@ interface AppointmentsPageProps {
 }
 
 export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsPageProps) {
-  const { user, hasPermission } = useAuth();
+  const { user } = useAuth();
   const { notify } = useToast();
 
   const [appointments, setAppointments] = useState<Appointment[]>([]);
@@ -68,7 +70,9 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
         apiClient.getSlotTemplates(),
         apiClient.getDoctors(),
         apiClient.getDepartments(),
-        user?.role === 'PATIENT' ? Promise.resolve([] as Patient[]) : apiClient.getPatients(),
+        user?.role === 'PATIENT'
+          ? Promise.resolve([] as Patient[])
+          : apiClient.getPatients().catch(() => [] as Patient[]),
         apiClient.getCancellationRules().catch(() => [] as CancellationRule[]),
       ]);
       const allDepts = await apiClient.resolveDepartmentsForIds(
@@ -162,11 +166,16 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
     });
   }, [appointments, mode, statusFilter, doctorFilter, dateFilter, search]);
 
-  const canBook = user?.role === 'PATIENT' || user?.role === 'RECEPTIONIST';
-
-  const canConfirmOrCancel = user?.role !== 'DOCTOR';
+  const canBook = hasModulePermission(user, 'APPOINTMENTS', 'CREATE') && user?.role !== 'DOCTOR';
+  const canConfirm = hasModulePermission(user, 'APPOINTMENTS', 'UPDATE') && user?.role !== 'DOCTOR';
+  const canCancel = hasModulePermission(user, 'APPOINTMENTS', 'DELETE') && user?.role !== 'DOCTOR';
   const canUpdateOutcome =
-    hasPermission('UPDATE_APPOINTMENTS') && user?.role !== 'PATIENT';
+    hasModulePermission(user, 'APPOINTMENTS', 'UPDATE') && user?.role !== 'PATIENT';
+  const canExpireHolds =
+    hasModulePermission(user, 'APPOINTMENTS', 'UPDATE') &&
+    user?.role !== 'PATIENT' &&
+    user?.role !== 'DOCTOR';
+  const canExport = hasModulePermission(user, 'APPOINTMENTS', 'EXPORT');
 
   const columns: DataColumn<Appointment>[] = [
     {
@@ -226,7 +235,7 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
       align: 'right',
       render: (row) => (
         <div className="inline-flex flex-wrap items-center justify-end gap-1.5">
-          {row.status === 'HELD' && canConfirmOrCancel && (
+          {row.status === 'HELD' && canConfirm && (
             <button
               type="button"
               onClick={() => setPendingAction({ appointment: row, type: 'confirm' })}
@@ -236,7 +245,7 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
               <span>Confirm</span>
             </button>
           )}
-          {['HELD', 'CONFIRMED'].includes(row.status) && canConfirmOrCancel && (
+          {['HELD', 'CONFIRMED'].includes(row.status) && canCancel && (
             <button
               type="button"
               onClick={() => setPendingAction({ appointment: row, type: 'cancel' })}
@@ -328,7 +337,32 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 shrink-0">
-          {(user?.role === 'ADMIN' || user?.role === 'RECEPTIONIST') && (
+          {canExport && (
+            <button
+              type="button"
+              onClick={() => {
+                const csv = buildCsvString(
+                  ['Reference', 'Patient', 'Doctor', 'Department', 'Date', 'Start Time', 'Status'],
+                  filteredAppointments.map((a) => [
+                    a.appointment_ref,
+                    a.patient_name,
+                    a.doctor_name || `Slot #${a.slot_id}`,
+                    a.department_name || 'OPD',
+                    a.slot_date || a.created_on,
+                    a.start_time || '',
+                    a.status,
+                  ]),
+                );
+                downloadCsvFile('carepulse-appointments.csv', csv);
+                notify('Appointments exported as CSV', 'success');
+              }}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+            >
+              <Download className="h-4 w-4" aria-hidden="true" />
+              <span>Export CSV</span>
+            </button>
+          )}
+          {canExpireHolds && (
             <button
               type="button"
               onClick={handleExpireHolds}

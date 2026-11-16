@@ -1,5 +1,7 @@
 import { Calendar, CalendarPlus, ListOrdered, RefreshCw, UserPlus, Users } from 'lucide-react';
 import type { DashboardSummaryResponse, RouteKey } from '../../types/opd';
+import { useAuth } from '../../context/AuthContext';
+import { canAccessRoute, hasModulePermission } from '../../utils/permissions';
 import { formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 
@@ -16,7 +18,13 @@ export function ReceptionistDashboard({
   refreshing,
   onNavigate,
 }: ReceptionistDashboardProps) {
+  const { user } = useAuth();
   const { metrics } = data;
+  const canRegisterPatient = canAccessRoute(user, 'register-patient');
+  const canBookAppointment = canAccessRoute(user, 'book-appointment');
+  const showSlots = canAccessRoute(user, 'slots');
+  const showAppointments = canAccessRoute(user, 'appointments');
+  const showPayments = hasModulePermission(user, 'PAYMENTS', 'VIEW');
 
   return (
     <div className="space-y-6">
@@ -28,22 +36,26 @@ export function ReceptionistDashboard({
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={() => onNavigate('register-patient')}
-            className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 whitespace-nowrap"
-          >
-            <UserPlus className="h-4 w-4" aria-hidden="true" />
-            <span>Register Patient</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => onNavigate('book-appointment')}
-            className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap"
-          >
-            <CalendarPlus className="h-4 w-4" aria-hidden="true" />
-            <span>Book Walk-in / OPD</span>
-          </button>
+          {canRegisterPatient && (
+            <button
+              type="button"
+              onClick={() => onNavigate('register-patient')}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 whitespace-nowrap"
+            >
+              <UserPlus className="h-4 w-4" aria-hidden="true" />
+              <span>Register Patient</span>
+            </button>
+          )}
+          {canBookAppointment && (
+            <button
+              type="button"
+              onClick={() => onNavigate('book-appointment')}
+              className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap"
+            >
+              <CalendarPlus className="h-4 w-4" aria-hidden="true" />
+              <span>Book Walk-in / OPD</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={onRefresh}
@@ -103,7 +115,9 @@ export function ReceptionistDashboard({
             {metrics.waiting_tokens}
           </p>
           <p className="mt-1 text-xs text-slate-500 tabular-nums">
-            Waiting · {formatCurrencyInr(metrics.total_payments_amount)} collected
+            {showPayments
+              ? `Waiting · ${formatCurrencyInr(metrics.total_payments_amount)} collected`
+              : `${metrics.in_consultation_tokens} in consultation · ${metrics.done_tokens} done`}
           </p>
         </div>
       </div>
@@ -112,13 +126,15 @@ export function ReceptionistDashboard({
         <section className="rounded-xl border border-slate-200 bg-white lg:col-span-2">
           <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
             <h3 className="text-base font-semibold text-slate-900">Upcoming Available Slots</h3>
-            <button
-              type="button"
-              onClick={() => onNavigate('slots')}
-              className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
-            >
-              All Slots
-            </button>
+            {showSlots && (
+              <button
+                type="button"
+                onClick={() => onNavigate('slots')}
+                className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
+              >
+                All Slots
+              </button>
+            )}
           </div>
           {data.upcoming_slots.length === 0 ? (
             <div className="p-8 text-center text-sm text-slate-500">
@@ -163,13 +179,15 @@ export function ReceptionistDashboard({
         <section className="rounded-xl border border-slate-200 bg-white">
           <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
             <h3 className="text-base font-semibold text-slate-900">Recent Bookings</h3>
-            <button
-              type="button"
-              onClick={() => onNavigate('appointments')}
-              className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
-            >
-              Manage
-            </button>
+            {showAppointments && (
+              <button
+                type="button"
+                onClick={() => onNavigate('appointments')}
+                className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
+              >
+                Manage
+              </button>
+            )}
           </div>
           {data.recent_appointments.length === 0 ? (
             <div className="p-8 text-center text-sm text-slate-500">No bookings yet.</div>

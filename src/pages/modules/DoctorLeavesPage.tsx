@@ -4,6 +4,7 @@ import type { Doctor, DoctorLeave } from '../../types/opd';
 import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { hasModulePermission } from '../../utils/permissions';
 import { formatDisplayDate, formatDisplayDateTime } from '../../utils/rules';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
@@ -11,13 +12,14 @@ import { MissingEndpointBanner } from '../../components/common/MissingEndpointBa
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 
 export function DoctorLeavesPage() {
-  const { user, hasPermission } = useAuth();
+  const { user } = useAuth();
   const { notify } = useToast();
 
-  const canRequest = hasPermission('REQUEST_LEAVE') || user?.role === 'DOCTOR';
+  const canRequest = hasModulePermission(user, 'SLOTS', 'CREATE') && user?.role === 'DOCTOR';
   const canApprove =
-    (hasPermission('MANAGE_APPROVALS') || hasPermission('APPROVE_LEAVES')) &&
-    user?.role === 'ADMIN';
+    hasModulePermission(user, 'SLOTS', 'UPDATE') &&
+    user?.role !== 'DOCTOR' &&
+    user?.role !== 'PATIENT';
 
   const [leaves, setLeaves] = useState<DoctorLeave[]>([]);
   const [doctors, setDoctors] = useState<Doctor[]>([]);

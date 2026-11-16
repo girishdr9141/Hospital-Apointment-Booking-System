@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import {
   Activity,
   AlertTriangle,
+  BarChart3,
   Bell,
   Calendar,
   CalendarClock,
@@ -10,31 +11,40 @@ import {
   ClipboardCheck,
   CreditCard,
   FileSearch,
+  FileText,
   History,
+  KeyRound,
   LayoutDashboard,
   ListOrdered,
+  Lock,
   LogOut,
   Menu,
   Building2,
+  Pill,
   Shield,
+  Sliders,
   Stethoscope,
   UserCheck,
+  UserCog,
   UserPlus,
   Users,
   X,
 } from 'lucide-react';
-import type { AuthUser, PortalNotification, RouteKey } from '../../types/opd';
+import type { AuthUser, NavItem, PortalNotification, RouteKey } from '../../types/opd';
 import { getNavForUser, getRouteLabel, ROLE_LABELS } from '../../utils/permissions';
 import { formatDisplayDateTime } from '../../utils/rules';
 import { ConfirmDialog } from './ConfirmDialog';
 
 const ROUTE_ICONS: Record<RouteKey, React.ComponentType<{ className?: string }>> = {
   dashboard: LayoutDashboard,
+  analytics: BarChart3,
   patients: Users,
   'register-patient': UserPlus,
   doctors: Stethoscope,
   departments: Building2,
   'consultation-types': Activity,
+  'medical-records': FileText,
+  prescriptions: Pill,
   appointments: Calendar,
   'book-appointment': CalendarPlus,
   'appointment-history': History,
@@ -43,10 +53,21 @@ const ROUTE_ICONS: Record<RouteKey, React.ComponentType<{ className?: string }>>
   approvals: ClipboardCheck,
   payments: CreditCard,
   'token-queue': ListOrdered,
-  'users-roles': Shield,
+  'users-roles': UserCog,
+  'role-management': Shield,
+  'permission-management': Sliders,
   'audit-logs': FileSearch,
+  'security-settings': Lock,
   'error-logs': AlertTriangle,
   profile: UserCheck,
+};
+
+const SECTION_LABELS: Record<NavItem['section'], string> = {
+  governance: 'Governance & RBAC',
+  overview: 'Overview',
+  clinical: 'Clinical',
+  operations: 'Operations',
+  administration: 'Administration',
 };
 
 interface AppShellProps {
@@ -74,11 +95,19 @@ export function AppShell({
   const [notifOpen, setNotifOpen] = useState(false);
   const [confirmLogoutOpen, setConfirmLogoutOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
-  const showBell = user.role === 'ADMIN' || user.role === 'DOCTOR';
+  const showBell = user.role === 'SUPER_ADMIN' || user.role === 'ADMIN' || user.role === 'DOCTOR';
   const unreadCount = notifications.filter((n) => !n.read).length;
 
   const navItems = getNavForUser(user);
   const activeLabel = getRouteLabel(user, activeRoute);
+
+  const groupedSections = (['governance', 'overview', 'clinical', 'operations', 'administration'] as const)
+    .map((sec) => ({
+      section: sec,
+      label: SECTION_LABELS[sec],
+      items: navItems.filter((item) => item.section === sec),
+    }))
+    .filter((group) => group.items.length > 0);
 
   const handleNavClick = (route: RouteKey) => {
     onNavigate(route);
@@ -118,35 +147,42 @@ export function AppShell({
         </button>
       </div>
 
-      <nav aria-label="Primary navigation" className="flex-1 overflow-y-auto px-3 py-4">
-        <ul className="space-y-1">
-          {navItems.map((item) => {
-            const Icon = ROUTE_ICONS[item.key];
-            const isActive = activeRoute === item.key;
-            return (
-              <li key={item.key}>
-                <button
-                  type="button"
-                  onClick={() => handleNavClick(item.key)}
-                  aria-current={isActive ? 'page' : undefined}
-                  className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm font-medium transition-colors whitespace-nowrap ${
-                    isActive
-                      ? 'bg-teal-50 text-teal-900'
-                      : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
-                  }`}
-                >
-                  <Icon
-                    className={`h-4 w-4 shrink-0 ${
-                      isActive ? 'text-teal-700' : 'text-slate-400'
-                    }`}
-                    aria-hidden="true"
-                  />
-                  <span className="truncate">{item.label}</span>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
+      <nav aria-label="Primary navigation" className="flex-1 overflow-y-auto px-3 py-4 space-y-5">
+        {groupedSections.map((group) => (
+          <div key={group.section}>
+            <p className="px-3 pb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+              {group.label}
+            </p>
+            <ul className="space-y-1">
+              {group.items.map((item) => {
+                const Icon = ROUTE_ICONS[item.key] || KeyRound;
+                const isActive = activeRoute === item.key;
+                return (
+                  <li key={item.key}>
+                    <button
+                      type="button"
+                      onClick={() => handleNavClick(item.key)}
+                      aria-current={isActive ? 'page' : undefined}
+                      className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors whitespace-nowrap ${
+                        isActive
+                          ? 'bg-teal-50 text-teal-900'
+                          : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                      }`}
+                    >
+                      <Icon
+                        className={`h-4 w-4 shrink-0 ${
+                          isActive ? 'text-teal-700' : 'text-slate-400'
+                        }`}
+                        aria-hidden="true"
+                      />
+                      <span className="truncate">{item.label}</span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        ))}
       </nav>
 
       <div className="border-t border-slate-200 p-4">

@@ -12,6 +12,7 @@ import type {
 import { apiClient } from '../../services/apiClient';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { hasModulePermission } from '../../utils/permissions';
 import { enrichAppointments, enrichSlots, formatDisplayDate, getIsoDatePart } from '../../utils/rules';
 import { formatShiftSummary, getTodayIsoLocal } from '../../utils/calendar';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
@@ -26,6 +27,7 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
   const { user } = useAuth();
   const { notify } = useToast();
   const isDoctor = user?.role === 'DOCTOR';
+  const canManageDoctorSlots = isDoctor && hasModulePermission(user, 'SLOTS', 'CREATE');
 
   const [slots, setSlots] = useState<Slot[]>([]);
   const [templates, setTemplates] = useState<SlotTemplate[]>([]);
@@ -219,7 +221,7 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
               : 'Tap any doctor to view their registered shift window along with all open and booked slots (read-only).'}
           </p>
         </div>
-        {isDoctor && (
+        {canManageDoctorSlots && (
           <button
             type="button"
             disabled={Boolean(activeDoctorShift?.pending_change_request)}
@@ -468,14 +470,14 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
             templates={calendarTemplates}
             leaves={calendarLeaves}
             shiftConfig={activeDoctorShift}
-            readOnly={!isDoctor}
-            onRequestShiftChange={isDoctor ? () => setShiftModalOpen(true) : undefined}
+            readOnly={!canManageDoctorSlots}
+            onRequestShiftChange={canManageDoctorSlots ? () => setShiftModalOpen(true) : undefined}
             onSlotsChanged={refreshAll}
           />
         </div>
       )}
 
-      {isDoctor && activeCalendarDoctor && (
+      {canManageDoctorSlots && activeCalendarDoctor && (
         <DoctorShiftModal
           open={shiftModalOpen}
           mode={activeDoctorShift?.is_registered ? 'change' : 'register'}

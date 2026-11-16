@@ -2,7 +2,9 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Pencil, Plus, Trash2 } from 'lucide-react';
 import type { ConsultationType, Department } from '../../types/opd';
 import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient';
+import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { hasModulePermission } from '../../utils/permissions';
 import { formatCurrencyInr } from '../../utils/rules';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
@@ -11,7 +13,11 @@ import { MissingEndpointBanner } from '../../components/common/MissingEndpointBa
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 
 export function ConsultationTypesPage() {
+  const { user } = useAuth();
   const { notify } = useToast();
+  const canCreate = hasModulePermission(user, 'DEPARTMENTS', 'CREATE');
+  const canEdit = hasModulePermission(user, 'DEPARTMENTS', 'UPDATE');
+  const canDelete = hasModulePermission(user, 'DEPARTMENTS', 'DELETE');
 
   const [types, setTypes] = useState<ConsultationType[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
@@ -199,31 +205,39 @@ export function ConsultationTypesPage() {
       header: 'Status',
       render: (row) => <StatusIndicator status={row.is_active === 'N' ? 'INACTIVE' : 'ACTIVE'} />,
     },
-    {
-      key: 'actions',
-      header: 'Actions',
-      align: 'right',
-      render: (row) => (
-        <div className="inline-flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={() => openEdit(row)}
-            className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
-          >
-            <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
-            <span>Edit</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setDeactivateTarget(row)}
-            className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:bg-red-50"
-          >
-            <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-            <span>Deactivate</span>
-          </button>
-        </div>
-      ),
-    },
+    ...(canEdit || canDelete
+      ? [
+          {
+            key: 'actions',
+            header: 'Actions',
+            align: 'right' as const,
+            render: (row: ConsultationType) => (
+              <div className="inline-flex items-center justify-end gap-2">
+                {canEdit && (
+                  <button
+                    type="button"
+                    onClick={() => openEdit(row)}
+                    className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Edit</span>
+                  </button>
+                )}
+                {canDelete && (
+                  <button
+                    type="button"
+                    onClick={() => setDeactivateTarget(row)}
+                    className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:bg-red-50"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Deactivate</span>
+                  </button>
+                )}
+              </div>
+            ),
+          },
+        ]
+      : []),
   ];
 
   return (
@@ -235,14 +249,16 @@ export function ConsultationTypesPage() {
             Configure outpatient visit durations and consultation fees per department.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={openCreate}
-          className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap shrink-0"
-        >
-          <Plus className="h-4 w-4" aria-hidden="true" />
-          <span>Add Consultation Type</span>
-        </button>
+        {canCreate && (
+          <button
+            type="button"
+            onClick={openCreate}
+            className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap shrink-0"
+          >
+            <Plus className="h-4 w-4" aria-hidden="true" />
+            <span>Add Consultation Type</span>
+          </button>
+        )}
       </div>
 
       {missingGetEndpoint && (

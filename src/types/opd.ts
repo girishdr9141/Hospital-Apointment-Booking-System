@@ -1,4 +1,42 @@
-export type RoleName = 'ADMIN' | 'DOCTOR' | 'PATIENT' | 'RECEPTIONIST';
+export type RoleName = 'SUPER_ADMIN' | 'ADMIN' | 'DOCTOR' | 'PATIENT' | 'RECEPTIONIST';
+
+export type AccountStatus = 'ACTIVE' | 'INACTIVE' | 'SUSPENDED';
+
+export type PermissionAction = 'VIEW' | 'CREATE' | 'UPDATE' | 'DELETE' | 'EXPORT';
+
+export type ModuleKey =
+  | 'DASHBOARD'
+  | 'PATIENTS'
+  | 'DOCTORS'
+  | 'RECEPTIONISTS'
+  | 'DEPARTMENTS'
+  | 'APPOINTMENTS'
+  | 'SLOTS'
+  | 'TOKEN_QUEUE'
+  | 'PAYMENTS'
+  | 'MEDICAL_RECORDS'
+  | 'PRESCRIPTIONS'
+  | 'REVENUE_ANALYTICS'
+  | 'DOCTOR_ANALYTICS'
+  | 'DEPARTMENT_ANALYTICS'
+  | 'GEOGRAPHIC_ANALYTICS'
+  | 'USERS'
+  | 'ROLES'
+  | 'PERMISSIONS'
+  | 'SYSTEM_SETTINGS';
+
+export interface ModuleDefinition {
+  key: ModuleKey;
+  label: string;
+  category: 'Overview' | 'Clinical' | 'Operations' | 'Analytics' | 'Administration';
+  supportedActions: PermissionAction[];
+  description: string;
+}
+
+export interface UserPermissionOverride {
+  grants: string[];
+  revokes: string[];
+}
 
 export interface AuthUser {
   user_id: number;
@@ -8,13 +46,16 @@ export interface AuthUser {
   phone_number?: string | null;
   role: RoleName;
   roles: RoleName[];
+  status?: AccountStatus;
   permissions: string[];
+  grants?: string[];
+  revokes?: string[];
   doctor_id?: number | null;
   patient_id?: number | null;
   department_id?: number | null;
   department_name?: string | null;
   specialization?: string | null;
-  auth_mode?: 'ords' | 'bridge';
+  auth_mode?: 'ords' | 'bridge' | 'system' | 'managed';
 }
 
 export interface Department {
@@ -56,6 +97,8 @@ export interface Patient {
   last_name: string;
   phone_number: string;
   email?: string | null;
+  city?: string | null;
+  locality?: string | null;
   date_of_birth?: string | null;
   gender?: 'MALE' | 'FEMALE' | 'OTHER' | null;
   blood_group?: string | null;
@@ -191,7 +234,121 @@ export interface UserAccount {
   patient_id?: number | null;
   role_name?: RoleName;
   is_active: 'Y' | 'N';
+  status?: AccountStatus;
   created_on?: string;
+}
+
+export interface ManagedUserRecord {
+  user_key: string;
+  user_id: number;
+  username: string;
+  email: string;
+  full_name: string;
+  phone_number?: string | null;
+  role: RoleName;
+  status: AccountStatus;
+  doctor_id?: number | null;
+  patient_id?: number | null;
+  grants: string[];
+  revokes: string[];
+  role_permissions: string[];
+  effective_permissions: string[];
+  created_on?: string;
+  source: 'system' | 'ords' | 'managed';
+  is_protected: boolean;
+}
+
+export interface RoleDefinition {
+  role: RoleName;
+  label: string;
+  description: string;
+  is_protected: boolean;
+  is_immutable: boolean;
+  allow_public_registration: boolean;
+  max_accounts?: number | null;
+  user_count: number;
+  active_count: number;
+  permission_count: number;
+  permissions: string[];
+}
+
+export interface SecuritySettings {
+  max_failed_login_attempts: number;
+  lockout_minutes: number;
+  min_password_length: number;
+  session_ttl_hours: number;
+  allow_patient_registration: boolean;
+  enforce_strict_role_portal: boolean;
+}
+
+export interface RbacAuditLogEntry {
+  id: string;
+  actor_user_id: number | null;
+  actor_name: string;
+  actor_role: string;
+  target_user_id?: number | null;
+  target_label?: string | null;
+  action: string;
+  category: 'USER' | 'ROLE' | 'PERMISSION' | 'AUTH' | 'SECURITY' | 'CLINICAL';
+  previous_value?: string | null;
+  new_value?: string | null;
+  details: string;
+  timestamp: string;
+  severity: 'info' | 'warning' | 'critical';
+}
+
+export interface SuperAdminOverviewResponse {
+  status: 'success';
+  generated_at: string;
+  metrics: {
+    total_users: number;
+    total_admins: number;
+    total_doctors: number;
+    total_receptionists: number;
+    total_patients: number;
+    active_accounts: number;
+    inactive_accounts: number;
+    suspended_accounts: number;
+  };
+  recent_registrations: ManagedUserRecord[];
+  recent_permission_changes: RbacAuditLogEntry[];
+  recent_security_activities: RbacAuditLogEntry[];
+  roles: RoleDefinition[];
+}
+
+export interface MedicalRecordEntry {
+  record_id: string;
+  patient_id: number;
+  patient_name: string;
+  doctor_id: number;
+  doctor_name: string;
+  appointment_ref?: string | null;
+  visit_date: string;
+  chief_complaint: string;
+  diagnosis: string;
+  vitals_summary?: string | null;
+  clinical_notes: string;
+  updated_at: string;
+}
+
+export interface PrescriptionEntry {
+  prescription_id: string;
+  patient_id: number;
+  patient_name: string;
+  doctor_id: number;
+  doctor_name: string;
+  appointment_ref?: string | null;
+  prescribed_date: string;
+  diagnosis: string;
+  medications: Array<{
+    name: string;
+    dosage: string;
+    frequency: string;
+    duration: string;
+  }>;
+  instructions: string;
+  status: 'ACTIVE' | 'COMPLETED';
+  updated_at: string;
 }
 
 export interface RoleRecord {
@@ -321,6 +478,7 @@ export interface DashboardSummaryResponse {
 
 export type RouteKey =
   | 'dashboard'
+  | 'analytics'
   | 'patients'
   | 'register-patient'
   | 'doctors'
@@ -334,16 +492,22 @@ export type RouteKey =
   | 'approvals'
   | 'payments'
   | 'token-queue'
+  | 'medical-records'
+  | 'prescriptions'
   | 'users-roles'
+  | 'role-management'
+  | 'permission-management'
   | 'audit-logs'
+  | 'security-settings'
   | 'error-logs'
   | 'profile';
 
 export interface NavItem {
   key: RouteKey;
   label: string;
-  section: 'overview' | 'clinical' | 'operations' | 'administration';
+  section: 'governance' | 'overview' | 'clinical' | 'operations' | 'administration';
   requiredPermission?: string;
+  anyOfPermissions?: string[];
 }
 
 export interface PortalNotification {
@@ -355,4 +519,49 @@ export interface PortalNotification {
   created_at: string;
   read: boolean;
   severity: 'info' | 'success' | 'warning';
+}
+
+export type AnalyticsSourceTag = 'HISTORICAL' | 'LIVE';
+
+export interface AnalyticsVisitRecord {
+  id: string;
+  source: AnalyticsSourceTag;
+  visit_date: string; // YYYY-MM-DD
+  visit_month: string; // YYYY-MM
+  start_time: string; // HH:MM
+  doctor_id: number;
+  doctor_name: string;
+  department_id: number;
+  department_name: string;
+  specialization: string;
+  patient_id: number;
+  patient_name: string;
+  patient_gender: 'MALE' | 'FEMALE' | 'OTHER' | 'UNKNOWN';
+  patient_age_group: '0-18' | '19-35' | '36-55' | '56+' | 'Unknown';
+  city: string;
+  locality: string;
+  status: 'HELD' | 'CONFIRMED' | 'COMPLETED' | 'CANCELLED' | 'NO_SHOW';
+  booking_source: 'ONLINE' | 'WALK_IN';
+  payment_method: 'UPI' | 'CARD' | 'CASH' | 'NETBANKING' | 'UNPAID';
+  amount: number;
+}
+
+export interface AnalyticsDatasetResponse {
+  status: 'success';
+  generated_at: string;
+  range_start: string;
+  range_end: string;
+  historical_count: number;
+  live_count: number;
+  records: AnalyticsVisitRecord[];
+  allowed_sections?: {
+    revenue: boolean;
+    doctor: boolean;
+    department: boolean;
+    geographic: boolean;
+    export_revenue: boolean;
+    export_doctor: boolean;
+    export_department: boolean;
+    export_geographic: boolean;
+  };
 }
