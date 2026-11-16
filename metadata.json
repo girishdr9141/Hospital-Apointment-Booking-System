@@ -1,0 +1,6 @@
+{
+  "name": "CarePulse OPD — Hospital Appointment Booking System",
+  "description": "Role-based outpatient hospital appointment, slot, leave, payment, and token queue management system powered by Oracle APEX ORDS.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

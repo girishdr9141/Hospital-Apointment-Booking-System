@@ -1,0 +1,142 @@
+{
+  "shifts": {
+    "2": {
+      "doctor_id": 2,
+      "doctor_name": "Dr. Priya Sharma",
+      "sessions": [
+        {
+          "start_time": "09:00",
+          "end_time": "12:00"
+        },
+        {
+          "start_time": "14:00",
+          "end_time": "17:00"
+        }
+      ],
+      "slot_duration_mins": 30,
+      "working_days": [
+        "FRIDAY",
+        "MONDAY",
+        "SUNDAY",
+        "THURSDAY",
+        "TUESDAY",
+        "WEDNESDAY"
+      ],
+      "is_registered": true,
+      "registered_at": "2026-11-15T17:03:01.708Z",
+      "updated_at": "2026-11-15T17:03:01.708Z"
+    },
+    "5": {
+      "doctor_id": 5,
+      "doctor_name": "Dr. Vikram Rao",
+      "sessions": [
+        {
+          "start_time": "09:00",
+          "end_time": "11:00"
+        },
+        {
+          "start_time": "13:00",
+          "end_time": "17:00"
+        }
+      ],
+      "slot_duration_mins": 15,
+      "working_days": [
+        "FRIDAY",
+        "MONDAY",
+        "THURSDAY",
+        "TUESDAY",
+        "WEDNESDAY"
+      ],
+      "is_registered": true,
+      "registered_at": "2026-11-16T04:07:12.960Z",
+      "updated_at": "2026-11-16T04:07:12.960Z"
+    },
+    "46": {
+      "doctor_id": 46,
+      "doctor_name": "Dr. Rohit Ramachandra",
+      "sessions": [
+        {
+          "start_time": "10:00",
+          "end_time": "15:20"
+        }
+      ],
+      "slot_duration_mins": 20,
+      "working_days": [
+        "FRIDAY",
+        "MONDAY",
+        "THURSDAY",
+        "TUESDAY",
+        "WEDNESDAY"
+      ],
+      "is_registered": true,
+      "registered_at": "2026-11-15T17:11:49.144Z",
+      "updated_at": "2026-11-15T17:15:52.297Z"
+    }
+  },
+  "change_requests": [
+    {
+      "request_id": "SCR-1794762901927",
+      "doctor_id": 46,
+      "doctor_name": "Dr. Rohit Ramachandra",
+      "current_sessions": [
+        {
+          "start_time": "13:00",
+          "end_time": "14:20"
+        },
+        {
+          "start_time": "15:00",
+          "end_time": "16:00"
+        }
+      ],
+      "current_slot_duration_mins": 20,
+      "current_working_days": [
+        "FRIDAY",
+        "MONDAY",
+        "THURSDAY",
+        "TUESDAY",
+        "WEDNESDAY"
+      ],
+      "requested_sessions": [
+        {
+          "start_time": "10:00",
+          "end_time": "15:20"
+        }
+      ],
+      "requested_slot_duration_mins": 20,
+      "requested_working_days": [
+        "FRIDAY",
+        "MONDAY",
+        "THURSDAY",
+        "TUESDAY",
+        "WEDNESDAY"
+      ],
+      "reason": "Personal",
+      "status": "APPROVED",
+      "requested_on": "2026-11-15T17:15:01.927Z",
+      "decided_on": "2026-11-15T17:15:52.297Z",
+      "decided_by": "Girish DR",
+      "decision_comments": "ok"
+    }
+  ],
+  "opened_slot_keys": [
+    "46|2026-11-15|10:20",
+    "5|2026-11-16|09:30",
+    "5|2026-11-16|09:45",
+    "5|2026-11-16|10:00",
+    "5|2026-11-16|10:30",
+    "5|2026-11-16|10:45",
+    "5|2026-11-16|13:30",
+    "5|2026-11-16|13:45",
+    "5|2026-11-16|14:30",
+    "5|2026-11-16|14:45",
+    "5|2026-11-16|15:00",
+    "5|2026-11-16|15:15",
+    "5|2026-11-16|16:15",
+    "5|2026-11-16|16:30"
+  ],
+  "template_doctor_map": {
+    "261": 2,
+    "293": 2
+  },
+  "opened_slots_initialized": true
+}

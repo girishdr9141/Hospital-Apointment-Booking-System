@@ -1,0 +1,501 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  Calendar as CalendarIcon,
+  CalendarCheck,
+  ChevronLeft,
+  ChevronRight,
+  Clock,
+  Stethoscope,
+  Video,
+} from 'lucide-react';
+import type { Department, Doctor, Patient, Slot } from '../../types/opd';
+import { apiClient } from '../../services/apiClient';
+import { useToast } from '../../context/ToastContext';
+import { getMonthGridDates, getTodayIsoLocal } from '../../utils/calendar';
+import { formatCurrencyInr, formatDisplayDate, getIsoDatePart } from '../../utils/rules';
+
+interface PatientBookingCalendarProps {
+  slots: Slot[];
+  doctors: Doctor[];
+  departments: Department[];
+  patients?: Patient[];
+  isPatientRole: boolean;
+  fixedPatientId?: number | null;
+  onBooked: () => Promise<void> | void;
+  onCancel?: () => void;
+}
+
+const MONTH_NAMES = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+];
+
+const WEEKDAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+export function PatientBookingCalendar({
+  slots,
+  doctors,
+  departments,
+  patients = [],
+  isPatientRole,
+  fixedPatientId,
+  onBooked,
+  onCancel,
+}: PatientBookingCalendarProps) {
+  const { notify } = useToast();
+  const todayIso = getTodayIsoLocal();
+  const now = new Date();
+
+  const [viewYear, setViewYear] = useState(now.getFullYear());
+  const [viewMonth, setViewMonth] = useState(now.getMonth());
+  const [selectedDate, setSelectedDate] = useState(todayIso);
+
+  const [selectedDeptId, setSelectedDeptId] = useState('ALL');
+  const [selectedDoctorId, setSelectedDoctorId] = useState('ALL');
+  const [selectedSlot, setSelectedSlot] = useState<Slot | null>(null);
+  const [selectedPatientId, setSelectedPatientId] = useState(
+    patients[0] ? String(patients[0].patient_id) : '',
+  );
+  const [bookingSource, setBookingSource] = useState<'ONLINE' | 'WALK_IN'>(
+    isPatientRole ? 'ONLINE' : 'WALK_IN',
+  );
+  const [bookingBusy, setBookingBusy] = useState(false);
+
+  useEffect(() => {
+    if (patients[0] && !selectedPatientId) {
+      setSelectedPatientId(String(patients[0].patient_id));
+    }
+  }, [patients, selectedPatientId]);
+
+  const filteredDoctors = useMemo(() => {
+    if (selectedDeptId === 'ALL') return doctors;
+    return doctors.filter((d) => String(d.department_id) === selectedDeptId);
+  }, [doctors, selectedDeptId]);
+
+  const doctorById = useMemo(
+    () => new Map(doctors.map((d) => [d.doctor_id, d])),
+    [doctors],
+  );
+
+  const matchingAvailableSlots = useMemo(() => {
+    const allowedDocIds = new Set(filteredDoctors.map((d) => d.doctor_id));
+    return slots
+      .filter((s) => {
+        if (s.status !== 'AVAILABLE' || s.booked_patients >= s.max_patients_per_slot) return false;
+        const dStr = getIsoDatePart(s.slot_date);
+        if (!dStr || dStr < todayIso) return false;
+        if (selectedDoctorId !== 'ALL') {
+          return String(s.doctor_id || '') === selectedDoctorId;
+        }
+        if (selectedDeptId !== 'ALL') {
+          return Boolean(s.doctor_id && allowedDocIds.has(s.doctor_id));
+        }
+        return true;
+      })
+      .sort((a, b) => {
+        const dCmp = getIsoDatePart(a.slot_date).localeCompare(getIsoDatePart(b.slot_date));
+        if (dCmp !== 0) return dCmp;
+        return (a.start_time || '').localeCompare(b.start_time || '');
+      });
+  }, [slots, filteredDoctors, selectedDoctorId, selectedDeptId, todayIso]);
+
+  const availableCountByDate = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const s of matchingAvailableSlots) {
+      const d = getIsoDatePart(s.slot_date);
+      map.set(d, (map.get(d) || 0) + 1);
+    }
+    return map;
+  }, [matchingAvailableSlots]);
+
+  // Keep selected date aligned with earliest available date when current selectedDate has 0 open slots
+  useEffect(() => {
+    if (availableCountByDate.size === 0) return;
+    if ((availableCountByDate.get(selectedDate) || 0) > 0) return;
+    const firstAvailDate = Array.from(availableCountByDate.keys()).sort()[0];
+    if (firstAvailDate) {
+      setSelectedDate(firstAvailDate);
+      const [y, m] = firstAvailDate.split('-').map(Number);
+      if (y && m) {
+        setViewYear(y);
+        setViewMonth(m - 1);
+      }
+    }
+  }, [availableCountByDate, selectedDate]);
+
+  const slotsForSelectedDate = useMemo(
+    () =>
+      matchingAvailableSlots.filter(
+        (s) => getIsoDatePart(s.slot_date) === selectedDate,
+      ),
+    [matchingAvailableSlots, selectedDate],
+  );
+
+  const gridCells = useMemo(
+    () => getMonthGridDates(viewYear, viewMonth, todayIso),
+    [viewYear, viewMonth, todayIso],
+  );
+
+  const shiftMonth = (delta: number) => {
+    const d = new Date(Date.UTC(viewYear, viewMonth + delta, 1));
+    setViewYear(d.getUTCFullYear());
+    setViewMonth(d.getUTCMonth());
+  };
+
+  const handleConfirmBooking = async () => {
+    if (!selectedSlot) return;
+    const patientIdToUse = isPatientRole ? fixedPatientId : Number(selectedPatientId);
+    if (!patientIdToUse) {
+      notify('Please select a patient record before booking', 'error');
+      return;
+    }
+
+    setBookingBusy(true);
+    try {
+      const res = await apiClient.bookAppointment({
+        patient_id: patientIdToUse,
+        slot_id: selectedSlot.slot_id,
+        booking_source: isPatientRole ? 'ONLINE' : bookingSource,
+      });
+      notify(
+        `Appointment booked successfully (${res.appointment_ref || 'Ref generated'})`,
+        'success',
+      );
+      setSelectedSlot(null);
+      await onBooked();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to book appointment', 'error');
+    } finally {
+      setBookingBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Filter Bar */}
+      <div className="grid grid-cols-1 gap-3 rounded-xl border border-slate-200 bg-white p-4 sm:grid-cols-2 lg:grid-cols-4">
+        {!isPatientRole && (
+          <>
+            <div>
+              <label htmlFor="cal-book-patient" className="block text-xs font-medium text-slate-600">
+                Patient *
+              </label>
+              <select
+                id="cal-book-patient"
+                value={selectedPatientId}
+                onChange={(e) => setSelectedPatientId(e.target.value)}
+                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none"
+              >
+                {patients.map((p) => (
+                  <option key={p.patient_id} value={String(p.patient_id)}>
+                    {p.first_name} {p.last_name} ({p.phone_number})
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label htmlFor="cal-book-source" className="block text-xs font-medium text-slate-600">
+                Booking Source *
+              </label>
+              <select
+                id="cal-book-source"
+                value={bookingSource}
+                onChange={(e) => setBookingSource(e.target.value as 'ONLINE' | 'WALK_IN')}
+                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none"
+              >
+                <option value="WALK_IN">Walk-in (Confirmed)</option>
+                <option value="ONLINE">Online (10-min Hold)</option>
+              </select>
+            </div>
+          </>
+        )}
+
+        <div>
+          <label htmlFor="cal-book-dept" className="block text-xs font-medium text-slate-600">
+            Department
+          </label>
+          <select
+            id="cal-book-dept"
+            value={selectedDeptId}
+            onChange={(e) => {
+              setSelectedDeptId(e.target.value);
+              setSelectedDoctorId('ALL');
+              setSelectedSlot(null);
+            }}
+            className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none"
+          >
+            <option value="ALL">All Departments</option>
+            {departments.map((d) => (
+              <option key={d.department_id} value={String(d.department_id)}>
+                {d.department_name}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div>
+          <label htmlFor="cal-book-doc" className="block text-xs font-medium text-slate-600">
+            Doctor
+          </label>
+          <select
+            id="cal-book-doc"
+            value={selectedDoctorId}
+            onChange={(e) => {
+              setSelectedDoctorId(e.target.value);
+              setSelectedSlot(null);
+            }}
+            className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none"
+          >
+            <option value="ALL">All Available Doctors</option>
+            {filteredDoctors.map((d) => (
+              <option key={d.doctor_id} value={String(d.doctor_id)}>
+                Dr. {d.first_name} {d.last_name} ({formatCurrencyInr(d.consultation_fee)})
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {/* Calendar + Slots Grid */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+        <section className="rounded-xl border border-slate-200 bg-white p-4 sm:p-5 lg:col-span-5">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <h3 className="flex items-center gap-2 text-base font-semibold text-slate-900">
+                <CalendarIcon className="h-4 w-4 text-teal-700" aria-hidden="true" />
+                <span>Appointment Calendar</span>
+              </h3>
+              <p className="mt-0.5 text-xs text-slate-500">
+                Highlighted dates have confirmed doctor slots open for booking.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setViewYear(now.getFullYear());
+                setViewMonth(now.getMonth());
+                setSelectedDate(todayIso);
+                setSelectedSlot(null);
+              }}
+              className="rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100"
+            >
+              Today
+            </button>
+          </div>
+
+          <div className="mt-4 flex items-center justify-between">
+            <button
+              type="button"
+              onClick={() => shiftMonth(-1)}
+              aria-label="Previous month"
+              className="rounded-lg border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-50"
+            >
+              <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+            </button>
+            <span className="text-sm font-semibold text-slate-900">
+              {MONTH_NAMES[viewMonth]} {viewYear}
+            </span>
+            <button
+              type="button"
+              onClick={() => shiftMonth(1)}
+              aria-label="Next month"
+              className="rounded-lg border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-50"
+            >
+              <ChevronRight className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </div>
+
+          <div className="mt-3 grid grid-cols-7 gap-1 text-center text-[11px] font-medium text-slate-500">
+            {WEEKDAY_SHORT.map((d) => (
+              <div key={d} className="py-1">
+                {d}
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-1 grid grid-cols-7 gap-1">
+            {gridCells.map((cell) => {
+              const openCount = availableCountByDate.get(cell.isoDate) || 0;
+              const isSelected = cell.isoDate === selectedDate;
+              return (
+                <button
+                  key={cell.isoDate}
+                  type="button"
+                  disabled={cell.isPast}
+                  onClick={() => {
+                    setSelectedDate(cell.isoDate);
+                    setSelectedSlot(null);
+                  }}
+                  aria-label={`Choose ${cell.isoDate}`}
+                  className={`flex min-h-[54px] flex-col items-center justify-between rounded-lg border p-1.5 text-xs transition-colors ${
+                    cell.isPast
+                      ? 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300'
+                      : isSelected
+                        ? 'border-teal-700 bg-teal-50 text-teal-950 ring-2 ring-teal-700/20'
+                        : openCount > 0
+                          ? 'border-emerald-200 bg-emerald-50/40 text-slate-900 hover:bg-emerald-50'
+                          : cell.inCurrentMonth
+                            ? 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                            : 'border-slate-100 bg-slate-50/50 text-slate-400 hover:bg-slate-50'
+                  }`}
+                >
+                  <span
+                    className={`font-mono text-xs tabular-nums ${
+                      cell.isToday && !cell.isPast ? 'font-bold text-teal-700' : 'font-medium'
+                    }`}
+                  >
+                    {cell.dayNumber}
+                  </span>
+                  {!cell.isPast && openCount > 0 ? (
+                    <span className="rounded bg-teal-700 px-1 font-mono text-[10px] font-medium text-white tabular-nums">
+                      {openCount}
+                    </span>
+                  ) : (
+                    <span className="text-[10px] text-slate-300">·</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </section>
+
+        {/* Right: Available Slots on Selected Date + Confirmation */}
+        <section className="flex flex-col justify-between rounded-xl border border-slate-200 bg-white p-4 sm:p-5 lg:col-span-7">
+          <div>
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Available Slots · {formatDisplayDate(selectedDate)}
+                </h3>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  Select a confirmed doctor time slot below to book your appointment.
+                </p>
+              </div>
+              <span className="rounded-md bg-slate-100 px-2.5 py-1 font-mono text-xs font-medium text-slate-700 tabular-nums">
+                {slotsForSelectedDate.length} open
+              </span>
+            </div>
+
+            {slotsForSelectedDate.length === 0 ? (
+              <div className="my-8 rounded-xl border border-dashed border-slate-200 bg-slate-50 p-6 text-center">
+                <Stethoscope className="mx-auto h-6 w-6 text-slate-400" aria-hidden="true" />
+                <p className="mt-2 text-sm font-medium text-slate-800">
+                  No open doctor slots on {formatDisplayDate(selectedDate)}
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  Try another highlighted date on the calendar or switch the Department/Doctor filter.
+                </p>
+              </div>
+            ) : (
+              <div className="mt-4 grid max-h-[340px] grid-cols-1 gap-2.5 overflow-y-auto pr-1 sm:grid-cols-2">
+                {slotsForSelectedDate.map((slot) => {
+                  const doc = slot.doctor_id ? doctorById.get(slot.doctor_id) : undefined;
+                  const isPicked = selectedSlot?.slot_id === slot.slot_id;
+                  return (
+                    <button
+                      key={slot.slot_id}
+                      type="button"
+                      onClick={() => setSelectedSlot(slot)}
+                      className={`flex flex-col items-start rounded-xl border p-3 text-left transition-colors ${
+                        isPicked
+                          ? 'border-teal-700 bg-teal-50 ring-2 ring-teal-700/20'
+                          : 'border-slate-200 bg-white hover:border-teal-600 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div className="flex w-full items-center justify-between gap-2">
+                        <span className="inline-flex items-center gap-1 font-mono text-xs font-semibold text-slate-900 tabular-nums">
+                          <Clock className="h-3.5 w-3.5 text-teal-700" aria-hidden="true" />
+                          <span>
+                            {slot.start_time} – {slot.end_time}
+                          </span>
+                        </span>
+                        {doc && (
+                          <span className="font-mono text-xs font-semibold text-teal-800 tabular-nums">
+                            {formatCurrencyInr(doc.consultation_fee)}
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-1.5 text-sm font-medium text-slate-900">
+                        {slot.doctor_name || `Template #${slot.template_id}`}
+                      </p>
+                      <div className="mt-0.5 flex items-center gap-2 text-xs text-slate-500">
+                        <span>{slot.department_name || 'Outpatient'}</span>
+                        {doc?.tele_consult_flag === 'Y' && (
+                          <span className="inline-flex items-center gap-1 text-teal-700">
+                            <Video className="h-3 w-3" aria-hidden="true" />
+                            <span>Tele-consult</span>
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Selected Booking Summary & Submit */}
+          <div className="mt-5 border-t border-slate-200 pt-4">
+            {selectedSlot ? (
+              <div className="flex flex-col gap-3 rounded-xl border border-teal-200 bg-teal-50/70 p-4 sm:flex-row sm:items-center sm:justify-between">
+                <div className="text-sm">
+                  <p className="font-semibold text-teal-950">
+                    {selectedSlot.doctor_name} · {formatDisplayDate(selectedSlot.slot_date)} ({selectedSlot.start_time} – {selectedSlot.end_time})
+                  </p>
+                  <p className="mt-0.5 text-xs text-teal-800">
+                    {isPatientRole
+                      ? 'Creates an ONLINE appointment with a 10-minute payment hold.'
+                      : `Booking mode: ${bookingSource === 'WALK_IN' ? 'Walk-in (Immediately Confirmed)' : 'Online (10-min Hold)'}`}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {onCancel && (
+                    <button
+                      type="button"
+                      onClick={onCancel}
+                      className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                    >
+                      Cancel
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleConfirmBooking}
+                    disabled={bookingBusy}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-4 py-2 text-xs font-medium text-white hover:bg-teal-800 disabled:opacity-60"
+                  >
+                    <CalendarCheck className="h-4 w-4" aria-hidden="true" />
+                    <span>{bookingBusy ? 'Booking...' : 'Confirm & Book Appointment'}</span>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between text-xs text-slate-500">
+                <span>Click an available time slot above to review and confirm your booking.</span>
+                {onCancel && (
+                  <button
+                    type="button"
+                    onClick={onCancel}
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    Back
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}

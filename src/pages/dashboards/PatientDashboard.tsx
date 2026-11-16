@@ -1,0 +1,201 @@
+import { Building2, Calendar, CalendarPlus, CreditCard, ListOrdered, RefreshCw } from 'lucide-react';
+import type { AuthUser, DashboardSummaryResponse, RouteKey } from '../../types/opd';
+import { formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
+import { StatusIndicator } from '../../components/layout/StatusIndicator';
+
+interface PatientDashboardProps {
+  user: AuthUser;
+  data: DashboardSummaryResponse;
+  onRefresh: () => void;
+  refreshing: boolean;
+  onNavigate: (route: RouteKey) => void;
+}
+
+export function PatientDashboard({
+  user,
+  data,
+  onRefresh,
+  refreshing,
+  onNavigate,
+}: PatientDashboardProps) {
+  const { metrics, patient_profile } = data;
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h2 className="text-xl font-semibold text-slate-900">
+            Welcome, {patient_profile ? `${patient_profile.first_name} ${patient_profile.last_name}` : user.full_name}
+          </h2>
+          <p className="mt-0.5 text-sm text-slate-600">
+            {patient_profile?.phone_number ? `Phone ${patient_profile.phone_number}` : user.email}
+            {patient_profile?.blood_group ? ` · Blood Group ${patient_profile.blood_group}` : ''}
+            {patient_profile?.gender ? ` · ${patient_profile.gender}` : ''}
+          </p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => onNavigate('book-appointment')}
+            className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-teal-800 whitespace-nowrap"
+          >
+            <CalendarPlus className="h-4 w-4" aria-hidden="true" />
+            <span>Book Appointment</span>
+          </button>
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={refreshing}
+            className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:opacity-60 whitespace-nowrap"
+          >
+            <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} aria-hidden="true" />
+            <span>Refresh</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="rounded-xl border border-slate-200 bg-white p-5">
+          <div className="flex items-center justify-between text-xs font-medium text-slate-500">
+            <span>My Appointments</span>
+            <Calendar className="h-4 w-4 text-slate-400" aria-hidden="true" />
+          </div>
+          <p className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
+            {metrics.total_appointments}
+          </p>
+          <p className="mt-1 text-xs text-slate-500 tabular-nums">
+            {metrics.confirmed_appointments} confirmed · {metrics.held_appointments} held
+          </p>
+        </div>
+
+        <div className="rounded-xl border border-slate-200 bg-white p-5">
+          <div className="flex items-center justify-between text-xs font-medium text-slate-500">
+            <span>Departments</span>
+            <Building2 className="h-4 w-4 text-slate-400" aria-hidden="true" />
+          </div>
+          <p className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
+            {metrics.total_departments}
+          </p>
+          <p className="mt-1 text-xs text-slate-500 tabular-nums">
+            {metrics.total_doctors} specialists available
+          </p>
+        </div>
+
+        <div className="rounded-xl border border-slate-200 bg-white p-5">
+          <div className="flex items-center justify-between text-xs font-medium text-slate-500">
+            <span>My Tokens</span>
+            <ListOrdered className="h-4 w-4 text-slate-400" aria-hidden="true" />
+          </div>
+          <p className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
+            {metrics.waiting_tokens + metrics.in_consultation_tokens}
+          </p>
+          <p className="mt-1 text-xs text-slate-500">Active queue tokens</p>
+        </div>
+
+        <div className="rounded-xl border border-slate-200 bg-white p-5">
+          <div className="flex items-center justify-between text-xs font-medium text-slate-500">
+            <span>Payments</span>
+            <CreditCard className="h-4 w-4 text-slate-400" aria-hidden="true" />
+          </div>
+          <p className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
+            {formatCurrencyInr(metrics.total_payments_amount)}
+          </p>
+          <p className="mt-1 text-xs text-slate-500 tabular-nums">
+            {metrics.payments_count} receipts
+          </p>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+        <section className="rounded-xl border border-slate-200 bg-white lg:col-span-2">
+          <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+            <h3 className="text-base font-semibold text-slate-900">My Appointments</h3>
+            <button
+              type="button"
+              onClick={() => onNavigate('appointments')}
+              className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
+            >
+              View All
+            </button>
+          </div>
+          {data.recent_appointments.length === 0 ? (
+            <div className="p-8 text-center">
+              <p className="text-sm text-slate-600">You have no appointments booked yet.</p>
+              <button
+                type="button"
+                onClick={() => onNavigate('book-appointment')}
+                className="mt-4 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white hover:bg-teal-800"
+              >
+                Book your first appointment
+              </button>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead className="border-b border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
+                  <tr>
+                    <th className="px-4 py-2.5">Reference</th>
+                    <th className="px-4 py-2.5">Doctor</th>
+                    <th className="px-4 py-2.5">Date &amp; Time</th>
+                    <th className="px-4 py-2.5">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {data.recent_appointments.map((appt) => (
+                    <tr key={appt.appointment_id} className="hover:bg-slate-50">
+                      <td className="px-4 py-2.5 font-mono text-xs text-slate-700 tabular-nums">
+                        {appt.appointment_ref}
+                      </td>
+                      <td className="px-4 py-2.5 text-slate-900">
+                        {appt.doctor_name || `Slot #${appt.slot_id}`}
+                      </td>
+                      <td className="px-4 py-2.5 font-mono text-xs text-slate-600 tabular-nums">
+                        {appt.slot_date
+                          ? `${formatDisplayDate(appt.slot_date)} ${appt.start_time || ''}`
+                          : formatDisplayDate(appt.created_on)}
+                      </td>
+                      <td className="px-4 py-2.5">
+                        <StatusIndicator status={appt.status} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+
+        <section className="rounded-xl border border-slate-200 bg-white">
+          <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+            <h3 className="text-base font-semibold text-slate-900">Hospital Departments</h3>
+            <button
+              type="button"
+              onClick={() => onNavigate('book-appointment')}
+              className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
+            >
+              Open Booking Calendar
+            </button>
+          </div>
+          <div className="divide-y divide-slate-100">
+            {data.departments.map((dept) => {
+              const docCount = data.doctors.filter(
+                (doc) => doc.department_id === dept.department_id,
+              ).length;
+              return (
+                <div
+                  key={dept.department_id}
+                  className="flex items-center justify-between px-5 py-3"
+                >
+                  <span className="text-sm font-medium text-slate-900">{dept.department_name}</span>
+                  <span className="font-mono text-xs text-slate-500 tabular-nums">
+                    {docCount} {docCount === 1 ? 'doctor' : 'doctors'}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
