@@ -77,6 +77,7 @@ interface AppShellProps {
   onLogout: () => Promise<void>;
   notifications?: PortalNotification[];
   onNotificationClick?: (notification: PortalNotification) => void;
+  onMarkNotificationRead?: (ids: string[]) => void;
   onDismissAllNotifications?: () => void;
   children: React.ReactNode;
 }
@@ -88,6 +89,7 @@ export function AppShell({
   onLogout,
   notifications = [],
   onNotificationClick,
+  onMarkNotificationRead,
   onDismissAllNotifications,
   children,
 }: AppShellProps) {
@@ -95,7 +97,11 @@ export function AppShell({
   const [notifOpen, setNotifOpen] = useState(false);
   const [confirmLogoutOpen, setConfirmLogoutOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
-  const showBell = user.role === 'SUPER_ADMIN' || user.role === 'ADMIN' || user.role === 'DOCTOR';
+  const showBell =
+    user.role === 'SUPER_ADMIN' ||
+    user.role === 'ADMIN' ||
+    user.role === 'DOCTOR' ||
+    user.role === 'PATIENT';
   const unreadCount = notifications.filter((n) => !n.read).length;
 
   const navItems = getNavForUser(user);
@@ -303,30 +309,50 @@ export function AppShell({
                             </div>
                           ) : (
                             notifications.slice(0, 15).map((n) => (
-                              <button
+                              <div
                                 key={n.id}
-                                type="button"
-                                onClick={() => {
-                                  setNotifOpen(false);
-                                  onNotificationClick?.(n);
-                                }}
-                                className={`flex w-full flex-col gap-0.5 px-4 py-3 text-left transition-colors hover:bg-slate-50 ${
+                                className={`flex items-start justify-between gap-2 px-4 py-3 transition-colors hover:bg-slate-50 ${
                                   n.read ? 'opacity-70' : 'bg-teal-50/35'
                                 }`}
                               >
-                                <div className="flex items-start justify-between gap-2">
-                                  <span className="text-xs font-semibold text-slate-900">
-                                    {n.title}
-                                  </span>
-                                  {!n.read && (
-                                    <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-teal-600" />
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setNotifOpen(false);
+                                    onNotificationClick?.(n);
+                                  }}
+                                  className="flex min-w-0 flex-1 flex-col gap-0.5 text-left"
+                                >
+                                  <div className="flex items-center gap-2">
+                                    {!n.read && (
+                                      <span className="h-2 w-2 shrink-0 rounded-full bg-teal-600" />
+                                    )}
+                                    <span className="text-xs font-semibold text-slate-900">
+                                      {n.title}
+                                    </span>
+                                  </div>
+                                  <span className="text-xs text-slate-600">{n.message}</span>
+                                  {(n.doctor_name || n.appointment_ref) && (
+                                    <span className="text-[11px] font-medium text-teal-800">
+                                      {n.doctor_name ? n.doctor_name : ''}
+                                      {n.doctor_name && n.appointment_ref ? ' · ' : ''}
+                                      {n.appointment_ref ? `Ref ${n.appointment_ref}` : ''}
+                                    </span>
                                   )}
-                                </div>
-                                <span className="text-xs text-slate-600">{n.message}</span>
-                                <span className="font-mono text-[10px] text-slate-400">
-                                  {formatDisplayDateTime(n.created_at)}
-                                </span>
-                              </button>
+                                  <span className="font-mono text-[10px] text-slate-400">
+                                    {formatDisplayDateTime(n.created_at)}
+                                  </span>
+                                </button>
+                                {!n.read && onMarkNotificationRead && (
+                                  <button
+                                    type="button"
+                                    onClick={() => onMarkNotificationRead([n.id])}
+                                    className="shrink-0 rounded border border-slate-200 bg-white px-2 py-1 text-[10px] font-medium text-slate-700 hover:bg-slate-100"
+                                  >
+                                    Mark read
+                                  </button>
+                                )}
+                              </div>
                             ))
                           )}
                         </div>

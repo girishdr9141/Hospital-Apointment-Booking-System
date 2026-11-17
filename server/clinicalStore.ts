@@ -7,9 +7,24 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(__dirname, '..', 'data');
 const CLINICAL_PATH = path.join(DATA_DIR, 'clinical_records.json');
 
+export interface PatientNotificationRecord {
+  id: string;
+  patient_id: number;
+  prescription_id: string;
+  event_type: 'CREATED' | 'UPDATED';
+  title: 'New Prescription Issued' | 'Prescription Updated';
+  message: string;
+  doctor_name: string;
+  appointment_ref: string | null;
+  created_at: string;
+  idempotency_key?: string;
+}
+
 interface ClinicalStoreData {
   medical_records: MedicalRecordEntry[];
   prescriptions: PrescriptionEntry[];
+  patient_notifications: PatientNotificationRecord[];
+  prescription_idempotency: Record<string, string>;
 }
 
 const INITIAL_CLINICAL_DATA: ClinicalStoreData = {
@@ -158,6 +173,8 @@ const INITIAL_CLINICAL_DATA: ClinicalStoreData = {
       updated_at: '2026-11-14T15:15:00.000Z',
     },
   ],
+  patient_notifications: [],
+  prescription_idempotency: {},
 };
 
 export function readClinicalStore(): ClinicalStoreData {
@@ -175,6 +192,13 @@ export function readClinicalStore(): ClinicalStoreData {
       prescriptions: Array.isArray(parsed.prescriptions)
         ? parsed.prescriptions
         : INITIAL_CLINICAL_DATA.prescriptions,
+      patient_notifications: Array.isArray(parsed.patient_notifications)
+        ? parsed.patient_notifications
+        : [],
+      prescription_idempotency:
+        parsed.prescription_idempotency && typeof parsed.prescription_idempotency === 'object'
+          ? parsed.prescription_idempotency
+          : {},
     };
   } catch {
     return INITIAL_CLINICAL_DATA;

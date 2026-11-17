@@ -31,6 +31,8 @@ export interface CalendarCell {
 }
 
 export interface WorkingHourWindow {
+  slot_date?: string;
+  dayOffset?: 0 | 1;
   start_time: string;
   end_time: string;
   template_id?: number;
@@ -39,6 +41,8 @@ export interface WorkingHourWindow {
 
 export interface DayWorkingSlotItem {
   key: string;
+  slot_date: string;
+  dayOffset: 0 | 1;
   start_time: string;
   end_time: string;
   template_id?: number;
@@ -47,11 +51,69 @@ export interface DayWorkingSlotItem {
   status: 'UNCONFIRMED' | 'AVAILABLE' | 'BOOKED' | 'CANCELLED';
 }
 
-export function getTodayIsoLocal(now = new Date()): string {
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, '0');
-  const d = String(now.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
+export interface ComputedShiftSession {
+  start_time: string;
+  end_time: string;
+  startMinutes: number;
+  endMinutes: number;
+  durationMinutes: number;
+  crossesMidnight: boolean;
+}
+
+export const DEFAULT_HOSPITAL_TIMEZONE = 'Asia/Kolkata';
+const HHMM_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+export interface HospitalNowParts {
+  isoDate: string;
+  timeHHMM: string;
+  minutesOfDay: number;
+  year: number;
+  monthIndex: number;
+  day: number;
+  timeZone: string;
+}
+
+export function getHospitalNowParts(
+  now = new Date(),
+  timeZone = DEFAULT_HOSPITAL_TIMEZONE,
+): HospitalNowParts {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+  const partsMap: Record<string, string> = {};
+  for (const p of formatter.formatToParts(now)) {
+    if (p.type !== 'literal') partsMap[p.type] = p.value;
+  }
+  const year = Number(partsMap.year || now.getUTCFullYear());
+  const monthNum = Number(partsMap.month || now.getUTCMonth() + 1);
+  const day = Number(partsMap.day || now.getUTCDate());
+  let hourNum = Number(partsMap.hour || 0);
+  if (hourNum === 24) hourNum = 0;
+  const minuteNum = Number(partsMap.minute || 0);
+  const isoDate = `${String(year).padStart(4, '0')}-${String(monthNum).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  const timeHHMM = `${String(hourNum).padStart(2, '0')}:${String(minuteNum).padStart(2, '0')}`;
+  return {
+    isoDate,
+    timeHHMM,
+    minutesOfDay: hourNum * 60 + minuteNum,
+    year,
+    monthIndex: monthNum - 1,
+    day,
+    timeZone,
+  };
+}
+
+export function getTodayIsoLocal(
+  now = new Date(),
+  timeZone = DEFAULT_HOSPITAL_TIMEZONE,
+): string {
+  return getHospitalNowParts(now, timeZone).isoDate;
 }
 
 export function getWeekdayName(isoDate: string): WeekdayName {
@@ -90,6 +152,10 @@ export function getMonthGridDates(
   return cells;
 }
 
+export function isValidHHMM(value?: string | null): boolean {
+  return Boolean(value && HHMM_REGEX.test(value.trim()));
+}
+
 export function parseHHMMToMinutes(hhmm: string): number {
   const [hStr, mStr] = hhmm.split(':');
   const h = Number(hStr);
@@ -99,10 +165,161 @@ export function parseHHMMToMinutes(hhmm: string): number {
 }
 
 export function formatMinutesToHHMM(totalMinutes: number): string {
-  const clamped = Math.max(0, Math.min(23 * 60 + 59, totalMinutes));
-  const h = Math.floor(clamped / 60);
-  const m = clamped % 60;
+  const normalized = ((Math.round(totalMinutes) % 1440) + 1440) % 1440;
+  const h = Math.floor(normalized / 60);
+  const m = normalized % 60;
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+export function computeShiftSession(
+  startTime?: string | null,
+  endTime?: string | null,
+): ComputedShiftSession | null {
+  const start = String(startTime || '').trim();
+  const end = String(endTime || '').trim();
+  if (!isValidHHMM(start) || !isValidHHMM(end)) return null;
+  const startMinutes = parseHHMMToMinutes(start);
+  const rawEndMinutes = parseHHMMToMinutes(end);
+  if (startMinutes === rawEndMinutes) return null;
+  const crossesMidnight = rawEndMinutes < startMinutes;
+  const endMinutes = crossesMidnight ? rawEndMinutes + 1440 : rawEndMinutes;
+  return {
+    start_time: start,
+    end_time: end,
+    startMinutes,
+    endMinutes,
+    durationMinutes: endMinutes - startMinutes,
+    crossesMidnight,
+  };
+}
+
+export function doesSessionCrossMidnight(
+  startTime?: string | null,
+  endTime?: string | null,
+): boolean {
+  return Boolean(computeShiftSession(startTime, endTime)?.crossesMidnight);
+}
+
+export function isValidSlotTimeRange(
+  startTime?: string | null,
+  endTime?: string | null,
+  maxDurationMins = 720,
+): boolean {
+  const parsed = computeShiftSession(startTime, endTime);
+  return Boolean(parsed && parsed.durationMinutes > 0 && parsed.durationMinutes <= maxDurationMins);
+}
+
+export function validateShiftSessions(
+  rawSessions: Array<{ start_time?: string | null; end_time?: string | null }>,
+): { valid: true; sessions: ShiftSession[] } | { valid: false; message: string } {
+  if (!Array.isArray(rawSessions) || rawSessions.length === 0) {
+    return { valid: false, message: 'At least one valid shift window is required' };
+  }
+
+  const firstRaw = rawSessions[0];
+  const s1Start = String(firstRaw?.start_time || '').trim();
+  const s1End = String(firstRaw?.end_time || '').trim();
+  if (!isValidHHMM(s1Start) || !isValidHHMM(s1End)) {
+    return { valid: false, message: 'Primary shift start and end times are required' };
+  }
+  const s1 = computeShiftSession(s1Start, s1End);
+  if (!s1) {
+    return { valid: false, message: 'Primary shift end time must be different from start time' };
+  }
+
+  const timeline: Array<{ start: number; end: number; session: ShiftSession }> = [
+    {
+      start: s1.startMinutes,
+      end: s1.endMinutes,
+      session: { start_time: s1.start_time, end_time: s1.end_time },
+    },
+  ];
+
+  for (let i = 1; i < rawSessions.length; i++) {
+    const item = rawSessions[i];
+    const startStr = String(item?.start_time || '').trim();
+    const endStr = String(item?.end_time || '').trim();
+    const label = i === 1 ? 'Second shift' : `Shift session #${i + 1}`;
+    if (!isValidHHMM(startStr) || !isValidHHMM(endStr)) {
+      return { valid: false, message: `${label} start and end times are required` };
+    }
+    const parsed = computeShiftSession(startStr, endStr);
+    if (!parsed) {
+      return { valid: false, message: `${label} end time must be different from start time` };
+    }
+
+    const dayOffset = parsed.startMinutes < s1.startMinutes ? 1440 : 0;
+    const adjStart = parsed.startMinutes + dayOffset;
+    const adjEnd = parsed.endMinutes + dayOffset;
+
+    if (adjEnd - s1.startMinutes > 1440) {
+      return {
+        valid: false,
+        message: 'Combined shift sessions cannot span more than 24 hours',
+      };
+    }
+
+    const overlaps = timeline.some(
+      (existing) => adjStart < existing.end && existing.start < adjEnd,
+    );
+    if (overlaps) {
+      return {
+        valid: false,
+        message: 'Second session cannot overlap with primary shift window',
+      };
+    }
+
+    timeline.push({
+      start: adjStart,
+      end: adjEnd,
+      session: { start_time: parsed.start_time, end_time: parsed.end_time },
+    });
+  }
+
+  timeline.sort((a, b) => a.start - b.start);
+  return { valid: true, sessions: timeline.map((entry) => entry.session) };
+}
+
+export function isSlotStartExpired(
+  slotDate?: string | null,
+  startTime?: string | null,
+  now = new Date(),
+  timeZone = DEFAULT_HOSPITAL_TIMEZONE,
+): boolean {
+  const datePart = getIsoDatePart(slotDate);
+  if (!datePart) return false;
+  const cur = getHospitalNowParts(now, timeZone);
+  if (datePart < cur.isoDate) return true;
+  if (datePart > cur.isoDate) return false;
+  if (!startTime || !/^\d{1,2}:\d{2}/.test(startTime.trim())) return false;
+  return parseHHMMToMinutes(startTime.trim()) <= cur.minutesOfDay;
+}
+
+export function isAppointmentTimeReached(
+  slotDate?: string | null,
+  startTime?: string | null,
+  now = new Date(),
+  timeZone = DEFAULT_HOSPITAL_TIMEZONE,
+): boolean {
+  const datePart = getIsoDatePart(slotDate);
+  if (!datePart || !startTime || !/^\d{1,2}:\d{2}/.test(startTime.trim())) return false;
+  const cur = getHospitalNowParts(now, timeZone);
+  if (datePart < cur.isoDate) return true;
+  if (datePart > cur.isoDate) return false;
+  return cur.minutesOfDay >= parseHHMMToMinutes(startTime.trim());
+}
+
+export function filterBookableSlots(
+  slots: Slot[],
+  now = new Date(),
+  timeZone = DEFAULT_HOSPITAL_TIMEZONE,
+): Slot[] {
+  return slots.filter(
+    (s) =>
+      s.status === 'AVAILABLE' &&
+      s.booked_patients < s.max_patients_per_slot &&
+      !isSlotStartExpired(s.slot_date, s.start_time, now, timeZone),
+  );
 }
 
 export function isDateCoveredByApprovedLeave(
@@ -124,7 +341,10 @@ export function formatShiftSummary(
   durationMins?: number,
 ): string {
   if (!sessions || sessions.length === 0) return 'Shift not registered';
-  const parts = sessions.map((s) => `${s.start_time}–${s.end_time}`);
+  const parts = sessions.map((s) => {
+    const overnight = doesSessionCrossMidnight(s.start_time, s.end_time);
+    return `${s.start_time}–${s.end_time}${overnight ? ' (+1d)' : ''}`;
+  });
   return durationMins ? `${parts.join(' · ')} (${durationMins} min)` : parts.join(' · ');
 }
 
@@ -156,7 +376,6 @@ export function deriveShiftDefaultsFromTemplates(
   const sampleDay = workingDays[0];
   const daySessions = active
     .filter((t) => (t.day_of_week || '').toUpperCase() === sampleDay)
-    .sort((a, b) => (a.start_time || '').localeCompare(b.start_time || ''))
     .map((t) => ({ start_time: t.start_time, end_time: t.end_time }));
 
   return {
@@ -185,8 +404,7 @@ export function buildWorkingHourWindows(
   const weekday = getWeekdayName(isoDate);
   const activeTemplates = doctorTemplates.filter((t) => t.is_active === 'Y');
   const dayTemplates = activeTemplates
-    .filter((t) => (t.day_of_week || '').toUpperCase() === weekday)
-    .sort((a, b) => (a.start_time || '').localeCompare(b.start_time || ''));
+    .filter((t) => (t.day_of_week || '').toUpperCase() === weekday);
 
   const durationOverride = options?.durationMins;
 
@@ -197,12 +415,16 @@ export function buildWorkingHourWindows(
     templateId: number | undefined,
     source: 'template' | 'working_hours',
   ): WorkingHourWindow[] => {
-    const startMin = parseHHMMToMinutes(startStr);
-    const endMin = parseHHMMToMinutes(endStr);
+    const parsed = computeShiftSession(startStr, endStr);
+    if (!parsed) return [];
     const step = Math.max(10, stepMins);
     const out: WorkingHourWindow[] = [];
-    for (let cur = startMin; cur + step <= endMin; cur += step) {
+    for (let cur = parsed.startMinutes; cur + step <= parsed.endMinutes; cur += step) {
+      const dayOffset: 0 | 1 = cur >= 1440 ? 1 : 0;
+      const slotDate = dayOffset === 1 ? addDaysIso(isoDate, 1) : isoDate;
       out.push({
+        slot_date: slotDate,
+        dayOffset,
         start_time: formatMinutesToHHMM(cur),
         end_time: formatMinutesToHHMM(cur + step),
         template_id: templateId,
@@ -212,6 +434,13 @@ export function buildWorkingHourWindows(
     return out;
   };
 
+  const sortChronologically = (list: WorkingHourWindow[]): WorkingHourWindow[] =>
+    list.sort((a, b) => {
+      const dCmp = (a.slot_date || isoDate).localeCompare(b.slot_date || isoDate);
+      if (dCmp !== 0) return dCmp;
+      return a.start_time.localeCompare(b.start_time);
+    });
+
   // Prefer registered per-doctor ShiftConfig when provided
   if (options?.shiftConfig && options.shiftConfig.sessions.length > 0) {
     const shift = options.shiftConfig;
@@ -219,9 +448,10 @@ export function buildWorkingHourWindows(
     const windows: WorkingHourWindow[] = [];
     const seen = new Set<string>();
     for (const sess of shift.sessions) {
-      const matchingTmpl = dayTemplates.find(
-        (t) => t.start_time === sess.start_time && t.end_time === sess.end_time,
-      ) || dayTemplates[0];
+      const matchingTmpl =
+        dayTemplates.find(
+          (t) => t.start_time === sess.start_time && t.end_time === sess.end_time,
+        ) || dayTemplates[0];
       for (const w of sliceRange(
         sess.start_time,
         sess.end_time,
@@ -229,14 +459,15 @@ export function buildWorkingHourWindows(
         matchingTmpl?.template_id,
         'working_hours',
       )) {
-        const key = `${w.start_time}-${w.end_time}`;
+        const wDate = w.slot_date || isoDate;
+        const key = `${wDate}|${w.start_time}-${w.end_time}`;
         if (!seen.has(key)) {
           seen.add(key);
           windows.push(w);
         }
       }
     }
-    return windows.sort((a, b) => a.start_time.localeCompare(b.start_time));
+    return sortChronologically(windows);
   }
 
   if (!options?.workStart && !options?.workEnd && dayTemplates.length > 0) {
@@ -245,14 +476,15 @@ export function buildWorkingHourWindows(
     for (const tmpl of dayTemplates) {
       const step = durationOverride || tmpl.slot_duration_mins || 30;
       for (const w of sliceRange(tmpl.start_time, tmpl.end_time, step, tmpl.template_id, 'template')) {
-        const key = `${w.start_time}-${w.end_time}`;
+        const wDate = w.slot_date || isoDate;
+        const key = `${wDate}|${w.start_time}-${w.end_time}`;
         if (!seen.has(key)) {
           seen.add(key);
           windows.push(w);
         }
       }
     }
-    return windows.sort((a, b) => a.start_time.localeCompare(b.start_time));
+    return sortChronologically(windows);
   }
 
   // Fallback or explicit working-hours override (ensures every day has working-hour slots!)
@@ -260,21 +492,21 @@ export function buildWorkingHourWindows(
     durationOverride || activeTemplates[0]?.slot_duration_mins || 30;
 
   if (options?.workStart && options?.workEnd) {
-    return sliceRange(
-      options.workStart,
-      options.workEnd,
-      defaultDuration,
-      dayTemplates[0]?.template_id,
-      'working_hours',
+    return sortChronologically(
+      sliceRange(
+        options.workStart,
+        options.workEnd,
+        defaultDuration,
+        dayTemplates[0]?.template_id,
+        'working_hours',
+      ),
     );
   }
 
   // Derive representative working hours from doctor's active templates if available, else 09:00-13:00 & 14:00-17:00
   if (activeTemplates.length > 0) {
     const firstDay = activeTemplates[0].day_of_week;
-    const sampleSessions = activeTemplates
-      .filter((t) => t.day_of_week === firstDay)
-      .sort((a, b) => a.start_time.localeCompare(b.start_time));
+    const sampleSessions = activeTemplates.filter((t) => t.day_of_week === firstDay);
     const windows: WorkingHourWindow[] = [];
     const seen = new Set<string>();
     for (const sess of sampleSessions) {
@@ -285,14 +517,15 @@ export function buildWorkingHourWindows(
         undefined,
         'working_hours',
       )) {
-        const key = `${w.start_time}-${w.end_time}`;
+        const wDate = w.slot_date || isoDate;
+        const key = `${wDate}|${w.start_time}-${w.end_time}`;
         if (!seen.has(key)) {
           seen.add(key);
           windows.push(w);
         }
       }
     }
-    if (windows.length > 0) return windows;
+    if (windows.length > 0) return sortChronologically(windows);
   }
 
   const morning = sliceRange('09:00', '13:00', defaultDuration, undefined, 'working_hours');
@@ -305,14 +538,17 @@ export function mergeDayWorkingSlots(
   windows: WorkingHourWindow[],
   doctorSlots: Slot[],
 ): DayWorkingSlotItem[] {
-  const slotsOnDay = doctorSlots.filter((s) => getIsoDatePart(s.slot_date) === isoDate);
-  const byKey = new Map<string, Slot>();
-  for (const s of slotsOnDay) {
-    const key = `${s.start_time}-${s.end_time}`;
+  const byDateTimeKey = new Map<string, Slot>();
+  const slotsOnDay: Slot[] = [];
+  for (const s of doctorSlots) {
+    const sDate = getIsoDatePart(s.slot_date);
+    if (!sDate) continue;
+    if (sDate === isoDate) slotsOnDay.push(s);
+    const lookupKey = `${sDate}|${s.start_time}-${s.end_time}`;
     // Prefer active/non-cancelled slot if multiple exist for same window
-    const existing = byKey.get(key);
+    const existing = byDateTimeKey.get(lookupKey);
     if (!existing || (existing.status === 'CANCELLED' && s.status !== 'CANCELLED')) {
-      byKey.set(key, s);
+      byDateTimeKey.set(lookupKey, s);
     }
   }
 
@@ -320,9 +556,11 @@ export function mergeDayWorkingSlots(
   const usedKeys = new Set<string>();
 
   for (const w of windows) {
-    const key = `${w.start_time}-${w.end_time}`;
-    usedKeys.add(key);
-    const match = byKey.get(key) ?? null;
+    const wDate = w.slot_date || isoDate;
+    const dayOffset: 0 | 1 = w.dayOffset ?? (wDate > isoDate ? 1 : 0);
+    const lookupKey = `${wDate}|${w.start_time}-${w.end_time}`;
+    usedKeys.add(lookupKey);
+    const match = byDateTimeKey.get(lookupKey) ?? null;
     let status: DayWorkingSlotItem['status'] = 'UNCONFIRMED';
     if (match) {
       if (match.status === 'CANCELLED') {
@@ -334,7 +572,9 @@ export function mergeDayWorkingSlots(
       }
     }
     items.push({
-      key,
+      key: lookupKey,
+      slot_date: wDate,
+      dayOffset,
       start_time: w.start_time,
       end_time: w.end_time,
       template_id: w.template_id ?? match?.template_id,
@@ -344,13 +584,15 @@ export function mergeDayWorkingSlots(
     });
   }
 
-  // Include any custom slots created on this day that are outside standard windows
+  // Include any custom or prior-shift slots present on isoDate that are outside this day's windows
   for (const s of slotsOnDay) {
-    const key = `${s.start_time}-${s.end_time}`;
-    if (usedKeys.has(key)) continue;
-    usedKeys.add(key);
+    const lookupKey = `${isoDate}|${s.start_time}-${s.end_time}`;
+    if (usedKeys.has(lookupKey)) continue;
+    usedKeys.add(lookupKey);
     items.push({
-      key,
+      key: lookupKey,
+      slot_date: isoDate,
+      dayOffset: 0,
       start_time: s.start_time,
       end_time: s.end_time,
       template_id: s.template_id,
@@ -365,7 +607,11 @@ export function mergeDayWorkingSlots(
     });
   }
 
-  return items.sort((a, b) => a.start_time.localeCompare(b.start_time));
+  return items.sort((a, b) => {
+    const aTime = a.dayOffset * 1440 + parseHHMMToMinutes(a.start_time);
+    const bTime = b.dayOffset * 1440 + parseHHMMToMinutes(b.start_time);
+    return aTime - bTime;
+  });
 }
 
 export function doesDoctorNeedDailySlotsPrompt(

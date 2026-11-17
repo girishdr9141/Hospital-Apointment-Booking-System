@@ -1,8 +1,23 @@
-import { Building2, Calendar, CalendarPlus, CreditCard, ListOrdered, RefreshCw } from 'lucide-react';
-import type { AuthUser, DashboardSummaryResponse, RouteKey } from '../../types/opd';
+import {
+  Bell,
+  Building2,
+  Calendar,
+  CalendarPlus,
+  Check,
+  CheckCheck,
+  CreditCard,
+  ListOrdered,
+  RefreshCw,
+} from 'lucide-react';
+import type {
+  AuthUser,
+  DashboardSummaryResponse,
+  PortalNotification,
+  RouteKey,
+} from '../../types/opd';
 import { canAccessRoute, hasModulePermission } from '../../utils/permissions';
-import { formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
-import { StatusIndicator } from '../../components/layout/StatusIndicator';
+import { formatCurrencyInr, formatDisplayDate, formatDisplayDateTime } from '../../utils/rules';
+import { ConsultationModeBadge, StatusIndicator } from '../../components/layout/StatusIndicator';
 
 interface PatientDashboardProps {
   user: AuthUser;
@@ -10,6 +25,9 @@ interface PatientDashboardProps {
   onRefresh: () => void;
   refreshing: boolean;
   onNavigate: (route: RouteKey) => void;
+  notifications?: PortalNotification[];
+  onMarkNotificationRead?: (ids: string[]) => Promise<void> | void;
+  onMarkAllNotificationsRead?: () => Promise<void> | void;
 }
 
 export function PatientDashboard({
@@ -18,11 +36,16 @@ export function PatientDashboard({
   onRefresh,
   refreshing,
   onNavigate,
+  notifications = [],
+  onMarkNotificationRead,
+  onMarkAllNotificationsRead,
 }: PatientDashboardProps) {
   const { metrics, patient_profile } = data;
   const canBook = canAccessRoute(user, 'book-appointment');
   const showAppointments = canAccessRoute(user, 'appointments');
   const showPayments = hasModulePermission(user, 'PAYMENTS', 'VIEW');
+  const showPrescriptions = canAccessRoute(user, 'prescriptions');
+  const unreadNotifications = notifications.filter((n) => !n.read);
 
   return (
     <div className="space-y-6">
@@ -114,6 +137,107 @@ export function PatientDashboard({
         )}
       </div>
 
+      {/* Prescription Notifications */}
+      <section className="rounded-xl border border-slate-200 bg-white">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-5 py-4">
+          <div className="flex items-center gap-2.5">
+            <Bell className="h-4 w-4 text-teal-700" aria-hidden="true" />
+            <h3 className="text-base font-semibold text-slate-900">Prescription Notifications</h3>
+            <span
+              className={`rounded px-2 py-0.5 font-mono text-xs font-semibold tabular-nums ${
+                unreadNotifications.length > 0
+                  ? 'bg-red-50 text-red-700 border border-red-200'
+                  : 'bg-slate-100 text-slate-600'
+              }`}
+            >
+              {unreadNotifications.length} unread
+            </span>
+          </div>
+          <div className="flex items-center gap-3">
+            {unreadNotifications.length > 0 && onMarkAllNotificationsRead && (
+              <button
+                type="button"
+                onClick={() => void onMarkAllNotificationsRead()}
+                className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-teal-700 hover:bg-teal-50"
+              >
+                <CheckCheck className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Mark all read</span>
+              </button>
+            )}
+            {showPrescriptions && (
+              <button
+                type="button"
+                onClick={() => onNavigate('prescriptions')}
+                className="text-xs font-medium text-teal-700 hover:underline whitespace-nowrap"
+              >
+                Open Prescriptions
+              </button>
+            )}
+          </div>
+        </div>
+        {notifications.length === 0 ? (
+          <div className="px-5 py-6 text-sm text-slate-500">
+            No prescription notifications yet. You will be notified here whenever a doctor issues or updates a prescription.
+          </div>
+        ) : (
+          <div className="divide-y divide-slate-100">
+            {notifications.slice(0, 8).map((n) => (
+              <div
+                key={n.id}
+                className={`flex flex-col gap-3 px-5 py-3.5 sm:flex-row sm:items-center sm:justify-between ${
+                  n.read ? 'bg-white opacity-75' : 'bg-teal-50/40'
+                }`}
+              >
+                <div className="min-w-0 space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {!n.read && <span className="h-2 w-2 rounded-full bg-teal-600" />}
+                    <span className="text-sm font-semibold text-slate-900">{n.title}</span>
+                    {n.appointment_ref && (
+                      <span className="font-mono text-xs text-slate-500">
+                        Ref: {n.appointment_ref}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-700">{n.message}</p>
+                  <p className="text-xs text-slate-500">
+                    {n.doctor_name ? `Doctor: ${n.doctor_name} · ` : ''}
+                    <span className="font-mono text-[11px]">
+                      {formatDisplayDateTime(n.created_at)}
+                    </span>
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {showPrescriptions && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!n.read && onMarkNotificationRead) {
+                          void onMarkNotificationRead([n.id]);
+                        }
+                        onNavigate('prescriptions');
+                      }}
+                      className="rounded-lg bg-teal-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-teal-800 whitespace-nowrap"
+                    >
+                      Check Prescription
+                    </button>
+                  )}
+                  {!n.read && onMarkNotificationRead && (
+                    <button
+                      type="button"
+                      onClick={() => void onMarkNotificationRead([n.id])}
+                      className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+                    >
+                      <Check className="h-3.5 w-3.5" aria-hidden="true" />
+                      <span>Mark read</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <section className="rounded-xl border border-slate-200 bg-white lg:col-span-2">
           <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
@@ -149,6 +273,7 @@ export function PatientDashboard({
                     <th className="px-4 py-2.5">Reference</th>
                     <th className="px-4 py-2.5">Doctor</th>
                     <th className="px-4 py-2.5">Date &amp; Time</th>
+                    <th className="px-4 py-2.5">Mode</th>
                     <th className="px-4 py-2.5">Status</th>
                   </tr>
                 </thead>
@@ -165,6 +290,9 @@ export function PatientDashboard({
                         {appt.slot_date
                           ? `${formatDisplayDate(appt.slot_date)} ${appt.start_time || ''}`
                           : formatDisplayDate(appt.created_on)}
+                      </td>
+                      <td className="px-4 py-2.5">
+                        <ConsultationModeBadge mode={appt.consultation_mode} />
                       </td>
                       <td className="px-4 py-2.5">
                         <StatusIndicator status={appt.status} />

@@ -1,4 +1,4 @@
-import type { AnalyticsSourceTag, AnalyticsVisitRecord } from '../types/opd.ts';
+import type { AnalyticsSourceTag, AnalyticsVisitRecord, ConsultationMode } from '../types/opd.ts';
 
 export interface AnalyticsFilterState {
   source: 'ALL' | AnalyticsSourceTag;
@@ -6,6 +6,7 @@ export interface AnalyticsFilterState {
   toMonth: string; // YYYY-MM or ''
   department: string; // 'ALL' or department_name
   city: string; // 'ALL' or city
+  consultationMode?: 'ALL' | ConsultationMode;
 }
 
 export interface MonthlyTrendPoint {
@@ -14,6 +15,8 @@ export interface MonthlyTrendPoint {
   total: number;
   completed: number;
   cancelledOrNoShow: number;
+  online: number;
+  faceToFace: number;
   revenue: number;
 }
 
@@ -69,6 +72,9 @@ export interface BreakdownRow {
 
 export interface HospitalAnalyticsReport {
   totalVisits: number;
+  activeVisits: number;
+  onlineConsultations: number;
+  faceToFaceConsultations: number;
   completedVisits: number;
   confirmedVisits: number;
   cancelledVisits: number;
@@ -90,6 +96,7 @@ export interface HospitalAnalyticsReport {
   topDepartments: DepartmentAnalyticsRow[];
   topCities: CityAnalyticsRow[];
   topLocalities: LocalityAnalyticsRow[];
+  consultationModes: BreakdownRow[];
   bookingSources: BreakdownRow[];
   paymentMethods: BreakdownRow[];
   peakDays: BreakdownRow[];
@@ -109,16 +116,41 @@ export function formatMonthShort(yyyyMm: string): string {
   return `${MONTH_SHORT[m - 1]} ${String(y).slice(-2)}`;
 }
 
+export function normalizeRecordConsultationMode(rec: AnalyticsVisitRecord): ConsultationMode {
+  return rec.consultation_mode === 'ONLINE' ? 'ONLINE' : 'FACE_TO_FACE';
+}
+
+export function deduplicateRescheduledRecords(
+  records: AnalyticsVisitRecord[],
+): AnalyticsVisitRecord[] {
+  const supersededIds = new Set<string>();
+  for (const r of records) {
+    if (r.rescheduled_from_id) {
+      supersededIds.add(`LIVE-${r.rescheduled_from_id}`);
+      supersededIds.add(String(r.rescheduled_from_id));
+    }
+  }
+  if (supersededIds.size === 0) return records;
+  return records.filter((r) => !supersededIds.has(r.id));
+}
+
 export function filterAnalyticsRecords(
   records: AnalyticsVisitRecord[],
   filters: AnalyticsFilterState,
 ): AnalyticsVisitRecord[] {
-  return records.filter((rec) => {
+  return deduplicateRescheduledRecords(records).filter((rec) => {
     if (filters.source !== 'ALL' && rec.source !== filters.source) return false;
     if (filters.fromMonth && rec.visit_month < filters.fromMonth) return false;
     if (filters.toMonth && rec.visit_month > filters.toMonth) return false;
     if (filters.department !== 'ALL' && rec.department_name !== filters.department) return false;
     if (filters.city !== 'ALL' && rec.city.toLowerCase() !== filters.city.toLowerCase()) return false;
+    if (
+      filters.consultationMode &&
+      filters.consultationMode !== 'ALL' &&
+      normalizeRecordConsultationMode(rec) !== filters.consultationMode
+    ) {
+      return false;
+    }
     return true;
   });
 }
@@ -128,8 +160,18 @@ function pct(part: number, total: number): number {
   return Number(((part / total) * 100).toFixed(1));
 }
 
-export function computeHospitalAnalytics(records: AnalyticsVisitRecord[]): HospitalAnalyticsReport {
+export function computeHospitalAnalytics(rawRecords: AnalyticsVisitRecord[]): HospitalAnalyticsReport {
+  const records = deduplicateRescheduledRecords(rawRecords);
   const totalVisits = records.length;
+  const activeRecords = records.filter((r) => r.status !== 'CANCELLED');
+  const activeVisits = activeRecords.length;
+  const onlineConsultations = activeRecords.filter(
+    (r) => normalizeRecordConsultationMode(r) === 'ONLINE',
+  ).length;
+  const faceToFaceConsultations = activeRecords.filter(
+    (r) => normalizeRecordConsultationMode(r) === 'FACE_TO_FACE',
+  ).length;
+
   const completedVisits = records.filter((r) => r.status === 'COMPLETED').length;
   const confirmedVisits = records.filter((r) => r.status === 'CONFIRMED').length;
   const cancelledVisits = records.filter((r) => r.status === 'CANCELLED').length;
@@ -156,11 +198,17 @@ export function computeHospitalAnalytics(records: AnalyticsVisitRecord[]): Hospi
       total: 0,
       completed: 0,
       cancelledOrNoShow: 0,
+      online: 0,
+      faceToFace: 0,
       revenue: 0,
     };
     existing.total += 1;
     if (r.status === 'COMPLETED' || r.status === 'CONFIRMED') existing.completed += 1;
     if (r.status === 'CANCELLED' || r.status === 'NO_SHOW') existing.cancelledOrNoShow += 1;
+    if (r.status !== 'CANCELLED') {
+      if (normalizeRecordConsultationMode(r) === 'ONLINE') existing.online += 1;
+      else existing.faceToFace += 1;
+    }
     existing.revenue += Number(r.amount || 0);
     monthMap.set(r.visit_month, existing);
   }
@@ -332,6 +380,13 @@ export function computeHospitalAnalytics(records: AnalyticsVisitRecord[]): Hospi
     }))
     .sort((a, b) => b.totalVisits - a.totalVisits || b.uniquePatients - a.uniquePatients);
 
+  // Consultation Modes (excludes cancelled appointments from active consultation counts)
+  const consultationModes = buildBreakdown(activeRecords, (r) =>
+    normalizeRecordConsultationMode(r) === 'ONLINE'
+      ? 'Online Consultation'
+      : 'Face-to-Face Consultation',
+  );
+
   // Booking Sources
   const bookingSources = buildBreakdown(records, (r) =>
     r.booking_source === 'WALK_IN' ? 'Walk-in Desk' : 'Online Portal',
@@ -394,6 +449,9 @@ export function computeHospitalAnalytics(records: AnalyticsVisitRecord[]): Hospi
 
   return {
     totalVisits,
+    activeVisits,
+    onlineConsultations,
+    faceToFaceConsultations,
     completedVisits,
     confirmedVisits,
     cancelledVisits,
@@ -415,6 +473,7 @@ export function computeHospitalAnalytics(records: AnalyticsVisitRecord[]): Hospi
     topDepartments,
     topCities,
     topLocalities,
+    consultationModes,
     bookingSources,
     paymentMethods,
     peakDays,
@@ -452,6 +511,11 @@ function buildBreakdown(
 export function buildAnalyticsCsv(report: HospitalAnalyticsReport): string {
   const lines: string[] = [];
   lines.push('Section,Name,Subgroup,Visits,Unique Patients,Share %,Revenue INR');
+  for (const mode of report.consultationModes) {
+    lines.push(
+      `Consultation Mode,"${mode.label}","Active (Cancelled excluded)",${mode.count},,${mode.sharePct}%,${mode.revenue}`,
+    );
+  }
   for (const d of report.topDoctors) {
     lines.push(
       `Top Doctor,"${d.doctor_name}","${d.department_name}",${d.totalVisits},${d.uniquePatients},,${d.revenue}`,

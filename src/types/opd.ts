@@ -132,6 +132,8 @@ export interface Slot {
   department_name?: string;
 }
 
+export type ConsultationMode = 'ONLINE' | 'FACE_TO_FACE';
+
 export interface Appointment {
   appointment_id: number;
   appointment_ref: string;
@@ -142,6 +144,8 @@ export interface Appointment {
   hold_expires_at?: string | null;
   created_on?: string;
   booking_source?: 'ONLINE' | 'WALK_IN';
+  consultation_mode?: ConsultationMode;
+  rescheduled_from_id?: number | null;
   slot_date?: string | null;
   start_time?: string | null;
   end_time?: string | null;
@@ -314,6 +318,12 @@ export interface SuperAdminOverviewResponse {
   recent_permission_changes: RbacAuditLogEntry[];
   recent_security_activities: RbacAuditLogEntry[];
   roles: RoleDefinition[];
+  consultation_metrics?: {
+    online_consultations: number;
+    face_to_face_consultations: number;
+    total_active_appointments: number;
+  };
+  recent_appointments?: Appointment[];
 }
 
 export interface MedicalRecordEntry {
@@ -416,6 +426,8 @@ export interface DashboardMetrics {
   in_consultation_tokens: number;
   done_tokens: number;
   pending_approvals: number | null;
+  online_consultations?: number;
+  face_to_face_consultations?: number;
 }
 
 export interface ShiftSession {
@@ -512,13 +524,24 @@ export interface NavItem {
 
 export interface PortalNotification {
   id: string;
-  category: 'SHIFT_REQUEST' | 'LEAVE_REQUEST' | 'APPROVAL_REQUEST' | 'NEW_APPOINTMENT' | 'ADMIN_RESPONSE';
+  category:
+    | 'SHIFT_REQUEST'
+    | 'LEAVE_REQUEST'
+    | 'APPROVAL_REQUEST'
+    | 'NEW_APPOINTMENT'
+    | 'ADMIN_RESPONSE'
+    | 'PRESCRIPTION_CREATED'
+    | 'PRESCRIPTION_UPDATED';
   title: string;
   message: string;
   route: RouteKey;
   created_at: string;
   read: boolean;
   severity: 'info' | 'success' | 'warning';
+  doctor_name?: string;
+  appointment_ref?: string | null;
+  prescription_id?: string;
+  patient_id?: number;
 }
 
 export type AnalyticsSourceTag = 'HISTORICAL' | 'LIVE';
@@ -542,6 +565,8 @@ export interface AnalyticsVisitRecord {
   locality: string;
   status: 'HELD' | 'CONFIRMED' | 'COMPLETED' | 'CANCELLED' | 'NO_SHOW';
   booking_source: 'ONLINE' | 'WALK_IN';
+  consultation_mode?: ConsultationMode;
+  rescheduled_from_id?: number | null;
   payment_method: 'UPI' | 'CARD' | 'CASH' | 'NETBANKING' | 'UNPAID';
   amount: number;
 }

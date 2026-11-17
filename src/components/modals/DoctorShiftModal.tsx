@@ -3,7 +3,12 @@ import { Clock, ShieldAlert } from 'lucide-react';
 import type { DoctorShiftConfig } from '../../types/opd';
 import { apiClient } from '../../services/apiClient';
 import { useToast } from '../../context/ToastContext';
-import { DEFAULT_WORKING_DAYS, formatShiftSummary } from '../../utils/calendar';
+import {
+  computeShiftSession,
+  DEFAULT_WORKING_DAYS,
+  formatShiftSummary,
+  validateShiftSessions,
+} from '../../utils/calendar';
 import { Modal } from '../common/Modal';
 
 interface DoctorShiftModalProps {
@@ -77,22 +82,16 @@ export function DoctorShiftModal({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!session1Start || !session1End || session1Start >= session1End) {
-      notify('Primary shift end time must be after start time', 'error');
+    const rawSessions = [{ start_time: session1Start, end_time: session1End }];
+    if (hasSecondSession) {
+      rawSessions.push({ start_time: session2Start, end_time: session2End });
+    }
+    const validation = validateShiftSessions(rawSessions);
+    if (!validation.valid) {
+      notify(validation.message, 'error');
       return;
     }
-    const sessions = [{ start_time: session1Start, end_time: session1End }];
-    if (hasSecondSession) {
-      if (!session2Start || !session2End || session2Start >= session2End) {
-        notify('Second shift end time must be after start time', 'error');
-        return;
-      }
-      if (session2Start < session1End) {
-        notify('Afternoon shift cannot overlap with morning shift', 'error');
-        return;
-      }
-      sessions.push({ start_time: session2Start, end_time: session2End });
-    }
+    const sessions = validation.sessions;
 
     if (workingDays.length === 0) {
       notify('Select at least one working day', 'error');
@@ -145,7 +144,7 @@ export function DoctorShiftModal({
           : 'Submitted to administrator Girish DR for approval.'
       }`}
       onClose={onClose}
-      maxWidth="lg"
+      maxWidth="xl"
     >
       <form onSubmit={handleSubmit} className="space-y-4">
         {mode === 'register' ? (
@@ -181,7 +180,7 @@ export function DoctorShiftModal({
                   type="time"
                   value={session1Start}
                   onChange={(e) => setSession1Start(e.target.value)}
-                  className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-sm"
+                  className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 font-mono text-xs sm:text-sm"
                 />
               </div>
               <div>
@@ -193,10 +192,15 @@ export function DoctorShiftModal({
                   type="time"
                   value={session1End}
                   onChange={(e) => setSession1End(e.target.value)}
-                  className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-sm"
+                  className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 font-mono text-xs sm:text-sm"
                 />
               </div>
             </div>
+            {computeShiftSession(session1Start, session1End)?.crossesMidnight && (
+              <p className="mt-2 text-[11px] font-medium text-teal-800">
+                Overnight shift · ends {session1End} next day (+1d)
+              </p>
+            )}
           </div>
 
           <div className="rounded-lg border border-slate-200 bg-slate-50 p-3.5">
@@ -210,32 +214,39 @@ export function DoctorShiftModal({
               />
             </label>
             {hasSecondSession ? (
-              <div className="mt-2.5 grid grid-cols-2 gap-3">
-                <div>
-                  <label htmlFor="shift-s2-start" className="block text-[11px] font-medium text-slate-600">
-                    Start Time
-                  </label>
-                  <input
-                    id="shift-s2-start"
-                    type="time"
-                    value={session2Start}
-                    onChange={(e) => setSession2Start(e.target.value)}
-                    className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-sm"
-                  />
+              <>
+                <div className="mt-2.5 grid grid-cols-2 gap-3">
+                  <div>
+                    <label htmlFor="shift-s2-start" className="block text-[11px] font-medium text-slate-600">
+                      Start Time
+                    </label>
+                    <input
+                      id="shift-s2-start"
+                      type="time"
+                      value={session2Start}
+                      onChange={(e) => setSession2Start(e.target.value)}
+                      className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 font-mono text-xs sm:text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="shift-s2-end" className="block text-[11px] font-medium text-slate-600">
+                      End Time
+                    </label>
+                    <input
+                      id="shift-s2-end"
+                      type="time"
+                      value={session2End}
+                      onChange={(e) => setSession2End(e.target.value)}
+                      className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 font-mono text-xs sm:text-sm"
+                    />
+                  </div>
                 </div>
-                <div>
-                  <label htmlFor="shift-s2-end" className="block text-[11px] font-medium text-slate-600">
-                    End Time
-                  </label>
-                  <input
-                    id="shift-s2-end"
-                    type="time"
-                    value={session2End}
-                    onChange={(e) => setSession2End(e.target.value)}
-                    className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-sm"
-                  />
-                </div>
-              </div>
+                {computeShiftSession(session2Start, session2End)?.crossesMidnight && (
+                  <p className="mt-2 text-[11px] font-medium text-teal-800">
+                    Overnight session · ends {session2End} next day (+1d)
+                  </p>
+                )}
+              </>
             ) : (
               <p className="mt-3 text-xs text-slate-500">
                 Single continuous shift enabled (no afternoon split).

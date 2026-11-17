@@ -16,7 +16,7 @@ import {
   formatShiftSummary,
   getTodayIsoLocal,
 } from '../../utils/calendar';
-import { StatusIndicator } from '../../components/layout/StatusIndicator';
+import { ConsultationModeBadge, StatusIndicator } from '../../components/layout/StatusIndicator';
 import { DoctorSlotCalendar } from '../../components/calendar/DoctorSlotCalendar';
 import { DoctorShiftModal } from '../../components/modals/DoctorShiftModal';
 
@@ -146,7 +146,8 @@ export function DoctorDashboard({
             {metrics.total_appointments}
           </p>
           <p className="mt-1 text-xs text-slate-500 tabular-nums">
-            {metrics.confirmed_appointments} confirmed · {metrics.completed_appointments} completed
+            {metrics.confirmed_appointments} confirmed · {metrics.online_consultations ?? 0} online ·{' '}
+            {metrics.face_to_face_consultations ?? 0} face-to-face
           </p>
         </div>
 
@@ -248,6 +249,7 @@ export function DoctorDashboard({
                   <th className="px-4 py-2.5">Reference</th>
                   <th className="px-4 py-2.5">Patient</th>
                   <th className="px-4 py-2.5">Date &amp; Time</th>
+                  <th className="px-4 py-2.5">Mode</th>
                   <th className="px-4 py-2.5">Status</th>
                 </tr>
               </thead>
@@ -262,6 +264,9 @@ export function DoctorDashboard({
                       {appt.slot_date
                         ? `${formatDisplayDate(appt.slot_date)} ${appt.start_time || ''}`
                         : formatDisplayDate(appt.created_on)}
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <ConsultationModeBadge mode={appt.consultation_mode} />
                     </td>
                     <td className="px-4 py-2.5">
                       <StatusIndicator status={appt.status} />

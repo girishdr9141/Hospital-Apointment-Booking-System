@@ -15,11 +15,14 @@ import { apiClient } from '../../services/apiClient';
 import { useToast } from '../../context/ToastContext';
 import {
   buildWorkingHourWindows,
+  doesSessionCrossMidnight,
   formatShiftSummary,
+  getHospitalNowParts,
   getMonthGridDates,
-  getTodayIsoLocal,
   getWeekdayName,
   isDateCoveredByApprovedLeave,
+  isSlotStartExpired,
+  isValidSlotTimeRange,
   mergeDayWorkingSlots,
   type DayWorkingSlotItem,
 } from '../../utils/calendar';
@@ -69,11 +72,11 @@ export function DoctorSlotCalendar({
   compact = false,
 }: DoctorSlotCalendarProps) {
   const { notify } = useToast();
-  const todayIso = getTodayIsoLocal();
-  const initialDate = new Date();
+  const initialNow = getHospitalNowParts();
+  const todayIso = initialNow.isoDate;
 
-  const [viewYear, setViewYear] = useState(initialDate.getFullYear());
-  const [viewMonth, setViewMonth] = useState(initialDate.getMonth());
+  const [viewYear, setViewYear] = useState(initialNow.year);
+  const [viewMonth, setViewMonth] = useState(initialNow.monthIndex);
   const [selectedDate, setSelectedDate] = useState(todayIso);
 
   const [multiSelectMode, setMultiSelectMode] = useState(false);
@@ -134,17 +137,25 @@ export function DoctorSlotCalendar({
   );
 
   const unconfirmedOpenItems = useMemo(
-    () => daySlotItems.filter((item) => item.status === 'UNCONFIRMED'),
-    [daySlotItems],
+    () =>
+      daySlotItems.filter((item) => {
+        const targetDate = item.slot_date || selectedDate;
+        return (
+          item.status === 'UNCONFIRMED' &&
+          !isSlotStartExpired(targetDate, item.start_time) &&
+          !isDateCoveredByApprovedLeave(targetDate, leaves, doctorId)
+        );
+      }),
+    [daySlotItems, selectedDate, leaves, doctorId],
   );
 
   const selectedDayCounts = useMemo(() => {
     return {
       open: daySlotItems.filter((i) => i.status === 'AVAILABLE').length,
       booked: daySlotItems.filter((i) => i.status === 'BOOKED').length,
-      unconfirmed: daySlotItems.filter((i) => i.status === 'UNCONFIRMED').length,
+      unconfirmed: unconfirmedOpenItems.length,
     };
-  }, [daySlotItems]);
+  }, [daySlotItems, unconfirmedOpenItems.length]);
 
   const todayStats = slotStatsByDate.get(todayIso) || { total: 0, available: 0, booked: 0 };
 
@@ -157,6 +168,22 @@ export function DoctorSlotCalendar({
   const handleSlotTileClick = (item: DayWorkingSlotItem) => {
     if (readOnly || selectedDateIsPast || selectedDateOnLeave) return;
     if (item.status !== 'UNCONFIRMED') return;
+    const targetDate = item.slot_date || selectedDate;
+    if (isDateCoveredByApprovedLeave(targetDate, leaves, doctorId)) {
+      notify(
+        `Cannot generate slot on ${formatDisplayDate(targetDate)}: approved leave active on that date.`,
+        'error',
+      );
+      return;
+    }
+    if (isSlotStartExpired(targetDate, item.start_time)) {
+      const nowParts = getHospitalNowParts();
+      notify(
+        `Cannot generate expired slot starting at ${item.start_time} (current hospital time ${nowParts.timeHHMM} IST).`,
+        'error',
+      );
+      return;
+    }
 
     if (multiSelectMode) {
       setSelectedKeys((prev) =>
@@ -172,17 +199,18 @@ export function DoctorSlotCalendar({
   const handleConfirmSingleSlot = async (e: React.FormEvent) => {
     e.preventDefault();
     if (readOnly || !confirmTarget) return;
-    if (!confirmEndTime || confirmEndTime <= confirmTarget.start_time) {
-      notify('End time must be after start time', 'error');
+    if (!confirmEndTime || !isValidSlotTimeRange(confirmTarget.start_time, confirmEndTime)) {
+      notify('End time must be after start time (midnight rollover supported)', 'error');
       return;
     }
+    const targetDate = confirmTarget.slot_date || selectedDate;
     setSubmitting(true);
     try {
       const res = await apiClient.confirmDoctorSlots({
         doctor_id: doctorId,
         slots: [
           {
-            slot_date: selectedDate,
+            slot_date: targetDate,
             start_time: confirmTarget.start_time,
             end_time: confirmEndTime,
             template_id: confirmTarget.template_id,
@@ -212,7 +240,7 @@ export function DoctorSlotCalendar({
       const res = await apiClient.confirmDoctorSlots({
         doctor_id: doctorId,
         slots: targets.map((t) => ({
-          slot_date: selectedDate,
+          slot_date: t.slot_date || selectedDate,
           start_time: t.start_time,
           end_time: t.end_time,
           template_id: t.template_id,
@@ -241,7 +269,7 @@ export function DoctorSlotCalendar({
       const res = await apiClient.confirmDoctorSlots({
         doctor_id: doctorId,
         slots: unconfirmedOpenItems.map((t) => ({
-          slot_date: selectedDate,
+          slot_date: t.slot_date || selectedDate,
           start_time: t.start_time,
           end_time: t.end_time,
           template_id: t.template_id,
@@ -261,8 +289,16 @@ export function DoctorSlotCalendar({
   const handleAddCustomSlot = async (e: React.FormEvent) => {
     e.preventDefault();
     if (readOnly || selectedDateIsPast || selectedDateOnLeave) return;
-    if (!customStart || !customEnd || customEnd <= customStart) {
-      notify('Custom slot end time must be after start time', 'error');
+    if (isSlotStartExpired(selectedDate, customStart)) {
+      const nowParts = getHospitalNowParts();
+      notify(
+        `Cannot generate a slot at ${customStart} on ${selectedDate}: start time must be after ${nowParts.timeHHMM} IST.`,
+        'error',
+      );
+      return;
+    }
+    if (!customStart || !customEnd || !isValidSlotTimeRange(customStart, customEnd)) {
+      notify('Custom slot end time must be after start time (midnight rollover supported)', 'error');
       return;
     }
     setSubmitting(true);
@@ -307,10 +343,10 @@ export function DoctorSlotCalendar({
             <button
               type="button"
               onClick={() => {
-                const now = new Date();
-                setViewYear(now.getFullYear());
-                setViewMonth(now.getMonth());
-                setSelectedDate(todayIso);
+                const cur = getHospitalNowParts();
+                setViewYear(cur.year);
+                setViewMonth(cur.monthIndex);
+                setSelectedDate(cur.isoDate);
                 setSelectedKeys([]);
               }}
               className="rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100"
@@ -533,18 +569,31 @@ export function DoctorSlotCalendar({
               >
                 {daySlotItems.map((item) => {
                   const isPicked = selectedKeys.includes(item.key);
+                  const itemDate = item.slot_date || selectedDate;
+                  const isNextDay = item.dayOffset === 1 || itemDate > selectedDate;
+                  const endsAtNextDayMidnight =
+                    !isNextDay && doesSessionCrossMidnight(item.start_time, item.end_time);
 
                   if (item.status === 'UNCONFIRMED') {
-                    if (readOnly) {
+                    const expiredNow = isSlotStartExpired(itemDate, item.start_time);
+                    const leaveOnTarget = isDateCoveredByApprovedLeave(itemDate, leaves, doctorId);
+                    if (readOnly || expiredNow || leaveOnTarget) {
                       return (
                         <div
                           key={item.key}
-                          className="flex flex-col items-start rounded-lg border border-dashed border-slate-200 bg-slate-50/60 p-2.5 text-left"
+                          className="flex flex-col items-start rounded-lg border border-dashed border-slate-200 bg-slate-50/70 p-2.5 text-left opacity-70"
                         >
-                          <span className="font-mono text-xs font-medium text-slate-600 tabular-nums">
+                          <span className="font-mono text-xs font-medium text-slate-500 tabular-nums">
                             {item.start_time}–{item.end_time}
+                            {isNextDay ? ' (+1d)' : ''}
                           </span>
-                          <span className="mt-1 text-[11px] text-slate-400">Not Opened</span>
+                          <span className="mt-1 text-[11px] text-slate-400">
+                            {leaveOnTarget
+                              ? 'Leave active'
+                              : expiredNow
+                                ? 'Expired (Past time)'
+                                : 'Not Opened'}
+                          </span>
                         </div>
                       );
                     }
@@ -566,7 +615,13 @@ export function DoctorSlotCalendar({
                           </span>
                         </span>
                         <span className="mt-1 text-[11px] font-medium text-teal-700">
-                          {isPicked ? 'Selected' : 'Click to confirm'}
+                          {isPicked
+                            ? 'Selected'
+                            : isNextDay
+                              ? `Next day (${formatDisplayDate(itemDate)})`
+                              : endsAtNextDayMidnight
+                                ? 'Ends midnight · Click to confirm'
+                                : 'Click to confirm'}
                         </span>
                       </button>
                     );
@@ -580,10 +635,13 @@ export function DoctorSlotCalendar({
                       >
                         <span className="font-mono text-xs font-semibold text-emerald-950 tabular-nums">
                           {item.start_time}–{item.end_time}
+                          {isNextDay ? ' (+1d)' : ''}
                         </span>
                         <span className="mt-1 inline-flex items-center gap-1 text-[11px] font-medium text-emerald-800">
                           <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
-                          <span>Open · Available</span>
+                          <span>
+                            Open{isNextDay ? ` · ${formatDisplayDate(itemDate)}` : ' · Available'}
+                          </span>
                         </span>
                       </div>
                     );
@@ -597,6 +655,7 @@ export function DoctorSlotCalendar({
                       >
                         <span className="font-mono text-xs font-semibold text-indigo-950 tabular-nums">
                           {item.start_time}–{item.end_time}
+                          {isNextDay ? ' (+1d)' : ''}
                         </span>
                         <span className="mt-1 text-[11px] font-medium text-indigo-800">
                           Booked ({item.existingSlot?.booked_patients}/
@@ -613,6 +672,7 @@ export function DoctorSlotCalendar({
                     >
                       <span className="font-mono text-xs font-medium text-slate-600 line-through tabular-nums">
                         {item.start_time}–{item.end_time}
+                        {isNextDay ? ' (+1d)' : ''}
                       </span>
                       <span className="mt-1 text-[11px] text-slate-500">Cancelled</span>
                     </div>
@@ -675,7 +735,11 @@ export function DoctorSlotCalendar({
       <Modal
         open={!readOnly && Boolean(confirmTarget)}
         title="Confirm Doctor Availability & Generate Slot"
-        subtitle={`${doctorName} · ${formatDisplayDate(selectedDate)} (${getWeekdayName(selectedDate)})`}
+        subtitle={
+          confirmTarget
+            ? `${doctorName} · ${formatDisplayDate(confirmTarget.slot_date || selectedDate)} (${getWeekdayName(confirmTarget.slot_date || selectedDate)})`
+            : ''
+        }
         onClose={() => setConfirmTarget(null)}
         maxWidth="md"
       >
@@ -686,7 +750,11 @@ export function DoctorSlotCalendar({
               <span className="font-mono font-semibold">
                 {confirmTarget.start_time} – {confirmEndTime}
               </span>{' '}
-              on <span className="font-semibold">{formatDisplayDate(selectedDate)}</span>? This will generate an active OPD appointment slot in Oracle so patients can book it.
+              on{' '}
+              <span className="font-semibold">
+                {formatDisplayDate(confirmTarget.slot_date || selectedDate)}
+              </span>
+              ? This will generate an active OPD appointment slot in Oracle so patients can book it.
             </div>
 
             <div className="grid grid-cols-2 gap-4">

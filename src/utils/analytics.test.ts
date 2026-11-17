@@ -4,10 +4,12 @@ import { generateHistoricalAnalyticsSeed } from './analyticsSeed.ts';
 import {
   buildAnalyticsCsv,
   computeHospitalAnalytics,
+  deduplicateRescheduledRecords,
   filterAnalyticsRecords,
   formatMonthShort,
 } from './analytics.ts';
 import { formatPatientRegion, getLocalitiesForCity, normalizeRegionText } from './regions.ts';
+import type { AnalyticsVisitRecord } from '../types/opd.ts';
 
 test('historical analytics seed covers Nov 2025 through Nov 2026 with valid doctor, department, and region data', () => {
   const records = generateHistoricalAnalyticsSeed([], []);
@@ -83,4 +85,124 @@ test('region helpers normalize, list localities by city, and format display stri
   assert.deepEqual(getLocalitiesForCity('UnknownCity'), []);
   assert.equal(formatMonthShort('2025-11'), 'Nov 25');
   assert.equal(formatMonthShort('2026-11'), 'Nov 26');
+});
+
+test('consultation mode analytics excludes CANCELLED, deduplicates rescheduled records, and filters cleanly', () => {
+  const sample: AnalyticsVisitRecord[] = [
+    {
+      id: 'LIVE-10',
+      source: 'LIVE',
+      visit_date: '2026-11-16',
+      visit_month: '2026-11',
+      start_time: '10:00',
+      doctor_id: 2,
+      doctor_name: 'Dr. Priya Sharma',
+      department_id: 1,
+      department_name: 'Neurology',
+      specialization: 'Neurology',
+      patient_id: 1,
+      patient_name: 'John Doe',
+      patient_gender: 'MALE',
+      patient_age_group: '19-35',
+      city: 'Bengaluru',
+      locality: 'Indiranagar',
+      status: 'CONFIRMED',
+      booking_source: 'ONLINE',
+      consultation_mode: 'ONLINE',
+      payment_method: 'UPI',
+      amount: 600,
+    },
+    {
+      id: 'LIVE-11',
+      source: 'LIVE',
+      visit_date: '2026-11-16',
+      visit_month: '2026-11',
+      start_time: '11:00',
+      doctor_id: 3,
+      doctor_name: 'Dr. Anil Mehta',
+      department_id: 2,
+      department_name: 'Orthopedics',
+      specialization: 'Ortho',
+      patient_id: 22,
+      patient_name: 'Amit Verma',
+      patient_gender: 'MALE',
+      patient_age_group: '36-55',
+      city: 'Mysuru',
+      locality: 'Vijayanagar',
+      status: 'CANCELLED',
+      booking_source: 'ONLINE',
+      consultation_mode: 'ONLINE',
+      payment_method: 'UNPAID',
+      amount: 0,
+    },
+    {
+      id: 'LIVE-12',
+      source: 'LIVE',
+      visit_date: '2026-11-16',
+      visit_month: '2026-11',
+      start_time: '12:00',
+      doctor_id: 2,
+      doctor_name: 'Dr. Priya Sharma',
+      department_id: 1,
+      department_name: 'Neurology',
+      specialization: 'Neurology',
+      patient_id: 23,
+      patient_name: 'Sneha Reddy',
+      patient_gender: 'FEMALE',
+      patient_age_group: '19-35',
+      city: 'Bengaluru',
+      locality: 'Koramangala',
+      status: 'CONFIRMED',
+      booking_source: 'WALK_IN',
+      consultation_mode: 'FACE_TO_FACE',
+      payment_method: 'CASH',
+      amount: 600,
+    },
+    {
+      id: 'LIVE-13',
+      source: 'LIVE',
+      visit_date: '2026-11-17',
+      visit_month: '2026-11',
+      start_time: '14:00',
+      doctor_id: 2,
+      doctor_name: 'Dr. Priya Sharma',
+      department_id: 1,
+      department_name: 'Neurology',
+      specialization: 'Neurology',
+      patient_id: 23,
+      patient_name: 'Sneha Reddy',
+      patient_gender: 'FEMALE',
+      patient_age_group: '19-35',
+      city: 'Bengaluru',
+      locality: 'Koramangala',
+      status: 'CONFIRMED',
+      booking_source: 'ONLINE',
+      consultation_mode: 'ONLINE',
+      rescheduled_from_id: 12,
+      payment_method: 'UPI',
+      amount: 600,
+    },
+  ];
+
+  // LIVE-12 was rescheduled to LIVE-13 -> deduplicated out, leaving LIVE-10 (ONLINE), LIVE-11 (CANCELLED), LIVE-13 (ONLINE)
+  const deduped = deduplicateRescheduledRecords(sample);
+  assert.deepEqual(
+    deduped.map((r) => r.id),
+    ['LIVE-10', 'LIVE-11', 'LIVE-13'],
+  );
+
+  const report = computeHospitalAnalytics(sample);
+  assert.equal(report.activeVisits, 2); // LIVE-10 and LIVE-13 (LIVE-11 CANCELLED excluded, LIVE-12 rescheduled out)
+  assert.equal(report.onlineConsultations, 2);
+  assert.equal(report.faceToFaceConsultations, 0);
+
+  const onlineOnly = filterAnalyticsRecords(sample, {
+    source: 'ALL',
+    fromMonth: '',
+    toMonth: '',
+    department: 'ALL',
+    city: 'ALL',
+    consultationMode: 'ONLINE',
+  });
+  assert.equal(onlineOnly.length, 3);
 });

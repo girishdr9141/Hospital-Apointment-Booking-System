@@ -12,13 +12,14 @@ import {
   UserPlus,
   Users,
   UserX,
+  Video,
 } from 'lucide-react';
 import type { RouteKey, SuperAdminOverviewResponse } from '../../types/opd';
 import { apiClient } from '../../services/apiClient';
 import { useToast } from '../../context/ToastContext';
 import { ROLE_LABELS } from '../../utils/permissions';
-import { formatDisplayDateTime } from '../../utils/rules';
-import { StatusIndicator } from '../../components/layout/StatusIndicator';
+import { formatDisplayDate, formatDisplayDateTime } from '../../utils/rules';
+import { ConsultationModeBadge, StatusIndicator } from '../../components/layout/StatusIndicator';
 import { DashboardSkeleton } from '../../components/layout/SkeletonBlock';
 
 interface SuperAdminDashboardProps {
@@ -72,8 +73,15 @@ export function SuperAdminDashboard({ onNavigate }: SuperAdminDashboardProps) {
 
   if (!overview) return null;
 
-  const { metrics, recent_registrations, recent_permission_changes, recent_security_activities, roles } =
-    overview;
+  const {
+    metrics,
+    recent_registrations,
+    recent_permission_changes,
+    recent_security_activities,
+    roles,
+    consultation_metrics,
+    recent_appointments = [],
+  } = overview;
 
   return (
     <div className="space-y-6">
@@ -261,6 +269,87 @@ export function SuperAdminDashboard({ onNavigate }: SuperAdminDashboardProps) {
             </div>
           ))}
         </div>
+      </section>
+
+      {/* OPD Consultation Mode Summary & Recent Appointments */}
+      <section className="rounded-xl border border-slate-200 bg-white">
+        <div className="flex flex-col gap-2 border-b border-slate-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 className="text-base font-semibold text-slate-900">
+              OPD Consultation Mode Overview
+            </h3>
+            <p className="text-xs text-slate-500">
+              Active appointments segmented by Online vs Face-to-Face consultation mode.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-4 text-xs tabular-nums">
+            <span className="inline-flex items-center gap-1.5 font-medium text-sky-800">
+              <Video className="h-3.5 w-3.5 text-sky-600" aria-hidden="true" />
+              <span>
+                Online: <strong>{consultation_metrics?.online_consultations ?? 0}</strong>
+              </span>
+            </span>
+            <span className="inline-flex items-center gap-1.5 font-medium text-teal-800">
+              <UserCheck className="h-3.5 w-3.5 text-teal-600" aria-hidden="true" />
+              <span>
+                Face-to-Face: <strong>{consultation_metrics?.face_to_face_consultations ?? 0}</strong>
+              </span>
+            </span>
+            <button
+              type="button"
+              onClick={() => onNavigate('appointments')}
+              className="font-medium text-teal-700 hover:underline whitespace-nowrap"
+            >
+              Open Appointments
+            </button>
+          </div>
+        </div>
+        {recent_appointments.length === 0 ? (
+          <div className="p-6 text-center text-xs text-slate-500">
+            No live OPD appointments recorded yet.
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="border-b border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
+                <tr>
+                  <th className="px-4 py-2.5">Reference</th>
+                  <th className="px-4 py-2.5">Patient</th>
+                  <th className="px-4 py-2.5">Doctor</th>
+                  <th className="px-4 py-2.5">Schedule</th>
+                  <th className="px-4 py-2.5">Mode</th>
+                  <th className="px-4 py-2.5">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {recent_appointments.slice(0, 6).map((appt) => (
+                  <tr key={appt.appointment_id} className="hover:bg-slate-50">
+                    <td className="px-4 py-2.5 font-mono text-xs text-slate-700 tabular-nums">
+                      {appt.appointment_ref}
+                    </td>
+                    <td className="px-4 py-2.5 font-medium text-slate-900">
+                      {appt.patient_name || `Patient #${appt.patient_id}`}
+                    </td>
+                    <td className="px-4 py-2.5 text-slate-600">
+                      {appt.doctor_name || `Slot #${appt.slot_id}`}
+                    </td>
+                    <td className="px-4 py-2.5 font-mono text-xs text-slate-600 tabular-nums">
+                      {appt.slot_date
+                        ? `${formatDisplayDate(appt.slot_date)} ${appt.start_time || ''}`
+                        : formatDisplayDate(appt.created_on)}
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <ConsultationModeBadge mode={appt.consultation_mode} />
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <StatusIndicator status={appt.status} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
 
       {/* 3 Live Governance Activity Panels */}

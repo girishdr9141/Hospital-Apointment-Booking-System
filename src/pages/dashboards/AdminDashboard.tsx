@@ -3,7 +3,7 @@ import type { DashboardSummaryResponse, RouteKey } from '../../types/opd';
 import { useAuth } from '../../context/AuthContext';
 import { canAccessRoute, hasModulePermission } from '../../utils/permissions';
 import { formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
-import { StatusIndicator } from '../../components/layout/StatusIndicator';
+import { ConsultationModeBadge, StatusIndicator } from '../../components/layout/StatusIndicator';
 
 interface DashboardProps {
   data: DashboardSummaryResponse;
@@ -88,8 +88,8 @@ export function AdminDashboard({ data, onRefresh, refreshing, onNavigate }: Dash
             {metrics.total_appointments}
           </p>
           <p className="mt-1 text-xs text-slate-500 tabular-nums">
-            {metrics.confirmed_appointments} confirmed · {metrics.held_appointments} held ·{' '}
-            {metrics.completed_appointments} completed
+            {metrics.confirmed_appointments} confirmed · {metrics.online_consultations ?? 0} online ·{' '}
+            {metrics.face_to_face_consultations ?? 0} face-to-face
           </p>
         </div>
 
@@ -199,6 +199,7 @@ export function AdminDashboard({ data, onRefresh, refreshing, onNavigate }: Dash
                     <th className="px-4 py-2.5">Patient</th>
                     <th className="px-4 py-2.5">Doctor</th>
                     <th className="px-4 py-2.5">Schedule</th>
+                    <th className="px-4 py-2.5">Mode</th>
                     <th className="px-4 py-2.5">Status</th>
                   </tr>
                 </thead>
@@ -218,6 +219,9 @@ export function AdminDashboard({ data, onRefresh, refreshing, onNavigate }: Dash
                         {appt.slot_date
                           ? `${formatDisplayDate(appt.slot_date)} ${appt.start_time || ''}`
                           : formatDisplayDate(appt.created_on)}
+                      </td>
+                      <td className="px-4 py-2.5">
+                        <ConsultationModeBadge mode={appt.consultation_mode} />
                       </td>
                       <td className="px-4 py-2.5">
                         <StatusIndicator status={appt.status} />

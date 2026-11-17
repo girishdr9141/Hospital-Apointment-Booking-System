@@ -172,3 +172,32 @@ test('normalizePersonName and doesLoginNameMatch validate personal names accurat
   assert.equal(doesLoginNameMatch('Girish DR', 'Girish DR', 'ADMIN'), true);
   assert.equal(doesLoginNameMatch('Other Admin', 'Girish DR', 'ADMIN'), false);
 });
+
+test('enrichAppointments normalizes consultation_mode and rescheduled_from_id', () => {
+  const enriched = enrichAppointments(
+    [
+      {
+        appointment_id: 101,
+        appointment_ref: 'APT-ONLINE',
+        patient_id: 1,
+        patient_name: 'John Doe',
+        slot_id: 10,
+        status: 'CONFIRMED',
+        consultation_mode: 'ONLINE',
+      },
+      {
+        appointment_id: 102,
+        appointment_ref: 'APT-LEGACY',
+        patient_id: 1,
+        patient_name: 'John Doe',
+        slot_id: 10,
+        status: 'COMPLETED',
+      },
+    ],
+    [],
+    [],
+  );
+  assert.equal(enriched[0].consultation_mode, 'ONLINE');
+  assert.equal(enriched[1].consultation_mode, 'FACE_TO_FACE');
+  assert.equal(enriched[0].rescheduled_from_id, null);
+});

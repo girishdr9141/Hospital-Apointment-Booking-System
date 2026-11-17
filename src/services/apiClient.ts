@@ -5,6 +5,7 @@ import type {
   AuditLogRecord,
   AuthUser,
   CancellationRule,
+  ConsultationMode,
   ConsultationType,
   DashboardSummaryResponse,
   Department,
@@ -138,6 +139,7 @@ export interface OrdsActionResponse {
   status: string;
   message?: string;
   appointment_ref?: string;
+  consultation_mode?: ConsultationMode;
   expired_count?: number;
 }
 
@@ -451,6 +453,7 @@ export const apiClient = {
     patient_id: number;
     slot_id: number;
     booking_source: 'ONLINE' | 'WALK_IN';
+    consultation_mode: ConsultationMode;
   }) =>
     requestJson<OrdsActionResponse>('/api/ords/appointments/', {
       method: 'POST',
@@ -694,11 +697,13 @@ export const apiClient = {
     patient_name?: string;
     doctor_id?: number;
     doctor_name?: string;
+    appointment_id?: number;
     appointment_ref?: string;
     prescribed_date?: string;
     diagnosis: string;
     medications: Array<{ name: string; dosage: string; frequency: string; duration: string }>;
     instructions?: string;
+    idempotency_key?: string;
   }) =>
     requestJson<{ status: string; prescription: PrescriptionEntry }>(
       '/api/clinical/prescriptions',
@@ -711,6 +716,7 @@ export const apiClient = {
       instructions?: string;
       status?: 'ACTIVE' | 'COMPLETED';
       medications?: Array<{ name: string; dosage: string; frequency: string; duration: string }>;
+      idempotency_key?: string;
     },
   ) =>
     requestJson<{ status: string; prescription: PrescriptionEntry }>(

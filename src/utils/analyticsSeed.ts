@@ -1,4 +1,18 @@
-import type { AnalyticsVisitRecord, Department, Doctor } from '../types/opd.ts';
+import type { AnalyticsVisitRecord, ConsultationMode, Department, Doctor } from '../types/opd.ts';
+
+export function deriveDeterministicConsultationMode(
+  recordId: string,
+  teleConsultFlag?: 'Y' | 'N',
+): ConsultationMode {
+  let hash = 2166136261;
+  for (let i = 0; i < recordId.length; i++) {
+    hash ^= recordId.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  const bucket = (hash >>> 0) % 100;
+  const onlineThreshold = teleConsultFlag === 'N' ? 18 : 38;
+  return bucket < onlineThreshold ? 'ONLINE' : 'FACE_TO_FACE';
+}
 
 interface HistoricalPatientTemplate {
   patient_id: number;
@@ -285,6 +299,15 @@ export function generateHistoricalAnalyticsSeed(
         fallbackDeptNames[doctor.department_id] ||
         `Department #${doctor.department_id}`;
 
+      const consultation_mode: ConsultationMode =
+        doctor.tele_consult_flag === 'N'
+          ? rng() < 0.16
+            ? 'ONLINE'
+            : 'FACE_TO_FACE'
+          : rng() < 0.38
+            ? 'ONLINE'
+            : 'FACE_TO_FACE';
+
       records.push({
         id: `HIST-${monthSpec.month}-${String(seq++).padStart(4, '0')}`,
         source: 'HISTORICAL',
@@ -304,6 +327,7 @@ export function generateHistoricalAnalyticsSeed(
         locality: patient.locality,
         status,
         booking_source,
+        consultation_mode,
         payment_method,
         amount: isPaid ? fee : 0,
       });

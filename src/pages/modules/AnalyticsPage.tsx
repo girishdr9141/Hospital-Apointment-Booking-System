@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { BarChart3, Download, RefreshCw, RotateCcw } from 'lucide-react';
-import type { AnalyticsDatasetResponse, AnalyticsSourceTag } from '../../types/opd';
+import { BarChart3, Download, RefreshCw, RotateCcw, UserCheck, Video } from 'lucide-react';
+import type {
+  AnalyticsDatasetResponse,
+  AnalyticsSourceTag,
+  ConsultationMode,
+} from '../../types/opd';
 import { apiClient } from '../../services/apiClient';
 import { useToast } from '../../context/ToastContext';
 import { formatCurrencyInr } from '../../utils/rules';
@@ -20,6 +24,7 @@ const DEFAULT_FILTERS: AnalyticsFilterState = {
   toMonth: '',
   department: 'ALL',
   city: 'ALL',
+  consultationMode: 'ALL',
 };
 
 export function AnalyticsPage() {
@@ -137,7 +142,8 @@ export function AnalyticsPage() {
     filters.fromMonth !== '' ||
     filters.toMonth !== '' ||
     filters.department !== 'ALL' ||
-    filters.city !== 'ALL';
+    filters.city !== 'ALL' ||
+    (Boolean(filters.consultationMode) && filters.consultationMode !== 'ALL');
 
   const handleExportCsv = () => {
     if (!canExportAny) {
@@ -231,6 +237,17 @@ export function AnalyticsPage() {
         ]);
       }
     }
+    for (const cm of report.consultationModes) {
+      rows.push([
+        'Consultation Mode',
+        cm.label,
+        'Active Consultations (Excludes Cancelled)',
+        cm.count,
+        '',
+        `${cm.sharePct}%`,
+        ...(includeRev ? [cm.revenue] : []),
+      ]);
+    }
     const csv = buildCsvString(headers, rows);
     downloadCsvFile('carepulse-opd-analytics-nov2025-nov2026.csv', csv);
     notify('Permitted analytics summary exported as CSV', 'success');
@@ -267,12 +284,25 @@ export function AnalyticsPage() {
   }
 
   const maxMonthlyVisits = Math.max(1, ...report.monthlyTrends.map((m) => m.total));
+  const maxModeMonthly = Math.max(
+    1,
+    ...report.monthlyTrends.map((m) => Math.max(m.online, m.faceToFace)),
+  );
   const maxDayCount = Math.max(1, ...report.peakDays.map((d) => d.count));
   const maxHourCount = Math.max(1, ...report.peakHours.map((h) => h.count));
   const topCitiesSlice = report.topCities.slice(0, 8);
   const topLocalitiesSlice = report.topLocalities.slice(0, 10);
   const maxCityVisits = Math.max(1, ...topCitiesSlice.map((c) => c.totalVisits));
   const maxLocVisits = Math.max(1, ...topLocalitiesSlice.map((l) => l.totalVisits));
+  const activeModeDenominator = Math.max(1, report.onlineConsultations + report.faceToFaceConsultations);
+  const onlineSharePct =
+    report.activeVisits > 0
+      ? Math.round((report.onlineConsultations / activeModeDenominator) * 1000) / 10
+      : 0;
+  const faceToFaceSharePct =
+    report.activeVisits > 0
+      ? Math.round((report.faceToFaceConsultations / activeModeDenominator) * 1000) / 10
+      : 0;
 
   return (
     <div className="space-y-6">
@@ -316,7 +346,7 @@ export function AnalyticsPage() {
       <div className="rounded-xl border border-slate-200 bg-white p-4">
         <div
           className={`grid grid-cols-1 gap-3 sm:grid-cols-2 ${
-            allowed.geographic ? 'lg:grid-cols-5' : 'lg:grid-cols-4'
+            allowed.geographic ? 'lg:grid-cols-6' : 'lg:grid-cols-5'
           }`}
         >
           <div>
@@ -337,6 +367,27 @@ export function AnalyticsPage() {
               <option value="ALL">All (Nov 25 – Nov 26)</option>
               <option value="HISTORICAL">Historical Seed Only</option>
               <option value="LIVE">Live Oracle Only</option>
+            </select>
+          </div>
+
+          <div>
+            <label htmlFor="ana-mode" className="block text-xs font-medium text-slate-500">
+              Consultation Mode
+            </label>
+            <select
+              id="ana-mode"
+              value={filters.consultationMode || 'ALL'}
+              onChange={(e) =>
+                setFilters((prev) => ({
+                  ...prev,
+                  consultationMode: e.target.value as 'ALL' | ConsultationMode,
+                }))
+              }
+              className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 focus:border-teal-700 focus:outline-none"
+            >
+              <option value="ALL">All Modes</option>
+              <option value="ONLINE">Online Consultation</option>
+              <option value="FACE_TO_FACE">Face-to-Face Consultation</option>
             </select>
           </div>
 
@@ -549,6 +600,148 @@ export function AnalyticsPage() {
                 </>
               )}
             </div>
+          </div>
+
+          {/* Consultation Mode KPIs & Visual Comparison Chart */}
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-1">
+              <div className="rounded-xl border border-slate-200 bg-white p-5">
+                <div className="flex items-center justify-between text-xs font-medium text-slate-500">
+                  <span>Total Online Consultations</span>
+                  <Video className="h-4 w-4 text-sky-600" aria-hidden="true" />
+                </div>
+                <p className="mt-2 font-mono text-2xl font-semibold text-sky-900 tabular-nums">
+                  {report.onlineConsultations.toLocaleString('en-IN')}
+                </p>
+                <p className="mt-1 text-xs text-slate-500 tabular-nums">
+                  {onlineSharePct}% of active consultations · Excludes cancelled
+                </p>
+              </div>
+
+              <div className="rounded-xl border border-slate-200 bg-white p-5">
+                <div className="flex items-center justify-between text-xs font-medium text-slate-500">
+                  <span>Total Face-to-Face Consultations</span>
+                  <UserCheck className="h-4 w-4 text-teal-700" aria-hidden="true" />
+                </div>
+                <p className="mt-2 font-mono text-2xl font-semibold text-teal-900 tabular-nums">
+                  {report.faceToFaceConsultations.toLocaleString('en-IN')}
+                </p>
+                <p className="mt-1 text-xs text-slate-500 tabular-nums">
+                  {faceToFaceSharePct}% of active consultations · Rescheduled deduplicated
+                </p>
+              </div>
+            </div>
+
+            <section className="rounded-xl border border-slate-200 bg-white p-5 lg:col-span-2">
+              <div className="flex flex-col gap-2 border-b border-slate-200 pb-4 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <h3 className="text-base font-semibold text-slate-900">
+                    Consultation Mode Comparison (Online vs Face-to-Face)
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Active consultations excluding cancelled records and deduplicating rescheduled appointments.
+                  </p>
+                </div>
+                {activeMonthPoint && (
+                  <div className="flex flex-wrap items-center gap-2 text-xs tabular-nums">
+                    <span className="font-semibold text-slate-900">
+                      {formatMonthShort(activeMonthPoint.month)}:
+                    </span>
+                    <span className="font-medium text-sky-700">
+                      {activeMonthPoint.online} online
+                    </span>
+                    <span aria-hidden="true">·</span>
+                    <span className="font-medium text-teal-700">
+                      {activeMonthPoint.faceToFace} face-to-face
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              {/* Proportional Split Bar */}
+              <div className="mt-4">
+                <div className="mb-1.5 flex items-center justify-between text-xs font-medium tabular-nums">
+                  <span className="text-sky-800">
+                    Online ({report.onlineConsultations.toLocaleString('en-IN')} · {onlineSharePct}%)
+                  </span>
+                  <span className="text-teal-800">
+                    Face-to-Face ({report.faceToFaceConsultations.toLocaleString('en-IN')} ·{' '}
+                    {faceToFaceSharePct}%)
+                  </span>
+                </div>
+                <div className="flex h-3 w-full overflow-hidden rounded-full bg-slate-100">
+                  <div
+                    className="h-full bg-sky-600 transition-all"
+                    style={{ width: `${onlineSharePct}%` }}
+                  />
+                  <div
+                    className="h-full bg-teal-700 transition-all"
+                    style={{ width: `${faceToFaceSharePct}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* Monthly Grouped Comparison Bars */}
+              <div className="mt-5 overflow-x-auto">
+                <div className="min-w-[540px]">
+                  <div
+                    className="grid items-end gap-2 h-40 pt-3"
+                    style={{
+                      gridTemplateColumns: `repeat(${Math.max(1, report.monthlyTrends.length)}, minmax(0, 1fr))`,
+                    }}
+                  >
+                    {report.monthlyTrends.map((m) => {
+                      const onlinePct =
+                        m.online > 0 ? Math.max(8, Math.round((m.online / maxModeMonthly) * 100)) : 0;
+                      const f2fPct =
+                        m.faceToFace > 0
+                          ? Math.max(8, Math.round((m.faceToFace / maxModeMonthly) * 100))
+                          : 0;
+                      const isFocused = activeMonthPoint?.month === m.month;
+                      return (
+                        <button
+                          key={`mode-${m.month}`}
+                          type="button"
+                          onMouseEnter={() => setHoveredMonth(m.month)}
+                          onFocus={() => setHoveredMonth(m.month)}
+                          onClick={() => setHoveredMonth(m.month)}
+                          aria-label={`${formatMonthShort(m.month)}: ${m.online} online, ${m.faceToFace} face-to-face`}
+                          className={`flex h-full flex-col justify-end rounded-lg px-1 pt-2 pb-1 text-center transition-colors ${
+                            isFocused ? 'bg-slate-50' : 'hover:bg-slate-50'
+                          }`}
+                        >
+                          <div className="mx-auto flex h-28 w-full max-w-[32px] items-end justify-center gap-1">
+                            <div
+                              className="w-3 rounded-t bg-sky-600 transition-all"
+                              style={{ height: `${onlinePct}%` }}
+                              title={`Online: ${m.online}`}
+                            />
+                            <div
+                              className="w-3 rounded-t bg-teal-700 transition-all"
+                              style={{ height: `${f2fPct}%` }}
+                              title={`Face-to-Face: ${m.faceToFace}`}
+                            />
+                          </div>
+                          <span className="mt-1.5 font-mono text-[10px] text-slate-600 whitespace-nowrap">
+                            {m.label}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="mt-2 flex items-center justify-end gap-5 text-xs text-slate-500">
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="inline-block h-2.5 w-2.5 rounded-sm bg-sky-600" />
+                      Online Consultation
+                    </span>
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="inline-block h-2.5 w-2.5 rounded-sm bg-teal-700" />
+                      Face-to-Face Consultation
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </section>
           </div>
 
           {/* Monthly Trend Chart (Nov 2025 – Nov 2026) */}

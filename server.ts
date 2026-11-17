@@ -11,6 +11,7 @@ import type {
   AnalyticsVisitRecord,
   Appointment,
   AuthUser,
+  ConsultationMode,
   DashboardSummaryResponse,
   Department,
   Doctor,
@@ -63,19 +64,29 @@ import {
 } from './src/utils/rules.ts';
 import {
   buildWorkingHourWindows,
+  DEFAULT_HOSPITAL_TIMEZONE,
   DEFAULT_WORKING_DAYS,
   deriveShiftDefaultsFromTemplates,
   formatShiftSummary,
+  getHospitalNowParts,
   getTodayIsoLocal,
   getWeekdayName,
+  isAppointmentTimeReached,
   isDateCoveredByApprovedLeave,
+  isSlotStartExpired,
+  isValidSlotTimeRange,
+  validateShiftSessions,
 } from './src/utils/calendar.ts';
 import {
   DEFAULT_SEEDED_PATIENT_REGIONS,
   normalizeRegionText,
   type PatientRegion,
 } from './src/utils/regions.ts';
-import { generateHistoricalAnalyticsSeed } from './src/utils/analyticsSeed.ts';
+import {
+  deriveDeterministicConsultationMode,
+  generateHistoricalAnalyticsSeed,
+} from './src/utils/analyticsSeed.ts';
+import { normalizeRecordConsultationMode } from './src/utils/analytics.ts';
 import {
   buildRoleDefinitions,
   buildUnifiedUsersDirectory,
@@ -93,7 +104,16 @@ import {
   verifyPasswordScrypt,
   writeRbacStore,
 } from './server/rbacStore.ts';
-import { readClinicalStore, writeClinicalStore } from './server/clinicalStore.ts';
+import {
+  readClinicalStore,
+  writeClinicalStore,
+  type PatientNotificationRecord,
+} from './server/clinicalStore.ts';
+
+const HOSPITAL_TIMEZONE = process.env.HOSPITAL_TIMEZONE || DEFAULT_HOSPITAL_TIMEZONE;
+function getServerTodayIso(): string {
+  return getTodayIsoLocal(new Date(), HOSPITAL_TIMEZONE);
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
@@ -371,6 +391,88 @@ const NOTIF_ACK_PATH = path.join(SHIFT_STORE_DIR, 'notifications_ack.json');
 const PATIENT_PW_PATH = path.join(SHIFT_STORE_DIR, 'patient_passwords.json');
 const PATIENT_REGIONS_PATH = path.join(SHIFT_STORE_DIR, 'patient_regions.json');
 const HISTORICAL_ANALYTICS_PATH = path.join(SHIFT_STORE_DIR, 'historical_analytics_seed.json');
+const APPT_METADATA_PATH = path.join(SHIFT_STORE_DIR, 'appointment_metadata.json');
+
+interface AppointmentMetadataEntry {
+  consultation_mode: ConsultationMode;
+  rescheduled_from_id?: number | null;
+  appointment_ref?: string | null;
+  appointment_id?: number | null;
+  patient_id?: number;
+  slot_id?: number;
+  updated_at: string;
+}
+
+function readAppointmentMetadata(): Record<string, AppointmentMetadataEntry> {
+  try {
+    if (!fs.existsSync(APPT_METADATA_PATH)) return {};
+    const parsed = JSON.parse(fs.readFileSync(APPT_METADATA_PATH, 'utf8'));
+    return parsed && typeof parsed === 'object'
+      ? (parsed as Record<string, AppointmentMetadataEntry>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAppointmentMetadata(entry: AppointmentMetadataEntry): void {
+  const store = readAppointmentMetadata();
+  if (entry.appointment_id && entry.appointment_id > 0) {
+    store[`id:${entry.appointment_id}`] = entry;
+  }
+  if (entry.appointment_ref) {
+    store[`ref:${entry.appointment_ref}`] = entry;
+  }
+  fs.mkdirSync(SHIFT_STORE_DIR, { recursive: true });
+  fs.writeFileSync(APPT_METADATA_PATH, JSON.stringify(store, null, 2), 'utf8');
+}
+
+function normalizeConsultationModeInput(value: unknown): ConsultationMode | null {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (normalized === 'ONLINE') return 'ONLINE';
+  if (normalized === 'FACE_TO_FACE') return 'FACE_TO_FACE';
+  return null;
+}
+
+function attachConsultationMode(appointments: Appointment[]): Appointment[] {
+  const meta = readAppointmentMetadata();
+  return appointments.map((a) => {
+    const directMode = normalizeConsultationModeInput(a.consultation_mode);
+    const metaEntry = meta[`id:${a.appointment_id}`] || (a.appointment_ref ? meta[`ref:${a.appointment_ref}`] : undefined);
+    const mode: ConsultationMode = directMode || metaEntry?.consultation_mode || 'FACE_TO_FACE';
+    const rescheduledFrom = a.rescheduled_from_id ?? metaEntry?.rescheduled_from_id ?? null;
+    return {
+      ...a,
+      consultation_mode: mode,
+      rescheduled_from_id: rescheduledFrom,
+    };
+  });
+}
+
+function countActiveConsultations(appointments: Appointment[]): {
+  online: number;
+  faceToFace: number;
+  totalActive: number;
+} {
+  const supersededIds = new Set<number>();
+  for (const a of appointments) {
+    if (a.rescheduled_from_id && a.rescheduled_from_id > 0) {
+      supersededIds.add(a.rescheduled_from_id);
+    }
+  }
+  let online = 0;
+  let faceToFace = 0;
+  for (const a of appointments) {
+    if (a.status === 'CANCELLED') continue;
+    if (supersededIds.has(a.appointment_id)) continue;
+    if (normalizeConsultationModeInput(a.consultation_mode) === 'ONLINE') {
+      online += 1;
+    } else {
+      faceToFace += 1;
+    }
+  }
+  return { online, faceToFace, totalActive: online + faceToFace };
+}
 
 function readPatientRegions(): Record<string, PatientRegion> {
   const merged: Record<string, PatientRegion> = {};
@@ -443,11 +545,32 @@ function loadOrSeedHistoricalAnalytics(
   doctors: Doctor[],
   departments: Department[],
 ): AnalyticsVisitRecord[] {
+  const docTeleMap = new Map<number, Doctor['tele_consult_flag']>(
+    doctors.map((d) => [d.doctor_id, d.tele_consult_flag]),
+  );
   try {
     if (fs.existsSync(HISTORICAL_ANALYTICS_PATH)) {
       const parsed = JSON.parse(fs.readFileSync(HISTORICAL_ANALYTICS_PATH, 'utf8'));
       if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed as AnalyticsVisitRecord[];
+        const records = parsed as AnalyticsVisitRecord[];
+        let needsBackfill = false;
+        const hydrated = records.map((r) => {
+          if (r.consultation_mode === 'ONLINE' || r.consultation_mode === 'FACE_TO_FACE') {
+            return r;
+          }
+          needsBackfill = true;
+          return {
+            ...r,
+            consultation_mode: deriveDeterministicConsultationMode(
+              r.id,
+              docTeleMap.get(r.doctor_id),
+            ),
+          };
+        });
+        if (needsBackfill) {
+          fs.writeFileSync(HISTORICAL_ANALYTICS_PATH, JSON.stringify(hydrated, null, 2), 'utf8');
+        }
+        return hydrated;
       }
     }
   } catch {
@@ -674,21 +797,16 @@ function resolveDoctorShift(
 
 function normalizeShiftSessions(raw: unknown): ShiftSession[] {
   if (!Array.isArray(raw)) return [];
-  const valid: ShiftSession[] = [];
-  for (const item of raw) {
-    const start = String((item as ShiftSession)?.start_time || '').trim();
-    const end = String((item as ShiftSession)?.end_time || '').trim();
-    if (/^\d{2}:\d{2}$/.test(start) && /^\d{2}:\d{2}$/.test(end) && start < end) {
-      valid.push({ start_time: start, end_time: end });
-    }
+  const result = validateShiftSessions(
+    raw.map((item) => ({
+      start_time: String((item as ShiftSession)?.start_time || '').trim(),
+      end_time: String((item as ShiftSession)?.end_time || '').trim(),
+    })),
+  );
+  if (!result.valid) {
+    throw new Error(result.message);
   }
-  valid.sort((a, b) => a.start_time.localeCompare(b.start_time));
-  for (let i = 1; i < valid.length; i++) {
-    if (valid[i].start_time < valid[i - 1].end_time) {
-      throw new Error('Shift sessions cannot overlap');
-    }
-  }
-  return valid;
+  return result.sessions;
 }
 
 async function syncShiftToOracleTemplates(
@@ -1655,11 +1773,11 @@ async function startServer() {
       const fullSlotsForApptJoin = enrichSlots(rawSlotsWithDoctors, templates, doctors, departmentsForJoin);
       const enrichedSlots = enrichSlots(confirmedRawSlots, templates, doctors, departmentsForJoin);
       const enrichedAppointments = enrichAppointments(
-        rawAppointments,
+        attachConsultationMode(rawAppointments),
         fullSlotsForApptJoin,
         doctors,
       );
-      const todayIso = new Date().toISOString().slice(0, 10);
+      const todayIso = getServerTodayIso();
 
       let scopedAppointments = enrichedAppointments;
       let scopedSlots = enrichedSlots;
@@ -1720,7 +1838,7 @@ async function startServer() {
         } catch {
           doctorLeaves = [];
         }
-        const localTodayIso = getTodayIsoLocal();
+        const localTodayIso = getServerTodayIso();
         doctorSlotsTodayCount = scopedSlots.filter(
           (s) => getIsoDatePart(s.slot_date) === localTodayIso && s.status !== 'CANCELLED',
         ).length;
@@ -1759,7 +1877,7 @@ async function startServer() {
         ).slice(0, 15);
       }
 
-      const localTodayIso = getTodayIsoLocal();
+      const localTodayIso = getServerTodayIso();
       const todaysAppointments = scopedAppointments.filter(
         (a) => getIsoDatePart(a.slot_date || a.created_on) === localTodayIso,
       );
@@ -1782,6 +1900,8 @@ async function startServer() {
         }
       }
 
+      const consultationCounts = countActiveConsultations(scopedAppointments);
+
       const payload: DashboardSummaryResponse = {
         role: user.role,
         generated_at: new Date().toISOString(),
@@ -1796,6 +1916,8 @@ async function startServer() {
           confirmed_appointments: scopedAppointments.filter((a) => a.status === 'CONFIRMED').length,
           completed_appointments: scopedAppointments.filter((a) => a.status === 'COMPLETED').length,
           cancelled_appointments: scopedAppointments.filter((a) => a.status === 'CANCELLED').length,
+          online_consultations: consultationCounts.online,
+          face_to_face_consultations: consultationCounts.faceToFace,
           available_slots_today: referenceSlots.filter((s) => s.status === 'AVAILABLE').length,
           total_slots_today: referenceSlots.length,
           total_payments_amount: scopedPayments
@@ -1891,7 +2013,11 @@ async function startServer() {
       const shiftStore = readShiftStore();
       const rawSlotsWithDoctors = attachDoctorIdsToSlots(rawSlots, templates, shiftStore);
       const joinedSlots = enrichSlots(rawSlotsWithDoctors, templates, doctors, allDepartments);
-      const enrichedAppointments = enrichAppointments(rawAppointments, joinedSlots, doctors);
+      const enrichedAppointments = enrichAppointments(
+        attachConsultationMode(rawAppointments),
+        joinedSlots,
+        doctors,
+      );
 
       const patientsWithRegions = attachRegionsToPatients(rawPatients);
       const patientMap = new Map<number, Patient>(
@@ -1913,7 +2039,7 @@ async function startServer() {
         const pat = patientMap.get(a.patient_id);
         const doc = a.doctor_id ? doctorMap.get(a.doctor_id) : undefined;
         const pay = paymentByApptId.get(a.appointment_id);
-        const visitDate = getIsoDatePart(a.slot_date || a.created_on) || getTodayIsoLocal();
+        const visitDate = getIsoDatePart(a.slot_date || a.created_on) || getServerTodayIso();
         const rawMethod = String(pay?.payment_method || '').trim().toUpperCase();
         const paymentMethod: AnalyticsVisitRecord['payment_method'] = pay
           ? rawMethod === 'UPI' || rawMethod === 'CARD' || rawMethod === 'CASH' || rawMethod === 'NETBANKING'
@@ -1951,6 +2077,8 @@ async function startServer() {
           locality: normalizeRegionText(pat?.locality) || 'Unspecified',
           status: a.status,
           booking_source: a.booking_source === 'WALK_IN' ? 'WALK_IN' : 'ONLINE',
+          consultation_mode: a.consultation_mode === 'ONLINE' ? 'ONLINE' : 'FACE_TO_FACE',
+          rescheduled_from_id: a.rescheduled_from_id ?? null,
           payment_method: allowedSections.revenue ? paymentMethod : 'UNPAID',
           amount: allowedSections.revenue ? amount : 0,
         };
@@ -2086,6 +2214,28 @@ async function startServer() {
           });
         }
       }
+    } else if (user.role === 'PATIENT' && user.patient_id) {
+      const store = readClinicalStore();
+      const myNotifs = store.patient_notifications.filter(
+        (n) => n.patient_id === user.patient_id,
+      );
+      for (const n of myNotifs) {
+        list.push({
+          id: n.id,
+          category:
+            n.event_type === 'CREATED' ? 'PRESCRIPTION_CREATED' : 'PRESCRIPTION_UPDATED',
+          title: n.title,
+          message: n.message,
+          route: 'prescriptions',
+          created_at: n.created_at,
+          read: dismissed.has(n.id),
+          severity: 'success',
+          doctor_name: n.doctor_name,
+          appointment_ref: n.appointment_ref,
+          prescription_id: n.prescription_id,
+          patient_id: n.patient_id,
+        });
+      }
     }
 
     list.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
@@ -2106,7 +2256,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/notifications/dismiss', requireAuth, async (req, res) => {
+  async function handleNotificationAck(req: Request, res: Response): Promise<void> {
     const user = (req as Request & { authUser: AuthUser }).authUser;
     try {
       const notifications = await buildNotificationsForUser(user);
@@ -2119,6 +2269,8 @@ async function startServer() {
         for (const id of req.body.ids) {
           if (typeof id === 'string') curSet.add(id);
         }
+      } else if (typeof req.body?.id === 'string') {
+        curSet.add(req.body.id);
       }
       acks[ackKey] = Array.from(curSet);
       writeNotificationAcks(acks);
@@ -2134,7 +2286,10 @@ async function startServer() {
         message: err instanceof Error ? err.message : 'Unable to update notifications',
       });
     }
-  });
+  }
+
+  app.post('/api/notifications/dismiss', requireAuth, handleNotificationAck);
+  app.post('/api/notifications/read', requireAuth, handleNotificationAck);
 
   // Helper to resolve or create a weekday slot template for a doctor
   async function ensureDoctorWeekdayTemplate(
@@ -2500,17 +2655,25 @@ async function startServer() {
       return;
     }
 
-    const todayIso = getTodayIsoLocal();
+    const now = new Date();
+    const nowParts = getHospitalNowParts(now, HOSPITAL_TIMEZONE);
     for (const s of requestedSlots) {
       if (!s.slot_date || !s.start_time || !s.end_time) {
         res.status(400).json({ status: 'error', message: 'Each slot requires slot_date, start_time, and end_time' });
         return;
       }
-      if (s.slot_date < todayIso) {
+      if (s.slot_date < nowParts.isoDate) {
         res.status(400).json({ status: 'error', message: `Cannot generate slots for past date ${s.slot_date}` });
         return;
       }
-      if (s.start_time >= s.end_time) {
+      if (isSlotStartExpired(s.slot_date, s.start_time, now, HOSPITAL_TIMEZONE)) {
+        res.status(400).json({
+          status: 'error',
+          message: `Cannot generate slot starting at ${s.start_time} on ${s.slot_date}: start time must be after current hospital time (${nowParts.timeHHMM} ${HOSPITAL_TIMEZONE}).`,
+        });
+        return;
+      }
+      if (!isValidSlotTimeRange(s.start_time, s.end_time)) {
         res.status(400).json({ status: 'error', message: `Invalid slot time range ${s.start_time}–${s.end_time}` });
         return;
       }
@@ -2642,7 +2805,9 @@ async function startServer() {
     }
 
     const targetDoctorId = user.doctor_id;
-    const todayIso = getTodayIsoLocal();
+    const now = new Date();
+    const nowParts = getHospitalNowParts(now, HOSPITAL_TIMEZONE);
+    const todayIso = nowParts.isoDate;
     const targetDate = String(req.body?.slot_date || todayIso).slice(0, 10);
 
     if (targetDate < todayIso) {
@@ -2672,17 +2837,32 @@ async function startServer() {
       const docTemplateIds = new Set(docTemplates.map((t) => t.template_id));
       const docExistingSlots = existingSlots.filter((s) => docTemplateIds.has(s.template_id));
 
-      const windows = buildWorkingHourWindows(targetDate, docTemplates, {
+      const allWindows = buildWorkingHourWindows(targetDate, docTemplates, {
         shiftConfig: shift,
         durationMins: Number(req.body?.duration_mins || shift.slot_duration_mins || 30),
       });
+      const windows = allWindows.filter((w) => {
+        const wDate = w.slot_date || targetDate;
+        return (
+          !isSlotStartExpired(wDate, w.start_time, now, HOSPITAL_TIMEZONE) &&
+          !isDateCoveredByApprovedLeave(wDate, leaves, targetDoctorId)
+        );
+      });
+      if (targetDate === todayIso && windows.length === 0) {
+        res.status(400).json({
+          status: 'error',
+          message: `No future slots remain today after ${nowParts.timeHHMM} (${HOSPITAL_TIMEZONE}). Please select a future date.`,
+        });
+        return;
+      }
 
       let createdCount = 0;
       for (const w of windows) {
-        const slotKey = makeSlotKey(targetDoctorId, targetDate, w.start_time);
+        const wDate = w.slot_date || targetDate;
+        const slotKey = makeSlotKey(targetDoctorId, wDate, w.start_time);
         const exists = docExistingSlots.some(
           (s) =>
-            getIsoDatePart(s.slot_date) === targetDate &&
+            getIsoDatePart(s.slot_date) === wDate &&
             s.start_time === w.start_time &&
             s.status !== 'CANCELLED',
         );
@@ -2696,7 +2876,7 @@ async function startServer() {
 
         let tmplId = w.template_id;
         if (!tmplId) {
-          const weekday = getWeekdayName(targetDate);
+          const weekday = getWeekdayName(wDate);
           tmplId = await ensureDoctorWeekdayTemplate(
             targetDoctorId,
             weekday,
@@ -2712,7 +2892,7 @@ async function startServer() {
           method: 'POST',
           body: JSON.stringify({
             template_id: tmplId,
-            slot_date: targetDate,
+            slot_date: wDate,
             start_time: w.start_time,
             end_time: w.end_time,
             max_patients_per_slot: 1,
@@ -2721,6 +2901,16 @@ async function startServer() {
         if (createdRes.status === 'error') {
           throw new Error(createdRes.message || 'Oracle rejected slot creation');
         }
+        docExistingSlots.push({
+          slot_id: -Date.now(),
+          template_id: tmplId,
+          slot_date: wDate,
+          start_time: w.start_time,
+          end_time: w.end_time,
+          max_patients_per_slot: 1,
+          booked_patients: 0,
+          status: 'AVAILABLE',
+        });
         openedSet.add(slotKey);
         createdCount += 1;
       }
@@ -2760,9 +2950,29 @@ async function startServer() {
     const user = (req as Request & { authUser: AuthUser }).authUser;
     if (!requireAnyPermission(user, res, ['USERS:VIEW', 'ROLES:VIEW'], 'RBAC Overview')) return;
     try {
-      const directory = await loadUnifiedDirectory();
+      const [directory, rawAppts, rawSlots, templates, doctors] = await Promise.all([
+        loadUnifiedDirectory(),
+        fetchOrdsItems<Appointment>('appointments').catch(() => [] as Appointment[]),
+        fetchOrdsItems<Slot>('slots').catch(() => [] as Slot[]),
+        fetchOrdsItems<SlotTemplate>('slot_templates').catch(() => [] as SlotTemplate[]),
+        fetchOrdsItems<Doctor>('doctors').catch(() => [] as Doctor[]),
+      ]);
       const roles = buildRoleDefinitions(directory);
       const logs = readRbacAuditLogs(300);
+
+      const shiftStore = readShiftStore();
+      const joinedSlots = enrichSlots(
+        attachDoctorIdsToSlots(rawSlots, templates, shiftStore),
+        templates,
+        doctors,
+        [],
+      );
+      const enrichedAppointments = enrichAppointments(
+        attachConsultationMode(rawAppts),
+        joinedSlots,
+        doctors,
+      );
+      const consultCounts = countActiveConsultations(enrichedAppointments);
 
       const recentRegistrations = [...directory]
         .sort((a, b) => (b.created_on || '').localeCompare(a.created_on || ''))
@@ -2787,6 +2997,12 @@ async function startServer() {
           inactive_accounts: directory.filter((u) => u.status === 'INACTIVE').length,
           suspended_accounts: directory.filter((u) => u.status === 'SUSPENDED').length,
         },
+        consultation_metrics: {
+          total_active_appointments: consultCounts.totalActive,
+          online_consultations: consultCounts.online,
+          face_to_face_consultations: consultCounts.faceToFace,
+        },
+        recent_appointments: enrichedAppointments.slice(0, 8),
         recent_registrations: recentRegistrations,
         recent_permission_changes: recentPermissionChanges,
         recent_security_activities: recentSecurityActivities,
@@ -3574,7 +3790,7 @@ async function startServer() {
       doctor_id: doctorId,
       doctor_name: doctorName || `Doctor #${doctorId}`,
       appointment_ref: String(req.body?.appointment_ref || '').trim() || null,
-      visit_date: String(req.body?.visit_date || getTodayIsoLocal()).slice(0, 10),
+      visit_date: String(req.body?.visit_date || getServerTodayIso()).slice(0, 10),
       chief_complaint: chiefComplaint,
       diagnosis,
       vitals_summary: String(req.body?.vitals_summary || '').trim() || null,
@@ -3682,14 +3898,28 @@ async function startServer() {
     res.json({ status: 'success', prescriptions });
   });
 
-  app.post('/api/clinical/prescriptions', requireAuth, (req, res) => {
+  app.post('/api/clinical/prescriptions', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
     if (!requirePermission(user, res, 'PRESCRIPTIONS:CREATE', 'Create Prescription')) return;
 
+    const idempotencyKey = String(
+      req.headers['x-idempotency-key'] || req.body?.idempotency_key || '',
+    ).trim();
+
+    const initialStore = readClinicalStore();
+    if (idempotencyKey && initialStore.prescription_idempotency[`POST:${idempotencyKey}`]) {
+      const existingId = initialStore.prescription_idempotency[`POST:${idempotencyKey}`];
+      const existingRx = initialStore.prescriptions.find((p) => p.prescription_id === existingId);
+      if (existingRx) {
+        res.status(200).json({ status: 'success', prescription: existingRx, deduplicated: true });
+        return;
+      }
+    }
+
     const patientId = Number(req.body?.patient_id);
     const patientName = String(req.body?.patient_name || '').trim();
-    const doctorId = Number(req.body?.doctor_id || user.doctor_id || 0);
-    const doctorName = String(req.body?.doctor_name || user.full_name || '').trim();
+    const appointmentId = Number(req.body?.appointment_id || 0);
+    const appointmentRefInput = String(req.body?.appointment_ref || '').trim();
     const diagnosis = String(req.body?.diagnosis || '').trim();
     const medications = Array.isArray(req.body?.medications) ? req.body.medications : [];
     const instructions = String(req.body?.instructions || '').trim();
@@ -3702,48 +3932,191 @@ async function startServer() {
       return;
     }
 
-    const store = readClinicalStore();
-    const entry = {
-      prescription_id: `RX-${Date.now()}`,
-      patient_id: patientId,
-      patient_name: patientName || `Patient #${patientId}`,
-      doctor_id: doctorId,
-      doctor_name: doctorName || `Doctor #${doctorId}`,
-      appointment_ref: String(req.body?.appointment_ref || '').trim() || null,
-      prescribed_date: String(req.body?.prescribed_date || getTodayIsoLocal()).slice(0, 10),
-      diagnosis,
-      medications: medications.map((m: Record<string, unknown>) => ({
-        name: String(m.name || '').trim(),
-        dosage: String(m.dosage || '').trim(),
-        frequency: String(m.frequency || '').trim(),
-        duration: String(m.duration || '').trim(),
-      })),
-      instructions: instructions || 'Take medications as directed.',
-      status: 'ACTIVE' as const,
-      updated_at: new Date().toISOString(),
-    };
-    store.prescriptions.unshift(entry);
-    writeClinicalStore(store);
+    if (!appointmentRefInput && !appointmentId) {
+      res.status(400).json({
+        status: 'error',
+        message: 'An appointment reference is required to issue a prescription.',
+      });
+      return;
+    }
 
-    recordRbacAuditLog({
-      actor_user_id: user.user_id,
-      actor_name: user.full_name,
-      actor_role: user.role,
-      target_label: `${entry.patient_name} (${entry.prescription_id})`,
-      action: 'PRESCRIPTION_CREATED',
-      category: 'CLINICAL',
-      new_value: entry.diagnosis,
-      details: `Issued prescription ${entry.prescription_id} with ${entry.medications.length} medication(s).`,
-      severity: 'info',
-    });
+    try {
+      const [rawAppts, rawSlots, templates, doctors] = await Promise.all([
+        fetchOrdsItems<Appointment>('appointments'),
+        fetchOrdsItems<Slot>('slots'),
+        fetchOrdsItems<SlotTemplate>('slot_templates'),
+        fetchOrdsItems<Doctor>('doctors'),
+      ]);
+      const shiftStore = readShiftStore();
+      const joinedSlots = enrichSlots(
+        attachDoctorIdsToSlots(rawSlots, templates, shiftStore),
+        templates,
+        doctors,
+        [],
+      );
+      const enrichedAppts = enrichAppointments(
+        attachConsultationMode(rawAppts),
+        joinedSlots,
+        doctors,
+      );
 
-    res.status(201).json({ status: 'success', prescription: entry });
+      const matchedAppt = enrichedAppts.find(
+        (a) =>
+          (appointmentId > 0 && a.appointment_id === appointmentId) ||
+          (appointmentRefInput && a.appointment_ref === appointmentRefInput),
+      );
+
+      if (!matchedAppt) {
+        res.status(404).json({
+          status: 'error',
+          message: 'Associated appointment was not found.',
+        });
+        return;
+      }
+
+      if (matchedAppt.status === 'CANCELLED' || matchedAppt.status === 'NO_SHOW') {
+        res.status(400).json({
+          status: 'error',
+          message: `Cannot issue prescription for an appointment with status ${matchedAppt.status}.`,
+        });
+        return;
+      }
+
+      if (user.role === 'DOCTOR') {
+        if (!user.doctor_id || matchedAppt.doctor_id !== user.doctor_id) {
+          res.status(403).json({
+            status: 'error',
+            message: 'Doctors can only issue prescriptions for appointments assigned to them.',
+          });
+          return;
+        }
+      }
+
+      if (matchedAppt.patient_id !== patientId) {
+        res.status(403).json({
+          status: 'error',
+          message: 'Selected patient does not match the patient assigned to this appointment.',
+        });
+        return;
+      }
+
+      if (
+        !isAppointmentTimeReached(
+          matchedAppt.slot_date,
+          matchedAppt.start_time,
+          new Date(),
+          HOSPITAL_TIMEZONE,
+        )
+      ) {
+        res.status(400).json({
+          status: 'error',
+          message: 'Prescription can only be issued after the scheduled appointment time.',
+        });
+        return;
+      }
+
+      const resolvedDoctorId = Number(matchedAppt.doctor_id || req.body?.doctor_id || user.doctor_id || 0);
+      const resolvedDoctorName =
+        String(matchedAppt.doctor_name || req.body?.doctor_name || user.full_name || '').trim() ||
+        `Doctor #${resolvedDoctorId}`;
+      const resolvedPatientName =
+        String(matchedAppt.patient_name || patientName || '').trim() || `Patient #${patientId}`;
+      const nowIso = new Date().toISOString();
+
+      const store = readClinicalStore();
+      if (idempotencyKey && store.prescription_idempotency[`POST:${idempotencyKey}`]) {
+        const existingId = store.prescription_idempotency[`POST:${idempotencyKey}`];
+        const existingRx = store.prescriptions.find((p) => p.prescription_id === existingId);
+        if (existingRx) {
+          res.status(200).json({ status: 'success', prescription: existingRx, deduplicated: true });
+          return;
+        }
+      }
+
+      const entry = {
+        prescription_id: `RX-${Date.now()}`,
+        patient_id: patientId,
+        patient_name: resolvedPatientName,
+        doctor_id: resolvedDoctorId,
+        doctor_name: resolvedDoctorName,
+        appointment_ref: matchedAppt.appointment_ref,
+        prescribed_date: String(req.body?.prescribed_date || getServerTodayIso()).slice(0, 10),
+        diagnosis,
+        medications: medications.map((m: Record<string, unknown>) => ({
+          name: String(m.name || '').trim(),
+          dosage: String(m.dosage || '').trim(),
+          frequency: String(m.frequency || '').trim(),
+          duration: String(m.duration || '').trim(),
+        })),
+        instructions: instructions || 'Take medications as directed.',
+        status: 'ACTIVE' as const,
+        updated_at: nowIso,
+      };
+
+      store.prescriptions.unshift(entry);
+      if (idempotencyKey) {
+        store.prescription_idempotency[`POST:${idempotencyKey}`] = entry.prescription_id;
+      }
+      // Step 1: Persist prescription BEFORE emitting notification
+      writeClinicalStore(store);
+
+      // Step 2: Emit patient-only notification after prescription write succeeded
+      const notifId = `rx-notif-create-${entry.prescription_id}`;
+      if (!store.patient_notifications.some((n) => n.id === notifId)) {
+        const notifRecord: PatientNotificationRecord = {
+          id: notifId,
+          patient_id: entry.patient_id,
+          prescription_id: entry.prescription_id,
+          event_type: 'CREATED',
+          title: 'New Prescription Issued',
+          message: `${entry.doctor_name} issued a new prescription for appointment ${entry.appointment_ref}. Please check your prescription in the Prescriptions section.`,
+          doctor_name: entry.doctor_name,
+          appointment_ref: entry.appointment_ref,
+          created_at: nowIso,
+          ...(idempotencyKey ? { idempotency_key: `POST:${idempotencyKey}` } : {}),
+        };
+        store.patient_notifications.unshift(notifRecord);
+        writeClinicalStore(store);
+      }
+
+      recordRbacAuditLog({
+        actor_user_id: user.user_id,
+        actor_name: user.full_name,
+        actor_role: user.role,
+        target_label: `${entry.patient_name} (${entry.prescription_id})`,
+        action: 'PRESCRIPTION_CREATED',
+        category: 'CLINICAL',
+        new_value: entry.diagnosis,
+        details: `Issued prescription ${entry.prescription_id} for ${entry.appointment_ref} with ${entry.medications.length} medication(s).`,
+        severity: 'info',
+      });
+
+      res.status(201).json({ status: 'success', prescription: entry });
+    } catch (err) {
+      res.status(502).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to verify appointment for prescription',
+      });
+    }
   });
 
-  app.put('/api/clinical/prescriptions/:id', requireAuth, (req, res) => {
+  app.put('/api/clinical/prescriptions/:id', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
     if (!requirePermission(user, res, 'PRESCRIPTIONS:UPDATE', 'Update Prescription')) return;
+
+    const idempotencyKey = String(
+      req.headers['x-idempotency-key'] || req.body?.idempotency_key || '',
+    ).trim();
+
     const store = readClinicalStore();
+    if (idempotencyKey && store.prescription_idempotency[`PUT:${idempotencyKey}`]) {
+      const existingRx = store.prescriptions.find((p) => p.prescription_id === req.params.id);
+      if (existingRx) {
+        res.json({ status: 'success', prescription: existingRx, deduplicated: true });
+        return;
+      }
+    }
+
     const idx = store.prescriptions.findIndex((p) => p.prescription_id === req.params.id);
     if (idx < 0) {
       res.status(404).json({ status: 'error', message: 'Prescription not found.' });
@@ -3757,16 +4130,108 @@ async function startServer() {
       });
       return;
     }
-    store.prescriptions[idx] = {
+    if (req.body?.patient_id && Number(req.body.patient_id) !== current.patient_id) {
+      res.status(403).json({
+        status: 'error',
+        message: 'Prescription does not belong to the specified patient.',
+      });
+      return;
+    }
+
+    if (current.appointment_ref) {
+      try {
+        const [rawAppts, rawSlots, templates, doctors] = await Promise.all([
+          fetchOrdsItems<Appointment>('appointments'),
+          fetchOrdsItems<Slot>('slots'),
+          fetchOrdsItems<SlotTemplate>('slot_templates'),
+          fetchOrdsItems<Doctor>('doctors'),
+        ]);
+        const shiftStore = readShiftStore();
+        const joinedSlots = enrichSlots(
+          attachDoctorIdsToSlots(rawSlots, templates, shiftStore),
+          templates,
+          doctors,
+          [],
+        );
+        const enrichedAppts = enrichAppointments(rawAppts, joinedSlots, doctors);
+        const linked = enrichedAppts.find((a) => a.appointment_ref === current.appointment_ref);
+        if (linked && linked.patient_id !== current.patient_id) {
+          res.status(403).json({
+            status: 'error',
+            message: 'Prescription patient mismatch with associated appointment.',
+          });
+          return;
+        }
+        if (
+          linked &&
+          linked.slot_date &&
+          linked.start_time &&
+          !isAppointmentTimeReached(linked.slot_date, linked.start_time, new Date(), HOSPITAL_TIMEZONE)
+        ) {
+          res.status(400).json({
+            status: 'error',
+            message: 'Prescription can only be issued after the scheduled appointment time.',
+          });
+          return;
+        }
+      } catch {
+        // Proceed if ORDS appointment lookup transiently unavailable during update of existing prescription
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    const updatedRx = {
       ...current,
       diagnosis: String(req.body?.diagnosis ?? current.diagnosis).trim(),
       instructions: String(req.body?.instructions ?? current.instructions).trim(),
-      status: req.body?.status === 'COMPLETED' ? 'COMPLETED' : current.status,
+      status: req.body?.status === 'COMPLETED' ? ('COMPLETED' as const) : current.status,
       ...(Array.isArray(req.body?.medications) ? { medications: req.body.medications } : {}),
-      updated_at: new Date().toISOString(),
+      updated_at: nowIso,
     };
+    store.prescriptions[idx] = updatedRx;
+    if (idempotencyKey) {
+      store.prescription_idempotency[`PUT:${idempotencyKey}`] = updatedRx.prescription_id;
+    }
+    // Step 1: Persist updated prescription BEFORE creating notification
     writeClinicalStore(store);
-    res.json({ status: 'success', prescription: store.prescriptions[idx] });
+
+    // Step 2: Emit patient-only notification after prescription update succeeds
+    const updateNonce = idempotencyKey || `${nowIso}`;
+    const notifId = `rx-notif-update-${updatedRx.prescription_id}-${updateNonce}`;
+    const alreadyHasNotif =
+      (idempotencyKey &&
+        store.patient_notifications.some((n) => n.idempotency_key === `PUT:${idempotencyKey}`)) ||
+      store.patient_notifications.some((n) => n.id === notifId);
+    if (!alreadyHasNotif) {
+      const notifRecord: PatientNotificationRecord = {
+        id: notifId,
+        patient_id: updatedRx.patient_id,
+        prescription_id: updatedRx.prescription_id,
+        event_type: 'UPDATED',
+        title: 'Prescription Updated',
+        message: `${updatedRx.doctor_name} updated your prescription${updatedRx.appointment_ref ? ` for appointment ${updatedRx.appointment_ref}` : ''}. Please check your prescription in the Prescriptions section.`,
+        doctor_name: updatedRx.doctor_name,
+        appointment_ref: updatedRx.appointment_ref ?? null,
+        created_at: nowIso,
+        ...(idempotencyKey ? { idempotency_key: `PUT:${idempotencyKey}` } : {}),
+      };
+      store.patient_notifications.unshift(notifRecord);
+      writeClinicalStore(store);
+    }
+
+    recordRbacAuditLog({
+      actor_user_id: user.user_id,
+      actor_name: user.full_name,
+      actor_role: user.role,
+      target_label: `${updatedRx.patient_name} (${updatedRx.prescription_id})`,
+      action: 'PRESCRIPTION_UPDATED',
+      category: 'CLINICAL',
+      new_value: updatedRx.diagnosis,
+      details: `Updated prescription ${updatedRx.prescription_id}.`,
+      severity: 'info',
+    });
+
+    res.json({ status: 'success', prescription: updatedRx });
   });
 
   app.delete('/api/clinical/prescriptions/:id', requireAuth, (req, res) => {
@@ -3921,14 +4386,34 @@ async function startServer() {
           });
           return;
         }
-        if (user.role === 'DOCTOR' && subPath === 'slots' && method === 'POST') {
-          const tid = Number(req.body?.template_id);
-          const allTmpls = await fetchOrdsItems<SlotTemplate>('slot_templates');
-          const target = allTmpls.find((t) => t.template_id === tid);
-          if (!target || target.doctor_id !== user.doctor_id) {
-            res.status(403).json({
+        if (subPath === 'slots' && method === 'POST') {
+          if (user.role === 'DOCTOR') {
+            const tid = Number(req.body?.template_id);
+            const allTmpls = await fetchOrdsItems<SlotTemplate>('slot_templates');
+            const target = allTmpls.find((t) => t.template_id === tid);
+            if (!target || target.doctor_id !== user.doctor_id) {
+              res.status(403).json({
+                status: 'error',
+                message: 'Doctors can only create slots under their own schedule',
+              });
+              return;
+            }
+          }
+          const slotDate = String(req.body?.slot_date || '').slice(0, 10);
+          const startTime = String(req.body?.start_time || '').trim();
+          const endTime = String(req.body?.end_time || '').trim();
+          if (startTime && endTime && !isValidSlotTimeRange(startTime, endTime)) {
+            res.status(400).json({
               status: 'error',
-              message: 'Doctors can only create slots under their own schedule',
+              message: `Invalid slot time range ${startTime}–${endTime}`,
+            });
+            return;
+          }
+          if (isSlotStartExpired(slotDate, startTime, new Date(), HOSPITAL_TIMEZONE)) {
+            const nowParts = getHospitalNowParts(new Date(), HOSPITAL_TIMEZONE);
+            res.status(400).json({
+              status: 'error',
+              message: `Cannot generate expired slot starting at ${startTime} on ${slotDate} (current time: ${nowParts.timeHHMM} ${HOSPITAL_TIMEZONE}).`,
             });
             return;
           }
@@ -4071,14 +4556,127 @@ async function startServer() {
       outgoingBody = cleanDoctorBody;
     }
 
-    if (subPath === 'appointments/' && method === 'POST') {
-      if (user.role === 'PATIENT') {
-        outgoingBody = {
-          ...outgoingBody,
-          patient_id: user.patient_id,
-          booking_source: 'ONLINE',
-        };
+    let pendingBookingInfo: {
+      patient_id: number;
+      slot_id: number;
+      consultation_mode: ConsultationMode;
+      rescheduled_from_id: number | null;
+    } | null = null;
+
+    if ((subPath === 'appointments/' || subPath === 'appointments') && method === 'POST') {
+      const targetPatientId =
+        user.role === 'PATIENT' ? Number(user.patient_id) : Number(outgoingBody?.patient_id);
+      const targetSlotId = Number(outgoingBody?.slot_id);
+      const consultationMode = normalizeConsultationModeInput(outgoingBody?.consultation_mode);
+      const rescheduledFromId = outgoingBody?.rescheduled_from_id
+        ? Number(outgoingBody.rescheduled_from_id)
+        : null;
+
+      if (!consultationMode) {
+        res.status(400).json({
+          status: 'error',
+          message: 'Consultation mode is required (ONLINE or FACE_TO_FACE).',
+        });
+        return;
       }
+
+      if (!targetPatientId || !targetSlotId) {
+        res.status(400).json({
+          status: 'error',
+          message: 'Patient and slot selection are required.',
+        });
+        return;
+      }
+
+      const [slotsList, templatesList, existingAppts] = await Promise.all([
+        fetchOrdsItems<Slot>('slots'),
+        fetchOrdsItems<SlotTemplate>('slot_templates'),
+        fetchOrdsItems<Appointment>('appointments'),
+      ]);
+      const shiftStore = readShiftStore();
+      const slotsWithDoc = attachDoctorIdsToSlots(slotsList, templatesList, shiftStore);
+      const targetSlot = slotsWithDoc.find((s) => s.slot_id === targetSlotId);
+
+      if (!targetSlot) {
+        res.status(404).json({
+          status: 'error',
+          code: 'SLOT_UNAVAILABLE',
+          message: 'Selected slot is no longer available. Available slots have been refreshed.',
+        });
+        return;
+      }
+
+      if (
+        targetSlot.status !== 'AVAILABLE' ||
+        Number(targetSlot.booked_patients || 0) >= Number(targetSlot.max_patients_per_slot || 1)
+      ) {
+        res.status(409).json({
+          status: 'error',
+          code: 'SLOT_UNAVAILABLE',
+          message: 'Selected slot has already been booked or closed. Available slots have been refreshed.',
+        });
+        return;
+      }
+
+      if (isSlotStartExpired(targetSlot.slot_date, targetSlot.start_time, new Date(), HOSPITAL_TIMEZONE)) {
+        res.status(400).json({
+          status: 'error',
+          code: 'SLOT_EXPIRED',
+          message: 'Selected slot time has already passed. Available slots have been refreshed.',
+        });
+        return;
+      }
+
+      const duplicateSameSlot = existingAppts.some(
+        (a) =>
+          a.patient_id === targetPatientId &&
+          a.slot_id === targetSlotId &&
+          a.status !== 'CANCELLED',
+      );
+      if (duplicateSameSlot) {
+        res.status(409).json({
+          status: 'error',
+          code: 'DUPLICATE_BOOKING',
+          message: 'You already have an appointment booked for this slot.',
+        });
+        return;
+      }
+
+      const slotById = new Map<number, Slot>(slotsWithDoc.map((s) => [s.slot_id, s]));
+      const targetSlotDate = getIsoDatePart(targetSlot.slot_date);
+      const duplicateSameTime = existingAppts.some((a) => {
+        if (a.patient_id !== targetPatientId) return false;
+        if (!['HELD', 'CONFIRMED'].includes(a.status)) return false;
+        const bookedSlot = slotById.get(a.slot_id);
+        return (
+          bookedSlot &&
+          getIsoDatePart(bookedSlot.slot_date) === targetSlotDate &&
+          bookedSlot.start_time === targetSlot.start_time
+        );
+      });
+      if (duplicateSameTime) {
+        res.status(409).json({
+          status: 'error',
+          code: 'DUPLICATE_BOOKING',
+          message: 'You already have another active appointment scheduled at this date and time.',
+        });
+        return;
+      }
+
+      pendingBookingInfo = {
+        patient_id: targetPatientId,
+        slot_id: targetSlotId,
+        consultation_mode: consultationMode,
+        rescheduled_from_id: rescheduledFromId,
+      };
+
+      outgoingBody = {
+        ...outgoingBody,
+        patient_id: targetPatientId,
+        slot_id: targetSlotId,
+        booking_source: user.role === 'PATIENT' ? 'ONLINE' : outgoingBody.booking_source || 'WALK_IN',
+        consultation_mode: consultationMode,
+      };
     }
 
     if (/^appointments\/\d+\/(confirm|cancel)$/.test(subPath) && method === 'POST') {
@@ -4120,6 +4718,49 @@ async function startServer() {
       });
       const text = await upstream.text();
       const contentType = upstream.headers.get('content-type') || 'application/json';
+
+      if (upstream.ok && pendingBookingInfo) {
+        try {
+          const parsedBody = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+          if (parsedBody?.status !== 'error') {
+            const latestAppts = await fetchOrdsItems<Appointment>('appointments').catch(
+              () => [] as Appointment[],
+            );
+            const refFromRes =
+              typeof parsedBody?.appointment_ref === 'string' ? parsedBody.appointment_ref : null;
+            const matchedCreated =
+              (refFromRes
+                ? latestAppts.find((a) => a.appointment_ref === refFromRes)
+                : undefined) ||
+              latestAppts
+                .filter(
+                  (a) =>
+                    a.patient_id === pendingBookingInfo!.patient_id &&
+                    a.slot_id === pendingBookingInfo!.slot_id &&
+                    a.status !== 'CANCELLED',
+                )
+                .sort((a, b) => b.appointment_id - a.appointment_id)[0];
+
+            saveAppointmentMetadata({
+              consultation_mode: pendingBookingInfo.consultation_mode,
+              rescheduled_from_id: pendingBookingInfo.rescheduled_from_id,
+              appointment_ref: refFromRes || matchedCreated?.appointment_ref || null,
+              appointment_id: matchedCreated?.appointment_id ?? null,
+              patient_id: pendingBookingInfo.patient_id,
+              slot_id: pendingBookingInfo.slot_id,
+              updated_at: new Date().toISOString(),
+            });
+
+            res.status(upstream.status).json({
+              ...parsedBody,
+              consultation_mode: pendingBookingInfo.consultation_mode,
+            });
+            return;
+          }
+        } catch {
+          // Fall through to raw ORDS response if parsing fails
+        }
+      }
 
       // Persist patient city & locality and auto-provision GIRISH_USERS portal login
       if (upstream.ok && /^patients\/\d+$/.test(subPath) && method === 'PUT' && pendingPatientRegion) {
@@ -4261,22 +4902,26 @@ async function startServer() {
               }
             } else if (subPath.startsWith('patients')) {
               parsed.items = attachRegionsToPatients(parsed.items as Patient[]);
-            } else if (subPath === 'appointments' && user.role === 'PATIENT') {
-              parsed.items = parsed.items.filter(
-                (a) => (a as Appointment).patient_id === user.patient_id,
-              );
-            } else if (subPath === 'appointments' && user.role === 'DOCTOR') {
-              const [slots, templates] = await Promise.all([
-                fetchOrdsItems<Slot>('slots'),
-                fetchOrdsItems<SlotTemplate>('slot_templates'),
-              ]);
-              const tmplDoctorMap = buildTemplateDoctorMap(templates);
-              const docSlotIds = new Set(
-                slots
-                  .filter((s) => (s.doctor_id ?? tmplDoctorMap.get(s.template_id)) === user.doctor_id)
-                  .map((s) => s.slot_id),
-              );
-              parsed.items = parsed.items.filter((a) => docSlotIds.has((a as Appointment).slot_id));
+            } else if (subPath === 'appointments' || subPath === 'appointments/') {
+              let appts = attachConsultationMode(parsed.items as Appointment[]);
+              if (user.role === 'PATIENT') {
+                appts = appts.filter((a) => a.patient_id === user.patient_id);
+              } else if (user.role === 'DOCTOR') {
+                const [slots, templates] = await Promise.all([
+                  fetchOrdsItems<Slot>('slots'),
+                  fetchOrdsItems<SlotTemplate>('slot_templates'),
+                ]);
+                const tmplDoctorMap = buildTemplateDoctorMap(templates);
+                const docSlotIds = new Set(
+                  slots
+                    .filter(
+                      (s) => (s.doctor_id ?? tmplDoctorMap.get(s.template_id)) === user.doctor_id,
+                    )
+                    .map((s) => s.slot_id),
+                );
+                appts = appts.filter((a) => docSlotIds.has(a.slot_id));
+              }
+              parsed.items = appts;
             } else if (subPath === 'payments' && user.role === 'PATIENT') {
               const appts = await fetchOrdsItems<Appointment>('appointments');
               const myApptIds = new Set(

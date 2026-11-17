@@ -3,7 +3,7 @@ import type { DashboardSummaryResponse, RouteKey } from '../../types/opd';
 import { useAuth } from '../../context/AuthContext';
 import { canAccessRoute, hasModulePermission } from '../../utils/permissions';
 import { formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
-import { StatusIndicator } from '../../components/layout/StatusIndicator';
+import { ConsultationModeBadge, StatusIndicator } from '../../components/layout/StatusIndicator';
 
 interface ReceptionistDashboardProps {
   data: DashboardSummaryResponse;
@@ -89,7 +89,9 @@ export function ReceptionistDashboard({
             {metrics.total_appointments}
           </p>
           <p className="mt-1 text-xs text-slate-500 tabular-nums">
-            {metrics.held_appointments} held · {metrics.confirmed_appointments} confirmed
+            {metrics.held_appointments} held · {metrics.confirmed_appointments} confirmed ·{' '}
+            {metrics.online_consultations ?? 0} online · {metrics.face_to_face_consultations ?? 0}{' '}
+            face-to-face
           </p>
         </div>
 
@@ -194,16 +196,19 @@ export function ReceptionistDashboard({
           ) : (
             <div className="divide-y divide-slate-100">
               {data.recent_appointments.slice(0, 6).map((appt) => (
-                <div key={appt.appointment_id} className="px-5 py-3">
+                <div key={appt.appointment_id} className="px-5 py-3 space-y-1.5">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-sm font-medium text-slate-900 truncate">
                       {appt.patient_name}
                     </span>
                     <StatusIndicator status={appt.status} />
                   </div>
-                  <p className="mt-1 font-mono text-xs text-slate-500 tabular-nums">
-                    {appt.appointment_ref} · {appt.doctor_name || `Slot #${appt.slot_id}`}
-                  </p>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="font-mono text-xs text-slate-500 tabular-nums">
+                      {appt.appointment_ref} · {appt.doctor_name || `Slot #${appt.slot_id}`}
+                    </p>
+                    <ConsultationModeBadge mode={appt.consultation_mode} />
+                  </div>
                 </div>
               ))}
             </div>

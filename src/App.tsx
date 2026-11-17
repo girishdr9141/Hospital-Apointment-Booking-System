@@ -116,7 +116,13 @@ function PortalContent() {
   }, []);
 
   const loadNotifications = useCallback(async () => {
-    if (!user || (user.role !== 'SUPER_ADMIN' && user.role !== 'ADMIN' && user.role !== 'DOCTOR')) {
+    if (
+      !user ||
+      (user.role !== 'SUPER_ADMIN' &&
+        user.role !== 'ADMIN' &&
+        user.role !== 'DOCTOR' &&
+        user.role !== 'PATIENT')
+    ) {
       setNotifications([]);
       return;
     }
@@ -306,6 +312,19 @@ function PortalContent() {
     }
   };
 
+  const handleMarkNotificationRead = async (ids: string[]) => {
+    if (ids.length === 0) return;
+    try {
+      const res = await apiClient.dismissNotifications({ ids });
+      setNotifications(res.notifications);
+    } catch {
+      const idSet = new Set(ids);
+      setNotifications((prev) =>
+        prev.map((item) => (idSet.has(item.id) ? { ...item, read: true } : item)),
+      );
+    }
+  };
+
   const handleDismissAllNotifications = async () => {
     setNotifPopupDismissedForUser(user.user_id);
     try {
@@ -389,6 +408,9 @@ function PortalContent() {
             onRefresh={loadDashboard}
             refreshing={dashLoading}
             onNavigate={navigate}
+            notifications={notifications}
+            onMarkNotificationRead={handleMarkNotificationRead}
+            onMarkAllNotificationsRead={handleDismissAllNotifications}
           />
         );
       case 'RECEPTIONIST':
@@ -490,6 +512,7 @@ function PortalContent() {
       onLogout={handleLogout}
       notifications={notifications}
       onNotificationClick={handleNotificationClick}
+      onMarkNotificationRead={handleMarkNotificationRead}
       onDismissAllNotifications={handleDismissAllNotifications}
     >
       {/* Persistent non-ignorable bar across all Doctor pages until today's slots exist */}

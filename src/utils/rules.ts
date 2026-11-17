@@ -109,6 +109,8 @@ export function enrichAppointments(
     const doc = slot?.doctor_id ? doctorById.get(slot.doctor_id) : undefined;
     return {
       ...appt,
+      consultation_mode: appt.consultation_mode === 'ONLINE' ? 'ONLINE' : 'FACE_TO_FACE',
+      rescheduled_from_id: appt.rescheduled_from_id ?? null,
       slot_date: slot?.slot_date ?? appt.slot_date ?? null,
       start_time: slot?.start_time ?? appt.start_time ?? null,
       end_time: slot?.end_time ?? appt.end_time ?? null,

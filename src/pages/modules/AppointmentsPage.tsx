@@ -17,7 +17,7 @@ import {
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
 import { ConfirmDialog } from '../../components/layout/ConfirmDialog';
-import { StatusIndicator } from '../../components/layout/StatusIndicator';
+import { StatusIndicator, ConsultationModeBadge } from '../../components/layout/StatusIndicator';
 import { PatientBookingCalendar } from '../../components/calendar/PatientBookingCalendar';
 
 interface AppointmentsPageProps {
@@ -41,6 +41,7 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
 
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
+  const [modeFilter, setModeFilter] = useState<'ALL' | 'ONLINE' | 'FACE_TO_FACE'>('ALL');
   const [doctorFilter, setDoctorFilter] = useState('ALL');
   const [dateFilter, setDateFilter] = useState('');
 
@@ -155,6 +156,9 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
         return false;
       }
       if (statusFilter !== 'ALL' && a.status !== statusFilter) return false;
+      if (modeFilter !== 'ALL' && (a.consultation_mode || 'FACE_TO_FACE') !== modeFilter) {
+        return false;
+      }
       if (doctorFilter !== 'ALL' && String(a.doctor_id || '') !== doctorFilter) return false;
       if (dateFilter && getIsoDatePart(a.slot_date || a.created_on) !== dateFilter) return false;
       if (!q) return true;
@@ -164,7 +168,7 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
         (a.doctor_name || '').toLowerCase().includes(q)
       );
     });
-  }, [appointments, mode, statusFilter, doctorFilter, dateFilter, search]);
+  }, [appointments, mode, statusFilter, modeFilter, doctorFilter, dateFilter, search]);
 
   const canBook = hasModulePermission(user, 'APPOINTMENTS', 'CREATE') && user?.role !== 'DOCTOR';
   const canConfirm = hasModulePermission(user, 'APPOINTMENTS', 'UPDATE') && user?.role !== 'DOCTOR';
@@ -223,6 +227,11 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
             : formatDisplayDate(row.created_on)}
         </span>
       ),
+    },
+    {
+      key: 'mode',
+      header: 'Mode',
+      render: (row) => <ConsultationModeBadge mode={row.consultation_mode} />,
     },
     {
       key: 'status',
@@ -309,6 +318,7 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
             patients={patients}
             isPatientRole={user?.role === 'PATIENT'}
             fixedPatientId={user?.patient_id}
+            onRefreshSlots={loadData}
             onBooked={async () => {
               await loadData();
               onModeHandled?.();
@@ -342,7 +352,16 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
               type="button"
               onClick={() => {
                 const csv = buildCsvString(
-                  ['Reference', 'Patient', 'Doctor', 'Department', 'Date', 'Start Time', 'Status'],
+                  [
+                    'Reference',
+                    'Patient',
+                    'Doctor',
+                    'Department',
+                    'Date',
+                    'Start Time',
+                    'Consultation Mode',
+                    'Status',
+                  ],
                   filteredAppointments.map((a) => [
                     a.appointment_ref,
                     a.patient_name,
@@ -350,6 +369,7 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
                     a.department_name || 'OPD',
                     a.slot_date || a.created_on,
                     a.start_time || '',
+                    a.consultation_mode || 'FACE_TO_FACE',
                     a.status,
                   ]),
                 );
@@ -419,6 +439,18 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
               </select>
             )}
             <select
+              aria-label="Filter by consultation mode"
+              value={modeFilter}
+              onChange={(e) =>
+                setModeFilter(e.target.value as 'ALL' | 'ONLINE' | 'FACE_TO_FACE')
+              }
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 focus:border-teal-700 focus:outline-none"
+            >
+              <option value="ALL">All Modes</option>
+              <option value="ONLINE">Online Consultation</option>
+              <option value="FACE_TO_FACE">Face-to-Face</option>
+            </select>
+            <select
               aria-label="Filter by appointment status"
               value={statusFilter}
               onChange={(e) => setStatusFilter(e.target.value)}
@@ -456,6 +488,7 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
           patients={patients}
           isPatientRole={user?.role === 'PATIENT'}
           fixedPatientId={user?.patient_id}
+          onRefreshSlots={loadData}
           onBooked={async () => {
             setBookOpen(false);
             await loadData();

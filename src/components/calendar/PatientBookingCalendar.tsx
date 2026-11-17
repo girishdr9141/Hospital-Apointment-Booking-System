@@ -1,17 +1,23 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  AlertCircle,
   Calendar as CalendarIcon,
   CalendarCheck,
   ChevronLeft,
   ChevronRight,
   Clock,
   Stethoscope,
+  UserCheck,
   Video,
 } from 'lucide-react';
-import type { Department, Doctor, Patient, Slot } from '../../types/opd';
+import type { ConsultationMode, Department, Doctor, Patient, Slot } from '../../types/opd';
 import { apiClient } from '../../services/apiClient';
 import { useToast } from '../../context/ToastContext';
-import { getMonthGridDates, getTodayIsoLocal } from '../../utils/calendar';
+import {
+  getHospitalNowParts,
+  getMonthGridDates,
+  isSlotStartExpired,
+} from '../../utils/calendar';
 import { formatCurrencyInr, formatDisplayDate, getIsoDatePart } from '../../utils/rules';
 
 interface PatientBookingCalendarProps {
@@ -22,6 +28,7 @@ interface PatientBookingCalendarProps {
   isPatientRole: boolean;
   fixedPatientId?: number | null;
   onBooked: () => Promise<void> | void;
+  onRefreshSlots?: () => Promise<void> | void;
   onCancel?: () => void;
 }
 
@@ -50,19 +57,22 @@ export function PatientBookingCalendar({
   isPatientRole,
   fixedPatientId,
   onBooked,
+  onRefreshSlots,
   onCancel,
 }: PatientBookingCalendarProps) {
   const { notify } = useToast();
-  const todayIso = getTodayIsoLocal();
-  const now = new Date();
+  const initialNow = getHospitalNowParts();
+  const todayIso = initialNow.isoDate;
 
-  const [viewYear, setViewYear] = useState(now.getFullYear());
-  const [viewMonth, setViewMonth] = useState(now.getMonth());
+  const [viewYear, setViewYear] = useState(initialNow.year);
+  const [viewMonth, setViewMonth] = useState(initialNow.monthIndex);
   const [selectedDate, setSelectedDate] = useState(todayIso);
 
   const [selectedDeptId, setSelectedDeptId] = useState('ALL');
   const [selectedDoctorId, setSelectedDoctorId] = useState('ALL');
   const [selectedSlot, setSelectedSlot] = useState<Slot | null>(null);
+  const [consultationMode, setConsultationMode] = useState<ConsultationMode | ''>('');
+  const [bookingError, setBookingError] = useState<string | null>(null);
   const [selectedPatientId, setSelectedPatientId] = useState(
     patients[0] ? String(patients[0].patient_id) : '',
   );
@@ -94,6 +104,7 @@ export function PatientBookingCalendar({
         if (s.status !== 'AVAILABLE' || s.booked_patients >= s.max_patients_per_slot) return false;
         const dStr = getIsoDatePart(s.slot_date);
         if (!dStr || dStr < todayIso) return false;
+        if (isSlotStartExpired(dStr, s.start_time)) return false;
         if (selectedDoctorId !== 'ALL') {
           return String(s.doctor_id || '') === selectedDoctorId;
         }
@@ -154,6 +165,24 @@ export function PatientBookingCalendar({
 
   const handleConfirmBooking = async () => {
     if (!selectedSlot) return;
+    setBookingError(null);
+
+    if (isSlotStartExpired(selectedSlot.slot_date, selectedSlot.start_time)) {
+      const msg = 'Selected slot time has already passed. Available slots have been refreshed.';
+      setBookingError(msg);
+      notify(msg, 'error');
+      setSelectedSlot(null);
+      await onRefreshSlots?.();
+      return;
+    }
+
+    if (!consultationMode) {
+      const msg = 'Please select a mandatory Consultation Mode (Online Consultation or Face-to-Face Consultation).';
+      setBookingError(msg);
+      notify(msg, 'error');
+      return;
+    }
+
     const patientIdToUse = isPatientRole ? fixedPatientId : Number(selectedPatientId);
     if (!patientIdToUse) {
       notify('Please select a patient record before booking', 'error');
@@ -166,15 +195,22 @@ export function PatientBookingCalendar({
         patient_id: patientIdToUse,
         slot_id: selectedSlot.slot_id,
         booking_source: isPatientRole ? 'ONLINE' : bookingSource,
+        consultation_mode: consultationMode,
       });
       notify(
-        `Appointment booked successfully (${res.appointment_ref || 'Ref generated'})`,
+        `Appointment booked successfully (${res.appointment_ref || 'Ref generated'}) · ${consultationMode === 'ONLINE' ? 'Online Consultation' : 'Face-to-Face'}`,
         'success',
       );
       setSelectedSlot(null);
+      setConsultationMode('');
+      setBookingError(null);
       await onBooked();
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'Unable to book appointment', 'error');
+      const msg = err instanceof Error ? err.message : 'Unable to book appointment';
+      setBookingError(msg);
+      notify(msg, 'error');
+      setSelectedSlot(null);
+      await onRefreshSlots?.();
     } finally {
       setBookingBusy(false);
     }
@@ -282,10 +318,12 @@ export function PatientBookingCalendar({
             <button
               type="button"
               onClick={() => {
-                setViewYear(now.getFullYear());
-                setViewMonth(now.getMonth());
-                setSelectedDate(todayIso);
+                const cur = getHospitalNowParts();
+                setViewYear(cur.year);
+                setViewMonth(cur.monthIndex);
+                setSelectedDate(cur.isoDate);
                 setSelectedSlot(null);
+                setBookingError(null);
               }}
               className="rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100"
             >
@@ -405,7 +443,10 @@ export function PatientBookingCalendar({
                     <button
                       key={slot.slot_id}
                       type="button"
-                      onClick={() => setSelectedSlot(slot)}
+                      onClick={() => {
+                        setSelectedSlot(slot);
+                        setBookingError(null);
+                      }}
                       className={`flex flex-col items-start rounded-xl border p-3 text-left transition-colors ${
                         isPicked
                           ? 'border-teal-700 bg-teal-50 ring-2 ring-teal-700/20'
@@ -444,44 +485,129 @@ export function PatientBookingCalendar({
             )}
           </div>
 
-          {/* Selected Booking Summary & Submit */}
-          <div className="mt-5 border-t border-slate-200 pt-4">
+          {/* Selected Booking Summary, Mandatory Consultation Mode & Submit */}
+          <div className="mt-5 space-y-3 border-t border-slate-200 pt-4">
+            {bookingError && (
+              <div
+                role="alert"
+                className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs text-red-800"
+              >
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-600" aria-hidden="true" />
+                <span>{bookingError}</span>
+              </div>
+            )}
+
             {selectedSlot ? (
-              <div className="flex flex-col gap-3 rounded-xl border border-teal-200 bg-teal-50/70 p-4 sm:flex-row sm:items-center sm:justify-between">
-                <div className="text-sm">
-                  <p className="font-semibold text-teal-950">
-                    {selectedSlot.doctor_name} · {formatDisplayDate(selectedSlot.slot_date)} ({selectedSlot.start_time} – {selectedSlot.end_time})
+              <div className="space-y-3 rounded-xl border border-teal-200 bg-teal-50/60 p-4">
+                <div>
+                  <p className="text-xs font-semibold text-slate-900">
+                    Consultation Mode * <span className="font-normal text-slate-600">(Required)</span>
                   </p>
-                  <p className="mt-0.5 text-xs text-teal-800">
-                    {isPatientRole
-                      ? 'Creates an ONLINE appointment with a 10-minute payment hold.'
-                      : `Booking mode: ${bookingSource === 'WALK_IN' ? 'Walk-in (Immediately Confirmed)' : 'Online (10-min Hold)'}`}
-                  </p>
-                </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  {onCancel && (
+                  <div
+                    role="radiogroup"
+                    aria-label="Consultation Mode"
+                    aria-required="true"
+                    className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2"
+                  >
                     <button
                       type="button"
-                      onClick={onCancel}
-                      className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                      role="radio"
+                      aria-checked={consultationMode === 'ONLINE'}
+                      onClick={() => {
+                        setConsultationMode('ONLINE');
+                        setBookingError(null);
+                      }}
+                      className={`flex items-start gap-2.5 rounded-lg border p-2.5 text-left transition-colors ${
+                        consultationMode === 'ONLINE'
+                          ? 'border-sky-600 bg-sky-50 ring-2 ring-sky-600/20'
+                          : 'border-slate-200 bg-white hover:border-sky-400'
+                      }`}
                     >
-                      Cancel
+                      <Video
+                        className={`mt-0.5 h-4 w-4 shrink-0 ${
+                          consultationMode === 'ONLINE' ? 'text-sky-600' : 'text-slate-400'
+                        }`}
+                        aria-hidden="true"
+                      />
+                      <div>
+                        <p className="text-xs font-semibold text-slate-900">Online Consultation</p>
+                        <p className="text-[11px] text-slate-500">
+                          Remote OPD consultation (ONLINE)
+                        </p>
+                      </div>
                     </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={handleConfirmBooking}
-                    disabled={bookingBusy}
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-4 py-2 text-xs font-medium text-white hover:bg-teal-800 disabled:opacity-60"
-                  >
-                    <CalendarCheck className="h-4 w-4" aria-hidden="true" />
-                    <span>{bookingBusy ? 'Booking...' : 'Confirm & Book Appointment'}</span>
-                  </button>
+
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={consultationMode === 'FACE_TO_FACE'}
+                      onClick={() => {
+                        setConsultationMode('FACE_TO_FACE');
+                        setBookingError(null);
+                      }}
+                      className={`flex items-start gap-2.5 rounded-lg border p-2.5 text-left transition-colors ${
+                        consultationMode === 'FACE_TO_FACE'
+                          ? 'border-teal-700 bg-teal-50 ring-2 ring-teal-700/20'
+                          : 'border-slate-200 bg-white hover:border-teal-500'
+                      }`}
+                    >
+                      <UserCheck
+                        className={`mt-0.5 h-4 w-4 shrink-0 ${
+                          consultationMode === 'FACE_TO_FACE' ? 'text-teal-700' : 'text-slate-400'
+                        }`}
+                        aria-hidden="true"
+                      />
+                      <div>
+                        <p className="text-xs font-semibold text-slate-900">
+                          Face-to-Face Consultation
+                        </p>
+                        <p className="text-[11px] text-slate-500">
+                          In-person hospital OPD visit (FACE_TO_FACE)
+                        </p>
+                      </div>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-3 border-t border-teal-200/70 pt-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="text-sm">
+                    <p className="font-semibold text-teal-950">
+                      {selectedSlot.doctor_name} · {formatDisplayDate(selectedSlot.slot_date)} ({selectedSlot.start_time} – {selectedSlot.end_time})
+                    </p>
+                    <p className="mt-0.5 text-xs text-teal-800">
+                      {isPatientRole
+                        ? 'Creates an ONLINE appointment with a 10-minute payment hold.'
+                        : `Booking mode: ${bookingSource === 'WALK_IN' ? 'Walk-in (Immediately Confirmed)' : 'Online (10-min Hold)'}`}
+                      {consultationMode
+                        ? ` · ${consultationMode === 'ONLINE' ? 'Online Consultation' : 'Face-to-Face Consultation'}`
+                        : ' · Select consultation mode above'}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {onCancel && (
+                      <button
+                        type="button"
+                        onClick={onCancel}
+                        className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                      >
+                        Cancel
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleConfirmBooking}
+                      disabled={bookingBusy}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-4 py-2 text-xs font-medium text-white hover:bg-teal-800 disabled:opacity-60"
+                    >
+                      <CalendarCheck className="h-4 w-4" aria-hidden="true" />
+                      <span>{bookingBusy ? 'Booking...' : 'Confirm & Book Appointment'}</span>
+                    </button>
+                  </div>
                 </div>
               </div>
             ) : (
               <div className="flex items-center justify-between text-xs text-slate-500">
-                <span>Click an available time slot above to review and confirm your booking.</span>
+                <span>Click an available time slot above to select consultation mode and confirm your booking.</span>
                 {onCancel && (
                   <button
                     type="button"

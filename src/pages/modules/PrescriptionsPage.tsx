@@ -1,16 +1,22 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Check, Download, Eye, Pencil, Pill, Plus, Trash2 } from 'lucide-react';
-import type { Doctor, Patient, PrescriptionEntry } from '../../types/opd';
+import { AlertCircle, Check, Download, Eye, Pencil, Pill, Plus, Trash2 } from 'lucide-react';
+import type { Appointment, Doctor, Patient, PrescriptionEntry } from '../../types/opd';
 import { apiClient } from '../../services/apiClient';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
 import { buildCsvString, downloadCsvFile } from '../../utils/csv';
 import { hasModulePermission } from '../../utils/permissions';
-import { formatDisplayDate, formatDisplayDateTime } from '../../utils/rules';
+import { getTodayIsoLocal, isAppointmentTimeReached } from '../../utils/calendar';
+import {
+  enrichAppointments,
+  enrichSlots,
+  formatDisplayDate,
+  formatDisplayDateTime,
+} from '../../utils/rules';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
 import { ConfirmDialog } from '../../components/layout/ConfirmDialog';
-import { StatusIndicator } from '../../components/layout/StatusIndicator';
+import { ConsultationModeBadge, StatusIndicator } from '../../components/layout/StatusIndicator';
 
 interface MedicationDraft {
   name: string;
@@ -36,6 +42,7 @@ export function PrescriptionsPage() {
   const canExport = hasModulePermission(user, 'PRESCRIPTIONS', 'EXPORT');
 
   const [prescriptions, setPrescriptions] = useState<PrescriptionEntry[]>([]);
+  const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [patients, setPatients] = useState<Patient[]>([]);
   const [doctors, setDoctors] = useState<Doctor[]>([]);
   const [loading, setLoading] = useState(true);
@@ -46,10 +53,12 @@ export function PrescriptionsPage() {
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<PrescriptionEntry | null>(null);
+  const [selectedAppointmentId, setSelectedAppointmentId] = useState('');
+  const [idempotencyKey, setIdempotencyKey] = useState('');
   const [patientId, setPatientId] = useState('');
   const [doctorId, setDoctorId] = useState('');
   const [appointmentRef, setAppointmentRef] = useState('');
-  const [prescribedDate, setPrescribedDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [prescribedDate, setPrescribedDate] = useState(() => getTodayIsoLocal());
   const [diagnosis, setDiagnosis] = useState('');
   const [medications, setMedications] = useState<MedicationDraft[]>([{ ...EMPTY_MED }]);
   const [instructions, setInstructions] = useState('');
@@ -62,14 +71,20 @@ export function PrescriptionsPage() {
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const [rxRes, patList, docList] = await Promise.all([
+      const [rxRes, patList, docList, rawAppts, rawSlots, templates] = await Promise.all([
         apiClient.getPrescriptions(),
         apiClient.getPatients().catch(() => [] as Patient[]),
         apiClient.getDoctors().catch(() => [] as Doctor[]),
+        apiClient.getAppointments().catch(() => [] as Appointment[]),
+        apiClient.getSlots().catch(() => []),
+        apiClient.getSlotTemplates().catch(() => []),
       ]);
+      const joinedSlots = enrichSlots(rawSlots, templates, docList, []);
+      const joinedAppts = enrichAppointments(rawAppts, joinedSlots, docList);
       setPrescriptions(rxRes.prescriptions || []);
       setPatients(patList);
       setDoctors(docList);
+      setAppointments(joinedAppts);
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Unable to load prescriptions', 'error');
     } finally {
@@ -81,10 +96,47 @@ export function PrescriptionsPage() {
     void loadData();
   }, [loadData]);
 
+  const activeAppointments = useMemo(() => {
+    return appointments
+      .filter((a) => {
+        if (a.status === 'CANCELLED' || a.status === 'NO_SHOW') return false;
+        if (user?.role === 'DOCTOR' && user.doctor_id) {
+          return a.doctor_id === user.doctor_id;
+        }
+        return true;
+      })
+      .sort((a, b) => {
+        const ad = `${a.slot_date || ''} ${a.start_time || ''}`;
+        const bd = `${b.slot_date || ''} ${b.start_time || ''}`;
+        return bd.localeCompare(ad);
+      });
+  }, [appointments, user?.role, user?.doctor_id]);
+
+  const selectedAppointment = useMemo(
+    () =>
+      activeAppointments.find((a) => String(a.appointment_id) === selectedAppointmentId) || null,
+    [activeAppointments, selectedAppointmentId],
+  );
+
+  const isSelectedAppointmentReached = useMemo(() => {
+    if (!selectedAppointment) return false;
+    return isAppointmentTimeReached(selectedAppointment.slot_date, selectedAppointment.start_time);
+  }, [selectedAppointment]);
+
+  const makeNonce = () =>
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `rx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
   const patientOptions = useMemo(() => {
     const map = new Map<number, string>();
     for (const p of patients) {
       map.set(p.patient_id, `${p.first_name} ${p.last_name}`);
+    }
+    for (const a of appointments) {
+      if (!map.has(a.patient_id)) {
+        map.set(a.patient_id, a.patient_name);
+      }
     }
     for (const rx of prescriptions) {
       if (!map.has(rx.patient_id)) {
@@ -92,20 +144,35 @@ export function PrescriptionsPage() {
       }
     }
     return Array.from(map.entries()).map(([id, name]) => ({ id, name }));
-  }, [patients, prescriptions]);
+  }, [patients, appointments, prescriptions]);
 
-  const openCreate = () => {
+  const openCreate = (presetAppt?: Appointment) => {
+    const targetAppt =
+      presetAppt ||
+      activeAppointments.find((a) => isAppointmentTimeReached(a.slot_date, a.start_time)) ||
+      activeAppointments[0] ||
+      null;
+
     setEditing(null);
-    setPatientId(patientOptions[0] ? String(patientOptions[0].id) : '');
-    setDoctorId(
-      user?.doctor_id
-        ? String(user.doctor_id)
-        : doctors[0]
-          ? String(doctors[0].doctor_id)
-          : '',
-    );
-    setAppointmentRef('');
-    setPrescribedDate(new Date().toISOString().slice(0, 10));
+    setIdempotencyKey(makeNonce());
+    if (targetAppt) {
+      setSelectedAppointmentId(String(targetAppt.appointment_id));
+      setPatientId(String(targetAppt.patient_id));
+      setDoctorId(targetAppt.doctor_id ? String(targetAppt.doctor_id) : '');
+      setAppointmentRef(targetAppt.appointment_ref);
+    } else {
+      setSelectedAppointmentId('');
+      setPatientId(patientOptions[0] ? String(patientOptions[0].id) : '');
+      setDoctorId(
+        user?.doctor_id
+          ? String(user.doctor_id)
+          : doctors[0]
+            ? String(doctors[0].doctor_id)
+            : '',
+      );
+      setAppointmentRef('');
+    }
+    setPrescribedDate(getTodayIsoLocal());
     setDiagnosis('');
     setMedications([{ ...EMPTY_MED }]);
     setInstructions('');
@@ -115,6 +182,8 @@ export function PrescriptionsPage() {
 
   const openEdit = (rx: PrescriptionEntry) => {
     setEditing(rx);
+    setIdempotencyKey(makeNonce());
+    setSelectedAppointmentId('');
     setPatientId(String(rx.patient_id));
     setDoctorId(String(rx.doctor_id));
     setAppointmentRef(rx.appointment_ref || '');
@@ -139,9 +208,19 @@ export function PrescriptionsPage() {
       notify('Diagnosis and at least one medication name are required.', 'error');
       return;
     }
-    if (!editing && !patientId) {
-      notify('Please select a patient.', 'error');
-      return;
+    if (!editing) {
+      if (!selectedAppointment) {
+        notify('Please select an appointment before issuing a prescription.', 'error');
+        return;
+      }
+      if (!isSelectedAppointmentReached) {
+        notify('Prescription can only be issued after the scheduled appointment time.', 'error');
+        return;
+      }
+      if (!patientId) {
+        notify('Please select a patient.', 'error');
+        return;
+      }
     }
     setSaving(true);
     try {
@@ -158,6 +237,7 @@ export function PrescriptionsPage() {
           medications: normalizedMeds,
           instructions: instructions.trim(),
           status: rxStatus,
+          idempotency_key: idempotencyKey || makeNonce(),
         });
         notify(`Prescription ${editing.prescription_id} updated`, 'success');
       } else {
@@ -165,18 +245,22 @@ export function PrescriptionsPage() {
         const selectedDoc = doctors.find((d) => String(d.doctor_id) === doctorId);
         await apiClient.createPrescription({
           patient_id: Number(patientId),
-          patient_name: selectedPat?.name,
+          patient_name: selectedAppointment?.patient_name || selectedPat?.name,
           doctor_id: doctorId ? Number(doctorId) : user?.doctor_id ?? undefined,
-          doctor_name: selectedDoc
-            ? `Dr. ${selectedDoc.first_name} ${selectedDoc.last_name}`
-            : user?.role === 'DOCTOR'
-              ? user.full_name
-              : undefined,
-          appointment_ref: appointmentRef.trim() || undefined,
+          doctor_name:
+            selectedAppointment?.doctor_name ||
+            (selectedDoc
+              ? `Dr. ${selectedDoc.first_name} ${selectedDoc.last_name}`
+              : user?.role === 'DOCTOR'
+                ? user.full_name
+                : undefined),
+          appointment_id: selectedAppointment?.appointment_id,
+          appointment_ref: selectedAppointment?.appointment_ref || appointmentRef.trim() || undefined,
           prescribed_date: prescribedDate,
           diagnosis: diagnosis.trim(),
           medications: normalizedMeds,
           instructions: instructions.trim(),
+          idempotency_key: idempotencyKey || makeNonce(),
         });
         notify('Prescription issued', 'success');
       }
@@ -269,6 +353,7 @@ export function PrescriptionsPage() {
           <p className="font-mono text-xs font-semibold text-slate-900">{row.prescription_id}</p>
           <p className="font-mono text-[11px] text-slate-500 tabular-nums">
             {formatDisplayDate(row.prescribed_date)}
+            {row.appointment_ref ? ` · ${row.appointment_ref}` : ''}
           </p>
         </div>
       ),
@@ -381,7 +466,7 @@ export function PrescriptionsPage() {
           {canCreate && (
             <button
               type="button"
-              onClick={openCreate}
+              onClick={() => openCreate()}
               className="inline-flex items-center gap-2 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white hover:bg-teal-800 whitespace-nowrap"
             >
               <Plus className="h-4 w-4" aria-hidden="true" />
@@ -390,6 +475,62 @@ export function PrescriptionsPage() {
           )}
         </div>
       </div>
+
+      {canCreate && activeAppointments.length > 0 && (
+        <section className="rounded-xl border border-slate-200 bg-white p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-100">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900">
+                Appointments &amp; Prescription Eligibility
+              </h3>
+              <p className="text-xs text-slate-500">
+                Prescriptions can only be issued on or after the scheduled appointment date and time.
+              </p>
+            </div>
+          </div>
+          <div className="mt-3 divide-y divide-slate-100">
+            {activeAppointments.slice(0, 6).map((appt) => {
+              const reached = isAppointmentTimeReached(appt.slot_date, appt.start_time);
+              return (
+                <div
+                  key={appt.appointment_id}
+                  className="flex flex-col gap-2 py-2.5 sm:flex-row sm:items-center sm:justify-between"
+                >
+                  <div className="flex flex-wrap items-center gap-2.5 text-xs">
+                    <span className="font-mono font-semibold text-slate-900">
+                      {appt.appointment_ref}
+                    </span>
+                    <span className="font-medium text-slate-800">{appt.patient_name}</span>
+                    <span className="font-mono text-slate-600 tabular-nums">
+                      {appt.slot_date
+                        ? `${formatDisplayDate(appt.slot_date)} ${appt.start_time || ''}`
+                        : formatDisplayDate(appt.created_on)}
+                    </span>
+                    <ConsultationModeBadge mode={appt.consultation_mode} />
+                    <StatusIndicator status={appt.status} />
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    {!reached && (
+                      <span className="text-xs font-medium text-amber-700">
+                        Prescription can only be issued after the scheduled appointment time.
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      disabled={!reached}
+                      onClick={() => openCreate(appt)}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500 whitespace-nowrap"
+                    >
+                      <Pill className="h-3.5 w-3.5" aria-hidden="true" />
+                      <span>Issue Prescription</span>
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       <DataTable
         rows={filtered}
@@ -493,45 +634,99 @@ export function PrescriptionsPage() {
       >
         <form onSubmit={handleSave} className="space-y-4">
           {!editing && (
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div className="space-y-4">
               <div>
-                <label htmlFor="rx-patient" className="block text-sm font-medium text-slate-700">
-                  Patient *
+                <label htmlFor="rx-appointment" className="block text-sm font-medium text-slate-700">
+                  Associated Appointment *
                 </label>
                 <select
-                  id="rx-patient"
-                  value={patientId}
-                  onChange={(e) => setPatientId(e.target.value)}
+                  id="rx-appointment"
+                  value={selectedAppointmentId}
+                  onChange={(e) => {
+                    const nextId = e.target.value;
+                    setSelectedAppointmentId(nextId);
+                    const picked = activeAppointments.find(
+                      (a) => String(a.appointment_id) === nextId,
+                    );
+                    if (picked) {
+                      setPatientId(String(picked.patient_id));
+                      setDoctorId(picked.doctor_id ? String(picked.doctor_id) : '');
+                      setAppointmentRef(picked.appointment_ref);
+                    }
+                  }}
                   className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none"
                 >
-                  <option value="">Select patient</option>
-                  {patientOptions.map((p) => (
-                    <option key={p.id} value={String(p.id)}>
-                      {p.name} (#{p.id})
-                    </option>
-                  ))}
+                  <option value="">Select scheduled appointment</option>
+                  {activeAppointments.map((a) => {
+                    const reached = isAppointmentTimeReached(a.slot_date, a.start_time);
+                    return (
+                      <option key={a.appointment_id} value={String(a.appointment_id)}>
+                        {a.appointment_ref} · {a.patient_name} ·{' '}
+                        {a.slot_date
+                          ? `${formatDisplayDate(a.slot_date)} ${a.start_time || ''}`
+                          : formatDisplayDate(a.created_on)}{' '}
+                        ({a.consultation_mode === 'ONLINE' ? 'Online' : 'Face-to-Face'})
+                        {reached ? ' — Eligible' : ' — Before scheduled time'}
+                      </option>
+                    );
+                  })}
                 </select>
               </div>
-              {user?.role !== 'DOCTOR' && (
+
+              {(!selectedAppointment || !isSelectedAppointmentReached) && (
+                <div
+                  role="alert"
+                  className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-900"
+                >
+                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" aria-hidden="true" />
+                  <span>
+                    Prescription can only be issued after the scheduled appointment time.
+                  </span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <div>
-                  <label htmlFor="rx-doctor" className="block text-sm font-medium text-slate-700">
-                    Prescribing Doctor
+                  <label htmlFor="rx-patient" className="block text-sm font-medium text-slate-700">
+                    Patient *
                   </label>
                   <select
-                    id="rx-doctor"
-                    value={doctorId}
-                    onChange={(e) => setDoctorId(e.target.value)}
-                    className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none"
+                    id="rx-patient"
+                    value={patientId}
+                    disabled={Boolean(selectedAppointment)}
+                    onChange={(e) => setPatientId(e.target.value)}
+                    className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none disabled:bg-slate-50"
                   >
-                    <option value="">Select doctor</option>
-                    {doctors.map((d) => (
-                      <option key={d.doctor_id} value={String(d.doctor_id)}>
-                        Dr. {d.first_name} {d.last_name}
+                    <option value="">Select patient</option>
+                    {patientOptions.map((p) => (
+                      <option key={p.id} value={String(p.id)}>
+                        {p.name} (#{p.id})
                       </option>
                     ))}
                   </select>
                 </div>
-              )}
+                {user?.role !== 'DOCTOR' && (
+                  <div>
+                    <label htmlFor="rx-doctor" className="block text-sm font-medium text-slate-700">
+                      Prescribing Doctor
+                    </label>
+                    <select
+                      id="rx-doctor"
+                      value={doctorId}
+                      disabled={Boolean(selectedAppointment)}
+                      onChange={(e) => setDoctorId(e.target.value)}
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none disabled:bg-slate-50"
+                    >
+                      <option value="">Select doctor</option>
+                      {doctors.map((d) => (
+                        <option key={d.doctor_id} value={String(d.doctor_id)}>
+                          Dr. {d.first_name} {d.last_name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
@@ -586,9 +781,9 @@ export function PrescriptionsPage() {
                   id="rx-appt"
                   type="text"
                   value={appointmentRef}
-                  onChange={(e) => setAppointmentRef(e.target.value)}
+                  readOnly
                   placeholder="APT-..."
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm focus:border-teal-700 focus:outline-none"
+                  className="mt-1.5 w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 font-mono text-sm focus:border-teal-700 focus:outline-none"
                 />
               </div>
             )}
@@ -683,8 +878,8 @@ export function PrescriptionsPage() {
             </button>
             <button
               type="submit"
-              disabled={saving}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white hover:bg-teal-800 disabled:opacity-60"
+              disabled={saving || (!editing && !isSelectedAppointmentReached)}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white hover:bg-teal-800 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Pill className="h-4 w-4" aria-hidden="true" />
               <span>{saving ? 'Saving...' : editing ? 'Update Prescription' : 'Issue Prescription'}</span>
