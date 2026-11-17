@@ -14,7 +14,12 @@ import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
 import { hasModulePermission } from '../../utils/permissions';
 import { enrichAppointments, enrichSlots, formatDisplayDate, getIsoDatePart } from '../../utils/rules';
-import { formatShiftSummary, getTodayIsoLocal } from '../../utils/calendar';
+import {
+  formatShiftSummary,
+  getTodayIsoLocal,
+  isSlotEndExpired,
+  isSlotStartExpired,
+} from '../../utils/calendar';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 import { DoctorSlotCalendar } from '../../components/calendar/DoctorSlotCalendar';
 import { DoctorShiftModal } from '../../components/modals/DoctorShiftModal';
@@ -125,8 +130,14 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
       if (!s.doctor_id || s.status === 'CANCELLED') continue;
       const cur = map.get(s.doctor_id) || { open: 0, booked: 0 };
       if (s.booked_patients > 0 || s.status === 'SOLD_OUT') {
-        cur.booked += 1;
-      } else if (s.status === 'AVAILABLE') {
+        if (!isSlotEndExpired(s.slot_date, s.start_time, s.end_time)) {
+          cur.booked += 1;
+        }
+      } else if (
+        s.status === 'AVAILABLE' &&
+        s.booked_patients < s.max_patients_per_slot &&
+        !isSlotStartExpired(s.slot_date, s.start_time)
+      ) {
         cur.open += 1;
       }
       map.set(s.doctor_id, cur);
@@ -160,7 +171,16 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
   const calendarSlots = useMemo(
     () =>
       slots
-        .filter((s) => s.doctor_id === activeCalendarDoctor?.doctor_id && s.status !== 'CANCELLED')
+        .filter((s) => {
+          if (s.doctor_id !== activeCalendarDoctor?.doctor_id || s.status === 'CANCELLED') {
+            return false;
+          }
+          const isBooked = s.booked_patients > 0 || s.status === 'SOLD_OUT';
+          if (isBooked) {
+            return !isSlotEndExpired(s.slot_date, s.start_time, s.end_time);
+          }
+          return !isSlotStartExpired(s.slot_date, s.start_time);
+        })
         .sort((a, b) => {
           const dCmp = getIsoDatePart(a.slot_date).localeCompare(getIsoDatePart(b.slot_date));
           if (dCmp !== 0) return dCmp;
@@ -172,13 +192,21 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
   const activeDoctorOpenSlots = useMemo(
     () =>
       calendarSlots.filter(
-        (s) => s.status === 'AVAILABLE' && s.booked_patients < s.max_patients_per_slot,
+        (s) =>
+          s.status === 'AVAILABLE' &&
+          s.booked_patients < s.max_patients_per_slot &&
+          !isSlotStartExpired(s.slot_date, s.start_time),
       ),
     [calendarSlots],
   );
 
   const activeDoctorBookedSlots = useMemo(
-    () => calendarSlots.filter((s) => s.booked_patients > 0 || s.status === 'SOLD_OUT'),
+    () =>
+      calendarSlots.filter(
+        (s) =>
+          (s.booked_patients > 0 || s.status === 'SOLD_OUT') &&
+          !isSlotEndExpired(s.slot_date, s.start_time, s.end_time),
+      ),
     [calendarSlots],
   );
 

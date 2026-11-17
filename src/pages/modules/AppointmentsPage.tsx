@@ -15,6 +15,7 @@ import {
   getIsoDatePart,
   isAppointmentHoldExpired,
 } from '../../utils/rules';
+import { getAppointmentsAwaitingOutcome, isSlotEndExpired } from '../../utils/calendar';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
 import { ConfirmDialog } from '../../components/layout/ConfirmDialog';
@@ -24,9 +25,10 @@ import { PatientBookingCalendar } from '../../components/calendar/PatientBooking
 interface AppointmentsPageProps {
   mode?: 'list' | 'book' | 'history';
   onModeHandled?: () => void;
+  onDataChanged?: () => Promise<void> | void;
 }
 
-export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsPageProps) {
+export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }: AppointmentsPageProps) {
   const { user } = useAuth();
   const { notify } = useToast();
 
@@ -132,6 +134,7 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
       }
       setPendingAction(null);
       await loadData();
+      await onDataChanged?.();
     } catch (err) {
       if (isEndpointNotDeployedError(err)) {
         notify('Appointment action endpoint is unavailable in Oracle ORDS.', 'error');
@@ -197,6 +200,13 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
     user?.role !== 'PATIENT' &&
     user?.role !== 'DOCTOR';
   const canExport = hasModulePermission(user, 'APPOINTMENTS', 'EXPORT');
+  const awaitingOutcomeAppts = useMemo(
+    () =>
+      user?.role === 'DOCTOR'
+        ? getAppointmentsAwaitingOutcome(appointments, user.doctor_id)
+        : [],
+    [appointments, user?.role, user?.doctor_id],
+  );
 
   const columns: DataColumn<Appointment>[] = [
     {
@@ -282,22 +292,28 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
             </button>
           )}
           {row.status === 'CONFIRMED' && canUpdateOutcome && (
-            <>
-              <button
-                type="button"
-                onClick={() => setPendingAction({ appointment: row, type: 'COMPLETED' })}
-                className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
-              >
-                Complete
-              </button>
-              <button
-                type="button"
-                onClick={() => setPendingAction({ appointment: row, type: 'NO_SHOW' })}
-                className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
-              >
-                No-Show
-              </button>
-            </>
+            isSlotEndExpired(row.slot_date, row.start_time, row.end_time) ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setPendingAction({ appointment: row, type: 'COMPLETED' })}
+                  className="rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-800 hover:bg-emerald-100"
+                >
+                  Complete
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPendingAction({ appointment: row, type: 'NO_SHOW' })}
+                  className="rounded-md border border-rose-200 bg-rose-50 px-2 py-1 text-xs font-medium text-rose-800 hover:bg-rose-100"
+                >
+                  No-Show
+                </button>
+              </>
+            ) : (
+              <span className="font-mono text-[11px] text-slate-400">
+                Ends {row.end_time || 'later'}
+              </span>
+            )
           )}
         </div>
       ),
@@ -422,6 +438,19 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
           )}
         </div>
       </div>
+
+      {mode === 'list' && user?.role === 'DOCTOR' && awaitingOutcomeAppts.length > 0 && (
+        <div
+          role="alert"
+          className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-950"
+        >
+          <span className="font-semibold">
+            {awaitingOutcomeAppts.length} completed-time appointment
+            {awaitingOutcomeAppts.length === 1 ? '' : 's'} awaiting outcome:
+          </span>{' '}
+          Use the <strong>Complete</strong> or <strong>No-Show</strong> buttons in the table below to finalize analytics records.
+        </div>
+      )}
 
       <DataTable
         rows={filteredAppointments}

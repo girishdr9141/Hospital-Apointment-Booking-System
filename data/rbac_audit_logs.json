@@ -1,5 +1,67 @@
 [
   {
+    "id": "AUD-1794908513488-208",
+    "timestamp": "2026-11-17T09:41:53.488Z",
+    "actor_user_id": 21,
+    "actor_name": "Dr. Priya Sharma",
+    "actor_role": "DOCTOR",
+    "target_label": "ORDS cancellation-rules",
+    "action": "UNAUTHORIZED_ACCESS",
+    "category": "SECURITY",
+    "previous_value": null,
+    "new_value": "DENIED:SYSTEM_SETTINGS:UPDATE",
+    "details": "Blocked DOCTOR (priya@hospital.com) from accessing ORDS cancellation-rules — missing SYSTEM_SETTINGS:UPDATE.",
+    "severity": "warning"
+  },
+  {
+    "id": "AUD-1794908491845-656",
+    "timestamp": "2026-11-17T09:41:31.845Z",
+    "actor_user_id": 21,
+    "actor_name": "Dr. Priya Sharma",
+    "actor_role": "DOCTOR",
+    "target_label": "priya@hospital.com",
+    "action": "LOGIN_SUCCESS",
+    "category": "AUTH",
+    "details": "Signed in via ords portal.",
+    "severity": "info"
+  },
+  {
+    "id": "AUD-1794908465909-149",
+    "timestamp": "2026-11-17T09:41:05.909Z",
+    "actor_user_id": 1,
+    "actor_name": "Girish DR",
+    "actor_role": "ADMIN",
+    "target_label": "girishramachandra12dr@gmail.com",
+    "action": "LOGOUT",
+    "category": "AUTH",
+    "details": "User signed out cleanly.",
+    "severity": "info"
+  },
+  {
+    "id": "AUD-1794908395170-254",
+    "timestamp": "2026-11-17T09:39:55.170Z",
+    "actor_user_id": 1,
+    "actor_name": "Girish DR",
+    "actor_role": "ADMIN",
+    "target_label": "girishramachandra12dr@gmail.com",
+    "action": "LOGIN_SUCCESS",
+    "category": "AUTH",
+    "details": "Signed in via ords portal.",
+    "severity": "info"
+  },
+  {
+    "id": "AUD-1794908300890-195",
+    "timestamp": "2026-11-17T09:38:20.890Z",
+    "actor_user_id": 1,
+    "actor_name": "Girish DR",
+    "actor_role": "ADMIN",
+    "target_label": "girishramachandra12dr@gmail.com",
+    "action": "LOGIN_SUCCESS",
+    "category": "AUTH",
+    "details": "Signed in via ords portal.",
+    "severity": "info"
+  },
+  {
     "id": "AUD-1794905957095-422",
     "timestamp": "2026-11-17T08:59:17.095Z",
     "actor_user_id": 42,

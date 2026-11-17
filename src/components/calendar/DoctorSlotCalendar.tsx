@@ -21,6 +21,7 @@ import {
   getMonthGridDates,
   getWeekdayName,
   isDateCoveredByApprovedLeave,
+  isSlotEndExpired,
   isSlotStartExpired,
   isValidSlotTimeRange,
   mergeDayWorkingSlots,
@@ -102,9 +103,14 @@ export function DoctorSlotCalendar({
       if (s.status === 'CANCELLED') continue;
       const d = getIsoDatePart(s.slot_date);
       if (!d) continue;
+      const isBooked = s.booked_patients > 0 || s.status === 'SOLD_OUT';
+      const isExpired = isBooked
+        ? isSlotEndExpired(d, s.start_time, s.end_time)
+        : isSlotStartExpired(d, s.start_time);
+      if (isExpired) continue;
       const cur = map.get(d) || { total: 0, available: 0, booked: 0 };
       cur.total += 1;
-      if (s.booked_patients > 0 || s.status === 'SOLD_OUT') {
+      if (isBooked) {
         cur.booked += 1;
       } else if (s.status === 'AVAILABLE') {
         cur.available += 1;
@@ -151,11 +157,19 @@ export function DoctorSlotCalendar({
 
   const selectedDayCounts = useMemo(() => {
     return {
-      open: daySlotItems.filter((i) => i.status === 'AVAILABLE').length,
-      booked: daySlotItems.filter((i) => i.status === 'BOOKED').length,
+      open: daySlotItems.filter(
+        (i) =>
+          i.status === 'AVAILABLE' &&
+          !isSlotStartExpired(i.slot_date || selectedDate, i.start_time),
+      ).length,
+      booked: daySlotItems.filter(
+        (i) =>
+          i.status === 'BOOKED' &&
+          !isSlotEndExpired(i.slot_date || selectedDate, i.start_time, i.end_time),
+      ).length,
       unconfirmed: unconfirmedOpenItems.length,
     };
-  }, [daySlotItems, unconfirmedOpenItems.length]);
+  }, [daySlotItems, selectedDate, unconfirmedOpenItems.length]);
 
   const todayStats = slotStatsByDate.get(todayIso) || { total: 0, available: 0, booked: 0 };
 

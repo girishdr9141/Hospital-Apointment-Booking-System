@@ -7,13 +7,17 @@ import {
   Clock,
   ListOrdered,
   RefreshCw,
+  UserX,
 } from 'lucide-react';
-import type { AuthUser, DashboardSummaryResponse, RouteKey } from '../../types/opd';
+import type { Appointment, AuthUser, DashboardSummaryResponse, RouteKey } from '../../types/opd';
+import { apiClient } from '../../services/apiClient';
+import { useToast } from '../../context/ToastContext';
 import { canAccessRoute, hasModulePermission } from '../../utils/permissions';
 import { formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
 import {
   doesDoctorNeedDailySlotsPrompt,
   formatShiftSummary,
+  getAppointmentsAwaitingOutcome,
   getTodayIsoLocal,
 } from '../../utils/calendar';
 import { ConsultationModeBadge, StatusIndicator } from '../../components/layout/StatusIndicator';
@@ -44,7 +48,9 @@ export function DoctorDashboard({
     doctor_leaves = [],
   } = data;
 
+  const { notify } = useToast();
   const [shiftChangeOpen, setShiftChangeOpen] = useState(false);
+  const [submittingOutcomeKey, setSubmittingOutcomeKey] = useState<string | null>(null);
 
   const todayIso = getTodayIsoLocal();
   const doctorId = user.doctor_id ?? doctor_profile?.doctor_id ?? 0;
@@ -58,6 +64,34 @@ export function DoctorDashboard({
     doctorId,
     todayIso,
   );
+  const pendingOutcomeAppointments =
+    data.pending_outcome_appointments ??
+    getAppointmentsAwaitingOutcome(data.recent_appointments, doctorId);
+
+  const handleQuickOutcome = async (
+    appt: Appointment,
+    outcome: 'COMPLETED' | 'NO_SHOW',
+  ) => {
+    const key = `${appt.appointment_id}:${outcome}`;
+    setSubmittingOutcomeKey(key);
+    try {
+      await apiClient.updateAppointmentOutcome(appt.appointment_id, outcome);
+      notify(
+        outcome === 'COMPLETED'
+          ? `Marked ${appt.appointment_ref} (${appt.patient_name}) as Completed`
+          : `Marked ${appt.appointment_ref} (${appt.patient_name}) as No-Show`,
+        'success',
+      );
+      await onRefresh();
+    } catch (err) {
+      notify(
+        err instanceof Error ? err.message : 'Unable to record appointment outcome',
+        'error',
+      );
+    } finally {
+      setSubmittingOutcomeKey(null);
+    }
+  };
 
   const showLeaves = canAccessRoute(user, 'doctor-leaves');
   const showSlots = canAccessRoute(user, 'slots');
@@ -133,6 +167,77 @@ export function DoctorDashboard({
               : `Today's availability confirmed (${data.doctor_slots_today_count ?? metrics.total_slots_today} slot(s) active for ${formatDisplayDate(todayIso)}).`}
           </span>
         </div>
+      )}
+
+      {/* Pending Post-Slot Outcomes Section */}
+      {pendingOutcomeAppointments.length > 0 && (
+        <section className="rounded-xl border border-rose-200 bg-white">
+          <div className="flex flex-col gap-1 border-b border-rose-100 bg-rose-50/70 px-5 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h3 className="text-sm font-semibold text-rose-950">
+                Post-Slot Outcomes Pending Confirmation ({pendingOutcomeAppointments.length})
+              </h3>
+              <p className="text-xs text-rose-800">
+                Slot end time has passed. Explicitly mark each appointment as Completed or No-Show for accurate analytics.
+              </p>
+            </div>
+          </div>
+          <div className="divide-y divide-slate-100">
+            {pendingOutcomeAppointments.map((appt) => {
+              const isBusy = submittingOutcomeKey?.startsWith(`${appt.appointment_id}:`) ?? false;
+              return (
+                <div
+                  key={appt.appointment_id}
+                  className="flex flex-col gap-3 px-5 py-3.5 sm:flex-row sm:items-center sm:justify-between"
+                >
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-semibold text-slate-900">
+                        {appt.patient_name}
+                      </span>
+                      <span className="font-mono text-xs text-slate-500 tabular-nums">
+                        {appt.appointment_ref}
+                      </span>
+                      <ConsultationModeBadge mode={appt.consultation_mode} />
+                    </div>
+                    <p className="mt-0.5 font-mono text-xs text-slate-600 tabular-nums">
+                      {formatDisplayDate(appt.slot_date)} · {appt.start_time || '—'} –{' '}
+                      {appt.end_time || '—'}
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => void handleQuickOutcome(appt, 'COMPLETED')}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-800 disabled:opacity-60"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+                      <span>
+                        {submittingOutcomeKey === `${appt.appointment_id}:COMPLETED`
+                          ? 'Saving...'
+                          : 'Completed'}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => void handleQuickOutcome(appt, 'NO_SHOW')}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-rose-300 bg-rose-50 px-3 py-1.5 text-xs font-medium text-rose-800 hover:bg-rose-100 disabled:opacity-60"
+                    >
+                      <UserX className="h-3.5 w-3.5" aria-hidden="true" />
+                      <span>
+                        {submittingOutcomeKey === `${appt.appointment_id}:NO_SHOW`
+                          ? 'Saving...'
+                          : 'No-Show'}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
       )}
 
       {/* Personal Doctor KPIs */}

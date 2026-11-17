@@ -20,6 +20,7 @@ import type {
   ModuleKey,
   Patient,
   Payment,
+  PendingOutcomeItem,
   PermissionAction,
   PortalNotification,
   RoleName,
@@ -73,8 +74,10 @@ import {
   getHospitalNowParts,
   getTodayIsoLocal,
   getWeekdayName,
+  getAppointmentsAwaitingOutcome,
   isAppointmentTimeReached,
   isDateCoveredByApprovedLeave,
+  isSlotEndExpired,
   isSlotStartExpired,
   isValidSlotTimeRange,
   validateShiftSessions,
@@ -454,6 +457,9 @@ interface AppointmentMetadataEntry {
   appointment_id?: number | null;
   patient_id?: number;
   slot_id?: number;
+  recorded_outcome?: 'COMPLETED' | 'NO_SHOW' | null;
+  outcome_recorded_at?: string | null;
+  outcome_recorded_by?: string | null;
   updated_at: string;
 }
 
@@ -481,6 +487,32 @@ function saveAppointmentMetadata(entry: AppointmentMetadataEntry): void {
   fs.writeFileSync(APPT_METADATA_PATH, JSON.stringify(store, null, 2), 'utf8');
 }
 
+function recordAppointmentOutcomeOverlay(
+  appt: Pick<Appointment, 'appointment_id' | 'appointment_ref' | 'patient_id' | 'slot_id' | 'consultation_mode' | 'rescheduled_from_id'>,
+  outcome: 'COMPLETED' | 'NO_SHOW' | null,
+  actorName: string,
+): void {
+  const store = readAppointmentMetadata();
+  const existing =
+    store[`id:${appt.appointment_id}`] ||
+    (appt.appointment_ref ? store[`ref:${appt.appointment_ref}`] : undefined);
+  saveAppointmentMetadata({
+    consultation_mode:
+      existing?.consultation_mode ||
+      normalizeConsultationModeInput(appt.consultation_mode) ||
+      'FACE_TO_FACE',
+    rescheduled_from_id: existing?.rescheduled_from_id ?? appt.rescheduled_from_id ?? null,
+    appointment_ref: appt.appointment_ref || existing?.appointment_ref || null,
+    appointment_id: appt.appointment_id,
+    patient_id: appt.patient_id ?? existing?.patient_id,
+    slot_id: appt.slot_id ?? existing?.slot_id,
+    recorded_outcome: outcome,
+    outcome_recorded_at: outcome ? new Date().toISOString() : null,
+    outcome_recorded_by: outcome ? actorName : null,
+    updated_at: new Date().toISOString(),
+  });
+}
+
 function normalizeConsultationModeInput(value: unknown): ConsultationMode | null {
   const normalized = String(value || '').trim().toUpperCase();
   if (normalized === 'ONLINE') return 'ONLINE';
@@ -495,8 +527,14 @@ function attachConsultationMode(appointments: Appointment[]): Appointment[] {
     const metaEntry = meta[`id:${a.appointment_id}`] || (a.appointment_ref ? meta[`ref:${a.appointment_ref}`] : undefined);
     const mode: ConsultationMode = directMode || metaEntry?.consultation_mode || 'FACE_TO_FACE';
     const rescheduledFrom = a.rescheduled_from_id ?? metaEntry?.rescheduled_from_id ?? null;
+    const effectiveStatus =
+      a.status === 'CONFIRMED' &&
+      (metaEntry?.recorded_outcome === 'COMPLETED' || metaEntry?.recorded_outcome === 'NO_SHOW')
+        ? metaEntry.recorded_outcome
+        : a.status;
     return {
       ...a,
+      status: effectiveStatus,
       consultation_mode: mode,
       rescheduled_from_id: rescheduledFrom,
     };
@@ -1928,17 +1966,19 @@ async function startServer() {
           ),
         );
         const todaysOrUpcoming = enrichedSlots.filter(
-          (s) => getIsoDatePart(s.slot_date) >= todayIso && s.status === 'AVAILABLE' && s.doctor_name,
+          (s) =>
+            getIsoDatePart(s.slot_date) >= todayIso &&
+            s.status === 'AVAILABLE' &&
+            s.doctor_name &&
+            !isSlotStartExpired(s.slot_date, s.start_time, new Date(), HOSPITAL_TIMEZONE),
         );
         const fallbackUpcoming = enrichedSlots.filter(
-          (s) => getIsoDatePart(s.slot_date) >= todayIso,
+          (s) =>
+            s.status !== 'CANCELLED' &&
+            !isSlotEndExpired(s.slot_date, s.start_time, s.end_time, new Date(), HOSPITAL_TIMEZONE),
         );
         scopedSlots = (
-          todaysOrUpcoming.length > 0
-            ? todaysOrUpcoming
-            : fallbackUpcoming.length > 0
-              ? fallbackUpcoming
-              : enrichedSlots
+          todaysOrUpcoming.length > 0 ? todaysOrUpcoming : fallbackUpcoming
         ).slice(0, 15);
       }
 
@@ -1966,6 +2006,15 @@ async function startServer() {
       }
 
       const consultationCounts = countActiveConsultations(scopedAppointments);
+      const pendingOutcomeAppointments =
+        user.role === 'DOCTOR'
+          ? getAppointmentsAwaitingOutcome(
+              scopedAppointments,
+              user.doctor_id,
+              new Date(),
+              HOSPITAL_TIMEZONE,
+            )
+          : [];
 
       const payload: DashboardSummaryResponse = {
         role: user.role,
@@ -1983,7 +2032,11 @@ async function startServer() {
           cancelled_appointments: scopedAppointments.filter((a) => a.status === 'CANCELLED').length,
           online_consultations: consultationCounts.online,
           face_to_face_consultations: consultationCounts.faceToFace,
-          available_slots_today: referenceSlots.filter((s) => s.status === 'AVAILABLE').length,
+          available_slots_today: referenceSlots.filter(
+            (s) =>
+              s.status === 'AVAILABLE' &&
+              !isSlotStartExpired(s.slot_date, s.start_time, new Date(), HOSPITAL_TIMEZONE),
+          ).length,
           total_slots_today: referenceSlots.length,
           total_payments_amount: scopedPayments
             .filter((p) => p.status === 'SUCCESS')
@@ -2012,6 +2065,7 @@ async function startServer() {
               doctor_leaves: doctorLeaves,
               doctor_slots_today_count: doctorSlotsTodayCount,
               doctor_on_leave_today: doctorOnLeaveToday,
+              pending_outcome_appointments: pendingOutcomeAppointments,
             }
           : {}),
       };
@@ -2100,42 +2154,78 @@ async function startServer() {
       }
 
       const historicalRecords = loadOrSeedHistoricalAnalytics(doctors, allDepartments);
-      const liveRecords: AnalyticsVisitRecord[] = enrichedAppointments.map((a) => {
+      const now = new Date();
+      const pendingOutcomes: PendingOutcomeItem[] = [];
+      const liveRecords: AnalyticsVisitRecord[] = [];
+
+      for (const a of enrichedAppointments) {
         const pat = patientMap.get(a.patient_id);
         const doc = a.doctor_id ? doctorMap.get(a.doctor_id) : undefined;
         const pay = paymentByApptId.get(a.appointment_id);
         const visitDate = getIsoDatePart(a.slot_date || a.created_on) || getServerTodayIso();
+        const deptId = a.department_id ?? doc?.department_id ?? 0;
+        const deptName =
+          a.department_name ||
+          (deptId ? deptNameMap.get(deptId) : undefined) ||
+          'General OPD';
+        const doctorName =
+          a.doctor_name || (doc ? `Dr. ${doc.first_name} ${doc.last_name}` : `Slot #${a.slot_id}`);
+        const patientName =
+          a.patient_name || (pat ? `${pat.first_name} ${pat.last_name}` : `Patient #${a.patient_id}`);
+
+        if (a.status === 'HELD') {
+          // Holds are provisional and not completed consultations
+          continue;
+        }
+
+        if (a.status === 'CONFIRMED') {
+          const slotEnded = a.slot_date
+            ? isSlotEndExpired(a.slot_date, a.start_time, a.end_time, now, HOSPITAL_TIMEZONE)
+            : visitDate < getServerTodayIso();
+          if (slotEnded) {
+            // Past confirmed visit still awaiting explicit doctor COMPLETED / NO_SHOW confirmation
+            pendingOutcomes.push({
+              appointment_id: a.appointment_id,
+              appointment_ref: a.appointment_ref,
+              doctor_id: a.doctor_id || doc?.doctor_id || 0,
+              doctor_name: doctorName,
+              department_name: deptName,
+              patient_name: patientName,
+              slot_date: visitDate,
+              start_time: a.start_time || '',
+              end_time: a.end_time || '',
+            });
+          }
+          // Do not inject unverified or future CONFIRMED bookings into completed/no-show analytics
+          continue;
+        }
+
         const rawMethod = String(pay?.payment_method || '').trim().toUpperCase();
         const paymentMethod: AnalyticsVisitRecord['payment_method'] = pay
           ? rawMethod === 'UPI' || rawMethod === 'CARD' || rawMethod === 'CASH' || rawMethod === 'NETBANKING'
             ? rawMethod
             : 'CASH'
           : 'UNPAID';
-        const deptId = a.department_id ?? doc?.department_id ?? 0;
-        const deptName =
-          a.department_name ||
-          (deptId ? deptNameMap.get(deptId) : undefined) ||
-          'General OPD';
 
         const amount = pay
           ? Number(pay.amount || 0)
-          : a.status === 'COMPLETED' || a.status === 'CONFIRMED'
+          : a.status === 'COMPLETED'
             ? Number(a.consultation_fee || doc?.consultation_fee || 0)
             : 0;
 
-        return {
+        liveRecords.push({
           id: `LIVE-${a.appointment_id}`,
           source: 'LIVE',
           visit_date: visitDate,
           visit_month: visitDate.slice(0, 7),
           start_time: a.start_time || '09:00',
           doctor_id: a.doctor_id || doc?.doctor_id || 0,
-          doctor_name: a.doctor_name || (doc ? `Dr. ${doc.first_name} ${doc.last_name}` : `Slot #${a.slot_id}`),
+          doctor_name: doctorName,
           department_id: deptId,
           department_name: deptName,
           specialization: doc?.specialization || 'General OPD',
           patient_id: a.patient_id,
-          patient_name: a.patient_name || (pat ? `${pat.first_name} ${pat.last_name}` : `Patient #${a.patient_id}`),
+          patient_name: patientName,
           patient_gender: (pat?.gender as AnalyticsVisitRecord['patient_gender']) || 'UNKNOWN',
           patient_age_group: computePatientAgeGroup(pat?.date_of_birth),
           city: normalizeRegionText(pat?.city) || 'Unspecified',
@@ -2146,8 +2236,15 @@ async function startServer() {
           rescheduled_from_id: a.rescheduled_from_id ?? null,
           payment_method: allowedSections.revenue ? paymentMethod : 'UNPAID',
           amount: allowedSections.revenue ? amount : 0,
-        };
-      });
+        });
+      }
+
+      pendingOutcomes.sort(
+        (a, b) =>
+          a.slot_date.localeCompare(b.slot_date) ||
+          a.start_time.localeCompare(b.start_time) ||
+          a.appointment_id - b.appointment_id,
+      );
 
       const sanitizedHistorical = allowedSections.revenue
         ? historicalRecords
@@ -2161,9 +2258,11 @@ async function startServer() {
         status: 'success',
         generated_at: new Date().toISOString(),
         range_start: '2025-11-01',
-        range_end: '2026-11-16',
+        range_end: getServerTodayIso(),
         historical_count: historicalRecords.length,
         live_count: liveRecords.length,
+        pending_outcome_count: pendingOutcomes.length,
+        pending_outcomes: allowedSections.doctor ? pendingOutcomes : [],
         records,
         allowed_sections: allowedSections,
       };
@@ -4792,6 +4891,69 @@ async function startServer() {
       }
     }
 
+    let pendingOutcomeVerification: {
+      appointment: Appointment;
+      outcome: 'COMPLETED' | 'NO_SHOW';
+    } | null = null;
+    if (/^appointments\/\d+\/outcome$/.test(subPath) && method === 'POST') {
+      const apptId = Number(subPath.split('/')[1]);
+      const requestedOutcome = String(outgoingBody?.outcome || '').trim().toUpperCase();
+      if (requestedOutcome !== 'COMPLETED' && requestedOutcome !== 'NO_SHOW') {
+        res.status(400).json({
+          status: 'error',
+          message: 'Outcome must be COMPLETED or NO_SHOW.',
+        });
+        return;
+      }
+
+      const [rawAppts, rawSlots, templates, doctors, departments] = await Promise.all([
+        fetchOrdsItems<Appointment>('appointments'),
+        fetchOrdsItems<Slot>('slots'),
+        fetchOrdsItems<SlotTemplate>('slot_templates'),
+        fetchOrdsItems<Doctor>('doctors'),
+        fetchOrdsItems<Department>('departments/'),
+      ]);
+      const shiftStore = readShiftStore();
+      const slotsWithDoc = attachDoctorIdsToSlots(rawSlots, templates, shiftStore);
+      const fullSlots = enrichSlots(slotsWithDoc, templates, doctors, departments);
+      const enrichedAppts = enrichAppointments(
+        attachConsultationMode(rawAppts),
+        fullSlots,
+        doctors,
+      );
+      const target = enrichedAppts.find((a) => a.appointment_id === apptId);
+      if (!target) {
+        res.status(404).json({ status: 'error', message: 'Appointment not found.' });
+        return;
+      }
+      if (user.role === 'DOCTOR' && target.doctor_id !== user.doctor_id) {
+        res.status(403).json({
+          status: 'error',
+          message: 'Doctors can only record outcomes for their own appointments.',
+        });
+        return;
+      }
+      if (target.status !== 'CONFIRMED') {
+        res.status(400).json({
+          status: 'error',
+          message: `Only confirmed appointments can be marked Completed or No-Show (current status: ${target.status}).`,
+        });
+        return;
+      }
+      if (!isSlotEndExpired(target.slot_date, target.start_time, target.end_time, new Date(), HOSPITAL_TIMEZONE)) {
+        res.status(400).json({
+          status: 'error',
+          message: `Appointment outcome can only be entered after the slot end time (${target.end_time || 'scheduled'}) has passed.`,
+        });
+        return;
+      }
+      outgoingBody = { outcome: requestedOutcome };
+      pendingOutcomeVerification = {
+        appointment: target,
+        outcome: requestedOutcome,
+      };
+    }
+
     if (
       method === 'GET' &&
       (subPath === 'slots' ||
@@ -4829,6 +4991,64 @@ async function startServer() {
       });
       const text = await upstream.text();
       const contentType = upstream.headers.get('content-type') || 'application/json';
+
+      if (pendingOutcomeVerification) {
+        let parsedBody: Record<string, unknown> | null = null;
+        try {
+          parsedBody = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+        } catch {
+          parsedBody = null;
+        }
+        const upstreamMsg = String(parsedBody?.message || text || '');
+        const upstreamSucceeded =
+          upstream.ok && parsedBody && parsedBody.status !== 'error';
+        const isTimezoneOrInvalidProcError =
+          /20032|end time has not passed|ORA-06575|ORA-06550|ORA-04063|invalid/i.test(upstreamMsg);
+
+        if (upstreamSucceeded) {
+          recordAppointmentOutcomeOverlay(
+            pendingOutcomeVerification.appointment,
+            null,
+            user.full_name,
+          );
+          recordRbacAuditLog({
+            actor_user_id: user.user_id,
+            actor_name: user.full_name,
+            actor_role: user.role,
+            target_label: pendingOutcomeVerification.appointment.appointment_ref,
+            action: `APPOINTMENT_${pendingOutcomeVerification.outcome}`,
+            category: 'CLINICAL',
+            previous_value: 'CONFIRMED',
+            new_value: pendingOutcomeVerification.outcome,
+            details: `${user.full_name} marked appointment ${pendingOutcomeVerification.appointment.appointment_ref} (${pendingOutcomeVerification.appointment.patient_name}) as ${pendingOutcomeVerification.outcome}.`,
+            severity: 'info',
+          });
+        } else if (isTimezoneOrInvalidProcError) {
+          recordAppointmentOutcomeOverlay(
+            pendingOutcomeVerification.appointment,
+            pendingOutcomeVerification.outcome,
+            user.full_name,
+          );
+          recordRbacAuditLog({
+            actor_user_id: user.user_id,
+            actor_name: user.full_name,
+            actor_role: user.role,
+            target_label: pendingOutcomeVerification.appointment.appointment_ref,
+            action: `APPOINTMENT_${pendingOutcomeVerification.outcome}`,
+            category: 'CLINICAL',
+            previous_value: 'CONFIRMED',
+            new_value: pendingOutcomeVerification.outcome,
+            details: `${user.full_name} marked appointment ${pendingOutcomeVerification.appointment.appointment_ref} (${pendingOutcomeVerification.appointment.patient_name}) as ${pendingOutcomeVerification.outcome} (IST slot-end verified).`,
+            severity: 'info',
+          });
+          res.status(200).json({
+            status: 'success',
+            message: `Appointment outcome updated to ${pendingOutcomeVerification.outcome}`,
+            persistence: 'ist_verified_overlay',
+          });
+          return;
+        }
+      }
 
       if (upstream.ok && pendingBookingInfo) {
         try {

@@ -7,7 +7,7 @@ import { useToast } from '../../context/ToastContext';
 import { hasModulePermission } from '../../utils/permissions';
 import { buildCsvString, downloadCsvFile } from '../../utils/csv';
 import { enrichAppointments, enrichSlots, formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
-import { formatShiftSummary } from '../../utils/calendar';
+import { formatShiftSummary, isSlotEndExpired, isSlotStartExpired } from '../../utils/calendar';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
 import { ConfirmDialog } from '../../components/layout/ConfirmDialog';
@@ -213,7 +213,14 @@ export function DoctorsPage() {
   const inspectDoctorSlots = useMemo(
     () =>
       inspectDoctor
-        ? slots.filter((s) => s.doctor_id === inspectDoctor.doctor_id && s.status !== 'CANCELLED')
+        ? slots.filter((s) => {
+            if (s.doctor_id !== inspectDoctor.doctor_id || s.status === 'CANCELLED') return false;
+            const isBooked = s.booked_patients > 0 || s.status === 'SOLD_OUT';
+            if (isBooked) {
+              return !isSlotEndExpired(s.slot_date, s.start_time, s.end_time);
+            }
+            return !isSlotStartExpired(s.slot_date, s.start_time);
+          })
         : [],
     [inspectDoctor, slots],
   );
@@ -571,10 +578,15 @@ export function DoctorsPage() {
         {inspectDoctor && (() => {
           const docShift = shiftByDoctorId.get(inspectDoctor.doctor_id);
           const openCount = inspectDoctorSlots.filter(
-            (s) => s.status === 'AVAILABLE' && s.booked_patients < s.max_patients_per_slot,
+            (s) =>
+              s.status === 'AVAILABLE' &&
+              s.booked_patients < s.max_patients_per_slot &&
+              !isSlotStartExpired(s.slot_date, s.start_time),
           ).length;
           const bookedCount = inspectDoctorSlots.filter(
-            (s) => s.booked_patients > 0 || s.status === 'SOLD_OUT',
+            (s) =>
+              (s.booked_patients > 0 || s.status === 'SOLD_OUT') &&
+              !isSlotEndExpired(s.slot_date, s.start_time, s.end_time),
           ).length;
           return (
             <div className="space-y-4">

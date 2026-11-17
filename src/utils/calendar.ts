@@ -1,4 +1,11 @@
-import type { DoctorLeave, DoctorShiftConfig, ShiftSession, Slot, SlotTemplate } from '../types/opd.ts';
+import type {
+  Appointment,
+  DoctorLeave,
+  DoctorShiftConfig,
+  ShiftSession,
+  Slot,
+  SlotTemplate,
+} from '../types/opd.ts';
 import { getIsoDatePart } from './rules.ts';
 
 export const WEEKDAY_NAMES = [
@@ -293,6 +300,81 @@ export function isSlotStartExpired(
   if (datePart > cur.isoDate) return false;
   if (!startTime || !/^\d{1,2}:\d{2}/.test(startTime.trim())) return false;
   return parseHHMMToMinutes(startTime.trim()) <= cur.minutesOfDay;
+}
+
+export function isSlotEndExpired(
+  slotDate?: string | null,
+  startTime?: string | null,
+  endTime?: string | null,
+  now = new Date(),
+  timeZone = DEFAULT_HOSPITAL_TIMEZONE,
+): boolean {
+  const datePart = getIsoDatePart(slotDate);
+  if (!datePart) return false;
+  const cur = getHospitalNowParts(now, timeZone);
+
+  const hasValidEnd = Boolean(endTime && /^\d{1,2}:\d{2}/.test(endTime.trim()));
+  if (!hasValidEnd) {
+    if (datePart < cur.isoDate) return true;
+    if (datePart > cur.isoDate) return false;
+    return isSlotStartExpired(datePart, startTime, now, timeZone);
+  }
+
+  const endMins = parseHHMMToMinutes(endTime!.trim());
+  const hasValidStart = Boolean(startTime && /^\d{1,2}:\d{2}/.test(startTime.trim()));
+  const crossesMidnight =
+    hasValidStart && endMins <= parseHHMMToMinutes(startTime!.trim());
+  const effectiveEndDate = crossesMidnight ? addDaysIso(datePart, 1) : datePart;
+
+  if (effectiveEndDate < cur.isoDate) return true;
+  if (effectiveEndDate > cur.isoDate) return false;
+  return cur.minutesOfDay >= endMins;
+}
+
+export function isSlotFutureOrActive(
+  slot: Pick<Slot, 'slot_date' | 'start_time' | 'end_time' | 'status' | 'booked_patients'>,
+  now = new Date(),
+  timeZone = DEFAULT_HOSPITAL_TIMEZONE,
+): boolean {
+  if (slot.status === 'CANCELLED') return false;
+  const isBooked = slot.booked_patients > 0 || slot.status === 'SOLD_OUT';
+  if (isBooked) {
+    return !isSlotEndExpired(slot.slot_date, slot.start_time, slot.end_time, now, timeZone);
+  }
+  return (
+    slot.status === 'AVAILABLE' &&
+    slot.booked_patients < 1_000_000 &&
+    !isSlotStartExpired(slot.slot_date, slot.start_time, now, timeZone)
+  );
+}
+
+export function getAppointmentsAwaitingOutcome<
+  T extends Pick<
+    Appointment,
+    'appointment_id' | 'status' | 'slot_date' | 'start_time' | 'end_time' | 'doctor_id'
+  >,
+>(
+  appointments: T[],
+  doctorId?: number | null,
+  now = new Date(),
+  timeZone = DEFAULT_HOSPITAL_TIMEZONE,
+): T[] {
+  return appointments
+    .filter((appt) => {
+      if (appt.status !== 'CONFIRMED') return false;
+      if (doctorId && appt.doctor_id !== doctorId) return false;
+      if (!appt.slot_date) return false;
+      return isSlotEndExpired(appt.slot_date, appt.start_time, appt.end_time, now, timeZone);
+    })
+    .sort((a, b) => {
+      const da = getIsoDatePart(a.slot_date);
+      const db = getIsoDatePart(b.slot_date);
+      if (da !== db) return da.localeCompare(db);
+      const ta = a.start_time || '';
+      const tb = b.start_time || '';
+      if (ta !== tb) return ta.localeCompare(tb);
+      return a.appointment_id - b.appointment_id;
+    });
 }
 
 export function isAppointmentTimeReached(

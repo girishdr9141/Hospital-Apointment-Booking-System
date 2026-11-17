@@ -7,6 +7,9 @@ import {
   doesSessionCrossMidnight,
   formatMinutesToHHMM,
   formatShiftSummary,
+  getAppointmentsAwaitingOutcome,
+  isSlotEndExpired,
+  isSlotFutureOrActive,
   isSlotStartExpired,
   isValidSlotTimeRange,
   mergeDayWorkingSlots,
@@ -216,3 +219,61 @@ test('formatShiftSummary indicates overnight next-day sessions clearly', () => {
     '09:00–17:00 (30 min)',
   );
 });
+
+test('isSlotEndExpired and isSlotFutureOrActive handle daytime, overnight, and past booked slots', () => {
+  // 2026-11-16 14:30 IST = 09:00 UTC
+  const at1430IST = new Date('2026-11-16T09:00:00.000Z');
+  // Daytime slot 14:00-14:30 has completed at 14:30
+  assert.equal(isSlotEndExpired('2026-11-16', '14:00', '14:30', at1430IST, 'Asia/Kolkata'), true);
+  // Daytime slot 14:15-14:45 is still ongoing at 14:30
+  assert.equal(isSlotEndExpired('2026-11-16', '14:15', '14:45', at1430IST, 'Asia/Kolkata'), false);
+  // Past day booked slot is expired
+  assert.equal(isSlotEndExpired('2026-11-15', '10:00', '10:30', at1430IST, 'Asia/Kolkata'), true);
+  // Cross-midnight slot 23:30-00:00 on 2026-11-16 at 23:45 IST (18:15 UTC) is NOT expired yet
+  const at2345IST = new Date('2026-11-16T18:15:00.000Z');
+  assert.equal(isSlotEndExpired('2026-11-16', '23:30', '00:00', at2345IST, 'Asia/Kolkata'), false);
+  // At 2026-11-17 00:00 IST (2026-11-16T18:30:00Z), 23:30-00:00 HAS expired
+  const atMidnightIST = new Date('2026-11-16T18:30:00.000Z');
+  assert.equal(isSlotEndExpired('2026-11-16', '23:30', '00:00', atMidnightIST, 'Asia/Kolkata'), true);
+
+  // isSlotFutureOrActive filters out past booked slots and ongoing/future booked slots remain visible
+  assert.equal(
+    isSlotFutureOrActive(
+      { slot_date: '2026-11-15', start_time: '09:00', end_time: '09:30', status: 'SOLD_OUT', booked_patients: 1 },
+      at1430IST,
+      'Asia/Kolkata',
+    ),
+    false,
+  );
+  assert.equal(
+    isSlotFutureOrActive(
+      { slot_date: '2026-11-16', start_time: '14:15', end_time: '14:45', status: 'SOLD_OUT', booked_patients: 1 },
+      at1430IST,
+      'Asia/Kolkata',
+    ),
+    true,
+  );
+});
+
+test('getAppointmentsAwaitingOutcome selects only CONFIRMED appointments past slot end time', () => {
+  // 2026-11-16 14:30 IST
+  const now = new Date('2026-11-16T09:00:00.000Z');
+  const pending = getAppointmentsAwaitingOutcome(
+    [
+      { appointment_id: 1, doctor_id: 2, status: 'CONFIRMED', slot_date: '2026-11-15', start_time: '10:00', end_time: '10:30' },
+      { appointment_id: 2, doctor_id: 2, status: 'COMPLETED', slot_date: '2026-11-15', start_time: '11:00', end_time: '11:30' },
+      { appointment_id: 3, doctor_id: 2, status: 'CONFIRMED', slot_date: '2026-11-16', start_time: '14:15', end_time: '14:45' },
+      { appointment_id: 4, doctor_id: 2, status: 'HELD', slot_date: '2026-11-15', start_time: '09:00', end_time: '09:30' },
+      { appointment_id: 5, doctor_id: 3, status: 'CONFIRMED', slot_date: '2026-11-16', start_time: '13:00', end_time: '13:30' },
+      { appointment_id: 6, doctor_id: 2, status: 'CONFIRMED', slot_date: '2026-11-16', start_time: '14:00', end_time: '14:30' },
+    ],
+    2,
+    now,
+    'Asia/Kolkata',
+  );
+  assert.deepEqual(
+    pending.map((a) => a.appointment_id),
+    [1, 6],
+  );
+});
+

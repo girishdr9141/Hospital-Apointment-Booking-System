@@ -486,6 +486,7 @@ export interface DashboardSummaryResponse {
   doctor_leaves?: DoctorLeave[];
   doctor_slots_today_count?: number;
   doctor_on_leave_today?: boolean;
+  pending_outcome_appointments?: Appointment[];
 }
 
 export type RouteKey =
@@ -571,6 +572,18 @@ export interface AnalyticsVisitRecord {
   amount: number;
 }
 
+export interface PendingOutcomeItem {
+  appointment_id: number;
+  appointment_ref: string;
+  doctor_id: number;
+  doctor_name: string;
+  department_name: string;
+  patient_name: string;
+  slot_date: string;
+  start_time: string;
+  end_time: string;
+}
+
 export interface AnalyticsDatasetResponse {
   status: 'success';
   generated_at: string;
@@ -578,6 +591,8 @@ export interface AnalyticsDatasetResponse {
   range_end: string;
   historical_count: number;
   live_count: number;
+  pending_outcome_count?: number;
+  pending_outcomes?: PendingOutcomeItem[];
   records: AnalyticsVisitRecord[];
   allowed_sections?: {
     revenue: boolean;

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { BarChart3, Download, RefreshCw, RotateCcw, UserCheck, Video } from 'lucide-react';
+import { AlertCircle, BarChart3, Download, RefreshCw, RotateCcw, UserCheck, Video } from 'lucide-react';
 import type {
   AnalyticsDatasetResponse,
   AnalyticsSourceTag,
@@ -341,6 +341,43 @@ export function AnalyticsPage() {
           )}
         </div>
       </div>
+
+      {Boolean(dataset?.pending_outcome_count && dataset.pending_outcome_count > 0) && (
+        <div
+          role="status"
+          className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-950"
+        >
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" aria-hidden="true" />
+            <div className="space-y-1">
+              <p className="font-semibold">
+                {dataset?.pending_outcome_count} past confirmed appointment
+                {dataset?.pending_outcome_count === 1 ? '' : 's'} awaiting doctor outcome (Completed / No-Show)
+              </p>
+              <p className="text-amber-900">
+                Excluded from live completion, no-show, and revenue totals until the attending doctor explicitly submits the visit outcome.
+              </p>
+              {dataset?.pending_outcomes && dataset.pending_outcomes.length > 0 && (
+                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                  {dataset.pending_outcomes.slice(0, 6).map((item) => (
+                    <span
+                      key={item.appointment_id}
+                      className="rounded-md border border-amber-200 bg-white px-2 py-0.5 font-mono text-[11px] text-amber-900"
+                    >
+                      {item.appointment_ref} · {item.doctor_name} ({item.slot_date} {item.start_time})
+                    </span>
+                  ))}
+                  {dataset.pending_outcomes.length > 6 && (
+                    <span className="px-1 py-0.5 font-mono text-[11px] text-amber-800">
+                      +{dataset.pending_outcomes.length - 6} more
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Filter Toolbar */}
       <div className="rounded-xl border border-slate-200 bg-white p-4">

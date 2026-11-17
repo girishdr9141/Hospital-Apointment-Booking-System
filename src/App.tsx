@@ -3,13 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useCallback, useEffect, useState } from 'react';
-import { AlertTriangle, Bell, CalendarPlus, CheckCheck, ChevronRight } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { AlertTriangle, Bell, CalendarPlus, CheckCheck, ChevronRight, ClipboardCheck } from 'lucide-react';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { ToastProvider, useToast } from './context/ToastContext';
 import type { DashboardSummaryResponse, PortalNotification, RoleName, RouteKey } from './types/opd';
 import { canAccessRoute } from './utils/permissions';
-import { doesDoctorNeedDailySlotsPrompt, getTodayIsoLocal } from './utils/calendar';
+import {
+  doesDoctorNeedDailySlotsPrompt,
+  getAppointmentsAwaitingOutcome,
+  getTodayIsoLocal,
+} from './utils/calendar';
 import { formatDisplayDate, formatDisplayDateTime } from './utils/rules';
 import { apiClient } from './services/apiClient';
 import { RoleSelectorPage } from './pages/auth/RoleSelectorPage';
@@ -45,6 +49,7 @@ import { LogsPage } from './pages/modules/LogsPage';
 import { ProfilePage } from './pages/modules/ProfilePage';
 import { AnalyticsPage } from './pages/modules/AnalyticsPage';
 import { DoctorShiftModal } from './components/modals/DoctorShiftModal';
+import { DoctorOutcomePromptModal } from './components/modals/DoctorOutcomePromptModal';
 
 const VALID_ROUTES: RouteKey[] = [
   'dashboard',
@@ -99,6 +104,8 @@ function PortalContent() {
   const [shiftModalDismissedForUser, setShiftModalDismissedForUser] = useState<number | null>(null);
   const [dailyModalDismissedForUser, setDailyModalDismissedForUser] = useState<number | null>(null);
   const [notifPopupDismissedForUser, setNotifPopupDismissedForUser] = useState<number | null>(null);
+  const [outcomeSnoozedSignature, setOutcomeSnoozedSignature] = useState<string | null>(null);
+  const [outcomeCheckNow, setOutcomeCheckNow] = useState<number>(() => Date.now());
   const [notifications, setNotifications] = useState<PortalNotification[]>([]);
   const [quickGenerating, setQuickGenerating] = useState(false);
 
@@ -164,7 +171,23 @@ function PortalContent() {
       setShiftModalDismissedForUser(null);
       setDailyModalDismissedForUser(null);
       setNotifPopupDismissedForUser(null);
+      setOutcomeSnoozedSignature(null);
     }
+  }, [user, loadDashboard]);
+
+  // Periodically check if any doctor appointment has crossed its slot end time
+  useEffect(() => {
+    if (!user || user.role !== 'DOCTOR') return;
+    const tickTimer = window.setInterval(() => {
+      setOutcomeCheckNow(Date.now());
+    }, 30_000);
+    const refreshTimer = window.setInterval(() => {
+      void loadDashboard();
+    }, 60_000);
+    return () => {
+      window.clearInterval(tickTimer);
+      window.clearInterval(refreshTimer);
+    };
   }, [user, loadDashboard]);
 
   const handleLogout = useCallback(async () => {
@@ -179,8 +202,28 @@ function PortalContent() {
     setShiftModalDismissedForUser(null);
     setDailyModalDismissedForUser(null);
     setNotifPopupDismissedForUser(null);
+    setOutcomeSnoozedSignature(null);
     notify('You have been signed out', 'info');
   }, [logout, notify]);
+
+  const pendingOutcomeAppointments = useMemo(() => {
+    if (!user || user.role !== 'DOCTOR' || !dashboardData) return [];
+    const serverList = dashboardData.pending_outcome_appointments ?? [];
+    const liveChecked = getAppointmentsAwaitingOutcome(
+      dashboardData.recent_appointments ?? [],
+      user.doctor_id,
+      new Date(outcomeCheckNow),
+    );
+    const mergedMap = new Map<number, (typeof serverList)[number]>();
+    for (const appt of serverList) mergedMap.set(appt.appointment_id, appt);
+    for (const appt of liveChecked) mergedMap.set(appt.appointment_id, appt);
+    return Array.from(mergedMap.values()).sort(
+      (a, b) =>
+        String(a.slot_date || '').localeCompare(String(b.slot_date || '')) ||
+        String(a.start_time || '').localeCompare(String(b.start_time || '')) ||
+        a.appointment_id - b.appointment_id,
+    );
+  }, [user, dashboardData, outcomeCheckNow]);
 
   if (loading) {
     return (
@@ -284,15 +327,27 @@ function PortalContent() {
       todayIso,
     );
 
+  const pendingOutcomeSignature =
+    pendingOutcomeAppointments.length > 0
+      ? `${user.user_id}:${pendingOutcomeAppointments.map((a) => a.appointment_id).join(',')}`
+      : null;
+
+  const showOutcomePromptModal =
+    !showShiftRegistrationModal &&
+    pendingOutcomeAppointments.length > 0 &&
+    outcomeSnoozedSignature !== pendingOutcomeSignature;
+
   const unreadNotifications = notifications.filter((n) => !n.read);
   const showLoginNotifModal =
     (user.role === 'SUPER_ADMIN' || user.role === 'ADMIN' || user.role === 'DOCTOR') &&
     !showShiftRegistrationModal &&
+    !showOutcomePromptModal &&
     unreadNotifications.length > 0 &&
     notifPopupDismissedForUser !== user.user_id;
 
   const showDailyReminderModal =
     !showShiftRegistrationModal &&
+    !showOutcomePromptModal &&
     !showLoginNotifModal &&
     doctorNeedsDailySlots &&
     dailyModalDismissedForUser !== user.user_id;
@@ -457,17 +512,30 @@ function PortalContent() {
       case 'consultation-types':
         return <ConsultationTypesPage />;
       case 'appointments':
-        return <AppointmentsPage key="appointments" mode="list" />;
+        return (
+          <AppointmentsPage
+            key="appointments"
+            mode="list"
+            onDataChanged={loadDashboard}
+          />
+        );
       case 'book-appointment':
         return (
           <AppointmentsPage
             key="book-appointment"
             mode="book"
             onModeHandled={() => navigate('appointments')}
+            onDataChanged={loadDashboard}
           />
         );
       case 'appointment-history':
-        return <AppointmentsPage key="appointment-history" mode="history" />;
+        return (
+          <AppointmentsPage
+            key="appointment-history"
+            mode="history"
+            onDataChanged={loadDashboard}
+          />
+        );
       case 'slots':
         return <SlotsPage onDoctorSlotsChanged={loadDashboard} />;
       case 'doctor-leaves':
@@ -515,6 +583,31 @@ function PortalContent() {
       onMarkNotificationRead={handleMarkNotificationRead}
       onDismissAllNotifications={handleDismissAllNotifications}
     >
+      {/* Persistent banner across all Doctor pages when finished appointments await Completed / No-Show */}
+      {user.role === 'DOCTOR' && pendingOutcomeAppointments.length > 0 && (
+        <div
+          role="alert"
+          className="mb-5 flex flex-col gap-2.5 rounded-xl border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-950 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div className="flex items-center gap-2.5">
+            <ClipboardCheck className="h-4 w-4 shrink-0 text-rose-700" aria-hidden="true" />
+            <span>
+              <span className="font-semibold">
+                Post-Slot Outcome Required ({pendingOutcomeAppointments.length}):
+              </span>{' '}
+              Mark completed slot{pendingOutcomeAppointments.length === 1 ? '' : 's'} as Completed or No-Show so accurate records go to analytics.
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setOutcomeSnoozedSignature(null)}
+            className="rounded-lg bg-rose-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-rose-800 whitespace-nowrap shrink-0"
+          >
+            Enter Outcomes ({pendingOutcomeAppointments.length})
+          </button>
+        </div>
+      )}
+
       {/* Persistent non-ignorable bar across all Doctor pages until today's slots exist */}
       {doctorNeedsDailySlots && activeRoute !== 'dashboard' && (
         <div
@@ -551,6 +644,17 @@ function PortalContent() {
             setShiftModalDismissedForUser(user.user_id);
             await loadDashboard();
           }}
+        />
+      )}
+
+      {/* Mandatory Post-Slot Doctor Outcome Prompt Modal (Completed vs No-Show) */}
+      {user.role === 'DOCTOR' && (
+        <DoctorOutcomePromptModal
+          open={showOutcomePromptModal}
+          doctorName={user.full_name}
+          appointments={pendingOutcomeAppointments}
+          onClose={() => setOutcomeSnoozedSignature(pendingOutcomeSignature)}
+          onOutcomeSubmitted={loadDashboard}
         />
       )}
 
