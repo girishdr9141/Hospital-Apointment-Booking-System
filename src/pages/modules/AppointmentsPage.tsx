@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CalendarPlus, Check, Clock, Download, RefreshCw, XCircle } from 'lucide-react';
 import type { Appointment, CancellationRule, Department, Doctor, Patient, Slot } from '../../types/opd';
 import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient';
@@ -13,6 +13,7 @@ import {
   formatDisplayDate,
   formatHoldRemaining,
   getIsoDatePart,
+  isAppointmentHoldExpired,
 } from '../../utils/rules';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
@@ -54,6 +55,7 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
     type: 'confirm' | 'cancel' | 'COMPLETED' | 'NO_SHOW';
   } | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
+  const autoExpiredTriggeredRef = useRef<Set<number>>(new Set());
 
   // Refresh hold countdown tick every second when any appointment is HELD
   useEffect(() => {
@@ -100,6 +102,18 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  // Automatically release expired holds & refresh slots/appointments as soon as countdown hits 00:00
+  useEffect(() => {
+    const newlyExpired = appointments.filter(
+      (a) => isAppointmentHoldExpired(a, nowMs) && !autoExpiredTriggeredRef.current.has(a.appointment_id),
+    );
+    if (newlyExpired.length === 0) return;
+    for (const appt of newlyExpired) {
+      autoExpiredTriggeredRef.current.add(appt.appointment_id);
+    }
+    void loadData();
+  }, [appointments, nowMs, loadData]);
 
   const executeAppointmentAction = async () => {
     if (!pendingAction) return;
@@ -171,7 +185,10 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
   }, [appointments, mode, statusFilter, modeFilter, doctorFilter, dateFilter, search]);
 
   const canBook = hasModulePermission(user, 'APPOINTMENTS', 'CREATE') && user?.role !== 'DOCTOR';
-  const canConfirm = hasModulePermission(user, 'APPOINTMENTS', 'UPDATE') && user?.role !== 'DOCTOR';
+  const canConfirm =
+    user?.role !== 'DOCTOR' &&
+    (hasModulePermission(user, 'APPOINTMENTS', 'UPDATE') ||
+      (user?.role === 'PATIENT' && hasModulePermission(user, 'APPOINTMENTS', 'CREATE')));
   const canCancel = hasModulePermission(user, 'APPOINTMENTS', 'DELETE') && user?.role !== 'DOCTOR';
   const canUpdateOutcome =
     hasModulePermission(user, 'APPOINTMENTS', 'UPDATE') && user?.role !== 'PATIENT';
@@ -244,7 +261,7 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
       align: 'right',
       render: (row) => (
         <div className="inline-flex flex-wrap items-center justify-end gap-1.5">
-          {row.status === 'HELD' && canConfirm && (
+          {row.status === 'HELD' && !isAppointmentHoldExpired(row, nowMs) && canConfirm && (
             <button
               type="button"
               onClick={() => setPendingAction({ appointment: row, type: 'confirm' })}
@@ -516,7 +533,11 @@ export function AppointmentsPage({ mode = 'list', onModeHandled }: AppointmentsP
             : ''
         }
         confirmLabel={
-          pendingAction?.type === 'cancel' ? 'Cancel Appointment' : 'Confirm Action'
+          pendingAction?.type === 'cancel'
+            ? 'Cancel Appointment'
+            : pendingAction?.type === 'confirm'
+              ? 'Confirm Appointment'
+              : 'Confirm Action'
         }
         tone={pendingAction?.type === 'cancel' ? 'danger' : 'primary'}
         busy={actionBusy}

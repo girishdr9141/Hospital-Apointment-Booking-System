@@ -60,6 +60,8 @@ import {
   enrichSlots,
   formatDisplayDate,
   getIsoDatePart,
+  getNextHoldExpiryMs,
+  isAppointmentHoldExpired,
   normalizeOrdsError,
 } from './src/utils/rules.ts';
 import {
@@ -304,6 +306,58 @@ async function fetchOrdsItems<T>(endpoint: string): Promise<T[]> {
     `${endpoint}${separator}limit=500`,
   );
   return Array.isArray(data.items) ? data.items : [];
+}
+
+let inFlightExpireHolds: Promise<number> | null = null;
+let lastExpireHoldsCheckMs = 0;
+let knownNextHoldExpiryMs: number | null = null;
+
+function trackNextHoldExpiry(appointments: Array<Pick<Appointment, 'status' | 'hold_expires_at'>>): void {
+  knownNextHoldExpiryMs = getNextHoldExpiryMs(appointments);
+}
+
+async function runOrdsExpireHolds(): Promise<number> {
+  if (inFlightExpireHolds) return inFlightExpireHolds;
+  inFlightExpireHolds = (async () => {
+    try {
+      const res = await fetchOrdsJson<{ status?: string; expired_count?: number }>(
+        'appointments/expire-holds',
+        { method: 'POST', body: '{}' },
+      );
+      lastExpireHoldsCheckMs = Date.now();
+      knownNextHoldExpiryMs = null;
+      return Number(res?.expired_count || 0);
+    } catch {
+      lastExpireHoldsCheckMs = Date.now();
+      return 0;
+    } finally {
+      inFlightExpireHolds = null;
+    }
+  })();
+  return inFlightExpireHolds;
+}
+
+async function ensureOverdueHoldsExpired(options?: {
+  force?: boolean;
+  appointmentsHint?: Appointment[];
+}): Promise<boolean> {
+  if (options?.appointmentsHint) {
+    trackNextHoldExpiry(options.appointmentsHint);
+    if (!options.force && !options.appointmentsHint.some((a) => isAppointmentHoldExpired(a))) {
+      return false;
+    }
+    const expired = await runOrdsExpireHolds();
+    return expired > 0;
+  }
+
+  const now = Date.now();
+  const dueByKnownHold = knownNextHoldExpiryMs !== null && now >= knownNextHoldExpiryMs;
+  const dueByInterval = now - lastExpireHoldsCheckMs >= 30_000;
+  if (!options?.force && !dueByKnownHold && !dueByInterval) {
+    return false;
+  }
+  const expired = await runOrdsExpireHolds();
+  return expired > 0;
 }
 
 function requireAuth(req: Request, res: Response, next: NextFunction): void {
@@ -1728,12 +1782,13 @@ async function startServer() {
     if (!requirePermission(user, res, 'DASHBOARD:VIEW', 'Dashboard Summary')) return;
 
     try {
+      await ensureOverdueHoldsExpired();
       const [
         departments,
         doctors,
         patients,
-        rawAppointments,
-        rawSlots,
+        initialRawAppointments,
+        initialRawSlots,
         templates,
         payments,
         tokenQueue,
@@ -1751,6 +1806,16 @@ async function startServer() {
           ? Promise.resolve([] as UtilisationReportRow[])
           : fetchOrdsItems<UtilisationReportRow>('reports/utilisation'),
       ]);
+
+      let rawAppointments = initialRawAppointments;
+      let rawSlots = initialRawSlots;
+      if (await ensureOverdueHoldsExpired({ appointmentsHint: rawAppointments })) {
+        [rawAppointments, rawSlots] = await Promise.all([
+          fetchOrdsItems<Appointment>('appointments'),
+          fetchOrdsItems<Slot>('slots'),
+        ]);
+        trackNextHoldExpiry(rawAppointments);
+      }
 
       const activeDeptIds = new Set(departments.map((d) => d.department_id));
       const missingDeptIds = Array.from(
@@ -4473,8 +4538,32 @@ async function startServer() {
         ) {
           return;
         }
-      } else if (/^appointments\/\d+\/(confirm|outcome)$/.test(subPath)) {
+      } else if (/^appointments\/\d+\/confirm$/.test(subPath)) {
+        const allowedPerms =
+          user.role === 'PATIENT'
+            ? ['APPOINTMENTS:UPDATE', 'APPOINTMENTS:CREATE']
+            : ['APPOINTMENTS:UPDATE'];
+        if (!requireAnyPermission(user, res, allowedPerms, `ORDS ${subPath}`)) return;
+      } else if (/^appointments\/\d+\/outcome$/.test(subPath)) {
+        if (user.role === 'PATIENT') {
+          res.status(403).json({
+            status: 'error',
+            message: 'Patients cannot mark appointment outcomes.',
+          });
+          return;
+        }
         if (!enforceModulePerm('APPOINTMENTS', 'UPDATE', `ORDS ${subPath}`)) return;
+      } else if (subPath === 'appointments/expire-holds') {
+        if (
+          !requireAnyPermission(
+            user,
+            res,
+            ['APPOINTMENTS:UPDATE', 'APPOINTMENTS:DELETE', 'APPOINTMENTS:CREATE'],
+            `ORDS ${subPath}`,
+          )
+        ) {
+          return;
+        }
       } else {
         if (!enforceModulePerm('APPOINTMENTS', actionForMethod(method), `ORDS ${subPath}`)) return;
       }
@@ -4588,11 +4677,13 @@ async function startServer() {
         return;
       }
 
+      await ensureOverdueHoldsExpired();
       const [slotsList, templatesList, existingAppts] = await Promise.all([
         fetchOrdsItems<Slot>('slots'),
         fetchOrdsItems<SlotTemplate>('slot_templates'),
         fetchOrdsItems<Appointment>('appointments'),
       ]);
+      trackNextHoldExpiry(existingAppts);
       const shiftStore = readShiftStore();
       const slotsWithDoc = attachDoctorIdsToSlots(slotsList, templatesList, shiftStore);
       const targetSlot = slotsWithDoc.find((s) => s.slot_id === targetSlotId);
@@ -4680,15 +4771,35 @@ async function startServer() {
     }
 
     if (/^appointments\/\d+\/(confirm|cancel)$/.test(subPath) && method === 'POST') {
-      if (user.role === 'PATIENT') {
-        const apptId = Number(subPath.split('/')[1]);
+      const isConfirmAction = subPath.endsWith('/confirm');
+      const apptId = Number(subPath.split('/')[1]);
+      if (user.role === 'PATIENT' || isConfirmAction) {
         const appts = await fetchOrdsItems<Appointment>('appointments');
         const target = appts.find((a) => a.appointment_id === apptId);
-        if (!target || target.patient_id !== user.patient_id) {
+        if (user.role === 'PATIENT' && (!target || target.patient_id !== user.patient_id)) {
           res.status(403).json({ status: 'error', message: 'Patients can only manage their own appointments' });
           return;
         }
+        if (isConfirmAction && target && isAppointmentHoldExpired(target)) {
+          await ensureOverdueHoldsExpired({ force: true });
+          res.status(409).json({
+            status: 'error',
+            code: 'HOLD_EXPIRED',
+            message: 'This 10-minute booking hold has expired and the slot has been released. Please book a new slot.',
+          });
+          return;
+        }
       }
+    }
+
+    if (
+      method === 'GET' &&
+      (subPath === 'slots' ||
+        subPath === 'slots/' ||
+        subPath === 'appointments' ||
+        subPath === 'appointments/')
+    ) {
+      await ensureOverdueHoldsExpired();
     }
 
     if (subPath === 'leaves' && method === 'POST') {
@@ -4750,6 +4861,7 @@ async function startServer() {
               slot_id: pendingBookingInfo.slot_id,
               updated_at: new Date().toISOString(),
             });
+            trackNextHoldExpiry(latestAppts);
 
             res.status(upstream.status).json({
               ...parsedBody,
@@ -4903,7 +5015,12 @@ async function startServer() {
             } else if (subPath.startsWith('patients')) {
               parsed.items = attachRegionsToPatients(parsed.items as Patient[]);
             } else if (subPath === 'appointments' || subPath === 'appointments/') {
-              let appts = attachConsultationMode(parsed.items as Appointment[]);
+              let rawAppts = parsed.items as Appointment[];
+              if (await ensureOverdueHoldsExpired({ appointmentsHint: rawAppts })) {
+                rawAppts = await fetchOrdsItems<Appointment>('appointments');
+                trackNextHoldExpiry(rawAppts);
+              }
+              let appts = attachConsultationMode(rawAppts);
               if (user.role === 'PATIENT') {
                 appts = appts.filter((a) => a.patient_id === user.patient_id);
               } else if (user.role === 'DOCTOR') {
@@ -4978,6 +5095,11 @@ async function startServer() {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
+
+  setInterval(() => {
+    if (knownNextHoldExpiryMs !== null && Date.now() < knownNextHoldExpiryMs) return;
+    void ensureOverdueHoldsExpired().catch(() => {});
+  }, 15_000).unref();
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`CarePulse OPD server listening on http://localhost:${PORT}`);

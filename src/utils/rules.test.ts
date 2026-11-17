@@ -6,6 +6,8 @@ import {
   formatCurrencyInr,
   formatDisplayDate,
   formatHoldRemaining,
+  getNextHoldExpiryMs,
+  isAppointmentHoldExpired,
   normalizeOrdsError,
   paginateItems,
   sortSlotTemplates,
@@ -150,6 +152,35 @@ test('formatHoldRemaining formats remaining mm:ss and detects expired holds', ()
   assert.equal(formatHoldRemaining('2026-11-13T10:09:05Z', base), '09:05');
   assert.equal(formatHoldRemaining('2026-11-13T09:59:50Z', base), 'Expired');
   assert.equal(formatHoldRemaining(null, base), null);
+});
+
+test('isAppointmentHoldExpired and getNextHoldExpiryMs accurately detect overdue holds', () => {
+  const base = Date.parse('2026-11-13T10:00:00Z');
+  assert.equal(
+    isAppointmentHoldExpired({ status: 'HELD', hold_expires_at: '2026-11-13T09:59:59Z' }, base),
+    true,
+  );
+  assert.equal(
+    isAppointmentHoldExpired({ status: 'HELD', hold_expires_at: '2026-11-13T10:00:00Z' }, base),
+    true,
+  );
+  assert.equal(
+    isAppointmentHoldExpired({ status: 'HELD', hold_expires_at: '2026-11-13T10:05:00Z' }, base),
+    false,
+  );
+  assert.equal(
+    isAppointmentHoldExpired({ status: 'CONFIRMED', hold_expires_at: '2026-11-13T09:59:59Z' }, base),
+    false,
+  );
+  assert.equal(
+    getNextHoldExpiryMs([
+      { status: 'CONFIRMED', hold_expires_at: '2026-11-13T09:00:00Z' },
+      { status: 'HELD', hold_expires_at: '2026-11-13T10:08:00Z' },
+      { status: 'HELD', hold_expires_at: '2026-11-13T10:03:00Z' },
+    ]),
+    Date.parse('2026-11-13T10:03:00Z'),
+  );
+  assert.equal(getNextHoldExpiryMs([{ status: 'CANCELLED', hold_expires_at: null }]), null);
 });
 
 test('sortSlotTemplates orders MONDAY through SUNDAY and then by start_time', () => {

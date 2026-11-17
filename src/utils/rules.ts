@@ -55,6 +55,31 @@ export function formatHoldRemaining(holdExpiresAt?: string | null, nowMs = Date.
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
+export function isAppointmentHoldExpired(
+  appointment: Pick<Appointment, 'status' | 'hold_expires_at'>,
+  nowMs = Date.now(),
+): boolean {
+  if (appointment.status !== 'HELD' || !appointment.hold_expires_at) return false;
+  const expiryMs = new Date(appointment.hold_expires_at).getTime();
+  if (Number.isNaN(expiryMs)) return false;
+  return expiryMs <= nowMs;
+}
+
+export function getNextHoldExpiryMs(
+  appointments: Array<Pick<Appointment, 'status' | 'hold_expires_at'>>,
+): number | null {
+  let minMs: number | null = null;
+  for (const appt of appointments) {
+    if (appt.status !== 'HELD' || !appt.hold_expires_at) continue;
+    const expiryMs = new Date(appt.hold_expires_at).getTime();
+    if (Number.isNaN(expiryMs)) continue;
+    if (minMs === null || expiryMs < minMs) {
+      minMs = expiryMs;
+    }
+  }
+  return minMs;
+}
+
 export function paginateItems<T>(
   items: T[],
   page: number,

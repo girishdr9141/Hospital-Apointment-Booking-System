@@ -1,5 +1,17 @@
 [
   {
+    "id": "AUD-1794905957095-422",
+    "timestamp": "2026-11-17T08:59:17.095Z",
+    "actor_user_id": 42,
+    "actor_name": "John Doe",
+    "actor_role": "PATIENT",
+    "target_label": "john.doe@example.com",
+    "action": "LOGIN_SUCCESS",
+    "category": "AUTH",
+    "details": "Signed in via ords portal.",
+    "severity": "info"
+  },
+  {
     "id": "AUD-1794894324680-802",
     "timestamp": "2026-11-17T05:45:24.680Z",
     "actor_user_id": 1,
