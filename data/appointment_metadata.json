@@ -1,0 +1,38 @@
+{
+  "id:201": {
+    "consultation_mode": "ONLINE",
+    "rescheduled_from_id": null,
+    "appointment_ref": "APT6072E92EDBF4D1A8E",
+    "appointment_id": 201,
+    "patient_id": 101,
+    "slot_id": 25082,
+    "updated_at": "2026-11-17T05:10:18.474Z"
+  },
+  "ref:APT6072E92EDBF4D1A8E": {
+    "consultation_mode": "ONLINE",
+    "rescheduled_from_id": null,
+    "appointment_ref": "APT6072E92EDBF4D1A8E",
+    "appointment_id": 201,
+    "patient_id": 101,
+    "slot_id": 25082,
+    "updated_at": "2026-11-17T05:10:18.474Z"
+  },
+  "id:221": {
+    "consultation_mode": "FACE_TO_FACE",
+    "rescheduled_from_id": null,
+    "appointment_ref": "APT607331D61F386293E",
+    "appointment_id": 221,
+    "patient_id": 1,
+    "slot_id": 25084,
+    "updated_at": "2026-11-17T05:30:37.340Z"
+  },
+  "ref:APT607331D61F386293E": {
+    "consultation_mode": "FACE_TO_FACE",
+    "rescheduled_from_id": null,
+    "appointment_ref": "APT607331D61F386293E",
+    "appointment_id": 221,
+    "patient_id": 1,
+    "slot_id": 25084,
+    "updated_at": "2026-11-17T05:30:37.340Z"
+  }
+}

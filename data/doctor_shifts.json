@@ -26,6 +26,31 @@
       "registered_at": "2026-11-15T17:03:01.708Z",
       "updated_at": "2026-11-15T17:03:01.708Z"
     },
+    "3": {
+      "doctor_id": 3,
+      "doctor_name": "Dr. Anil Mehta",
+      "sessions": [
+        {
+          "start_time": "17:00",
+          "end_time": "20:00"
+        },
+        {
+          "start_time": "22:00",
+          "end_time": "01:00"
+        }
+      ],
+      "slot_duration_mins": 30,
+      "working_days": [
+        "FRIDAY",
+        "SUNDAY",
+        "THURSDAY",
+        "TUESDAY",
+        "SATURDAY"
+      ],
+      "is_registered": true,
+      "registered_at": "2026-11-17T05:27:43.466Z",
+      "updated_at": "2026-11-17T05:27:43.466Z"
+    },
     "5": {
       "doctor_id": 5,
       "doctor_name": "Dr. Vikram Rao",
@@ -132,11 +157,19 @@
     "5|2026-11-16|15:00",
     "5|2026-11-16|15:15",
     "5|2026-11-16|16:15",
-    "5|2026-11-16|16:30"
+    "5|2026-11-16|16:30",
+    "46|2026-11-18|10:00",
+    "3|2026-11-17|19:30",
+    "3|2026-11-17|17:00",
+    "3|2026-11-17|18:00",
+    "3|2026-11-17|22:30"
   ],
   "template_doctor_map": {
     "261": 2,
-    "293": 2
+    "293": 2,
+    "325": 2,
+    "327": 3,
+    "545": 4
   },
   "opened_slots_initialized": true
 }
