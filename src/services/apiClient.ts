@@ -34,6 +34,7 @@ import type {
   TokenQueueItem,
   UserAccount,
 } from '../types/opd';
+import type { BackendMode, OicPhaseId } from '../utils/backendRouter';
 import { normalizeOrdsError } from '../utils/rules';
 
 const TOKEN_STORAGE_KEY = 'carepulse_opd_session_token';
@@ -240,13 +241,40 @@ export const apiClient = {
       body: JSON.stringify(payload),
     });
   },
-  // Backend toggle (ORDS <-> OIC)
+  // Global Backend Toggle (ORDS <-> OIC) & Phase Tester
   getBackendMode: () =>
-    requestJson<{ mode: 'ords' | 'oic'; oic_configured: boolean }>('/api/backend-mode'),
-  setBackendMode: (mode: 'ords' | 'oic') =>
-    requestJson<{ status: string; mode: 'ords' | 'oic' }>('/api/backend-mode', {
+    requestJson<{
+      mode: BackendMode;
+      oic_configured: boolean;
+      oic_phases: OicPhaseId[];
+      oic_host_preview?: string | null;
+    }>('/api/backend-mode'),
+  setBackendMode: (payload: { mode?: BackendMode; oic_phases?: OicPhaseId[] } | BackendMode) =>
+    requestJson<{
+      status: string;
+      mode: BackendMode;
+      oic_configured: boolean;
+      oic_phases: OicPhaseId[];
+    }>('/api/backend-mode', {
       method: 'POST',
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify(typeof payload === 'string' ? { mode: payload } : payload),
+    }),
+  testOicEndpoints: (phaseId?: OicPhaseId) =>
+    requestJson<{
+      status: string;
+      results: Array<{
+        phaseId: OicPhaseId;
+        endpointId: string;
+        oicPath: string;
+        ok: boolean;
+        status: number;
+        latencyMs: number;
+        itemCount: number | null;
+        error?: string;
+      }>;
+    }>('/api/backend-mode/test', {
+      method: 'POST',
+      body: JSON.stringify(phaseId ? { phaseId } : {}),
     }),
   // Departments
   getDepartments: () => fetchCollection<Department>('departments/'),

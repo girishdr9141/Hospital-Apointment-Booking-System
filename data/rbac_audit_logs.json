@@ -1,5 +1,29 @@
 [
   {
+    "id": "AUD-1795068793095-367",
+    "timestamp": "2026-11-19T06:13:13.095Z",
+    "actor_user_id": 1,
+    "actor_name": "Girish DR",
+    "actor_role": "ADMIN",
+    "target_label": "girishramachandra12dr@gmail.com",
+    "action": "LOGIN_SUCCESS",
+    "category": "AUTH",
+    "details": "Signed in via ords portal.",
+    "severity": "info"
+  },
+  {
+    "id": "AUD-1795068316125-354",
+    "timestamp": "2026-11-19T06:05:16.125Z",
+    "actor_user_id": 1,
+    "actor_name": "Girish DR",
+    "actor_role": "ADMIN",
+    "target_label": "girishramachandra12dr@gmail.com",
+    "action": "LOGIN_SUCCESS",
+    "category": "AUTH",
+    "details": "Signed in via ords portal.",
+    "severity": "info"
+  },
+  {
     "id": "AUD-1794983345631-98",
     "timestamp": "2026-11-18T06:29:05.631Z",
     "actor_user_id": 9001,

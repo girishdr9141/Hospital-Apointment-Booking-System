@@ -10,7 +10,6 @@ import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
 import { ConfirmDialog } from '../../components/layout/ConfirmDialog';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
-import { BackendToggle } from '../../components/common/BackendToggle';
 
 export function DepartmentsPage() {
   const { user } = useAuth();
@@ -183,9 +182,6 @@ export function DepartmentsPage() {
 
   return (
     <div className="space-y-5">
-            {(user?.role === 'ADMIN' || user?.role === 'SUPER_ADMIN') && (
-        <BackendToggle onChanged={() => loadData()} />
-      )}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-xl font-semibold text-slate-900">Hospital Departments</h2>

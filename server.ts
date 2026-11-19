@@ -120,12 +120,89 @@ function getServerTodayIso(): string {
   return getTodayIsoLocal(new Date(), HOSPITAL_TIMEZONE);
 }
 
+import {
+  ALL_OIC_PHASES,
+  OIC_PHASE_SPECS,
+  buildUpstreamUrl,
+  classifyEndpointPhase,
+  normalizeBackendPayload,
+  normalizeEnabledPhases,
+  shouldUseOicForEndpoint,
+  type BackendMode,
+  type OicPhaseId,
+} from './src/utils/backendRouter.ts';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
 const ORDS_BASE_URL = (
   process.env.ORDS_BASE_URL ||
   'https://ga97be9115f23e9-moviestreamworkshop.adb.ap-mumbai-1.oraclecloudapps.com/ords/nov_2026_batch/girish_opd_api/v1'
 ).replace(/\/+$/, '');
+const OIC_BASE_URL = (process.env.OIC_BASE_URL || '').replace(/\/+$/, '');
+const OIC_USERNAME = process.env.OIC_USERNAME || '';
+const OIC_PASSWORD = process.env.OIC_PASSWORD || '';
+const OIC_CONFIGURED = Boolean(OIC_BASE_URL && OIC_USERNAME && OIC_PASSWORD);
+const BACKEND_MODE_PATH = path.resolve(__dirname, 'data', 'backend_mode.json');
+
+interface PersistedBackendState {
+  mode: BackendMode;
+  oic_phases: OicPhaseId[];
+}
+
+function readBackendState(): PersistedBackendState {
+  try {
+    if (fs.existsSync(BACKEND_MODE_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(BACKEND_MODE_PATH, 'utf8')) as {
+        mode?: unknown;
+        oic_phases?: unknown;
+      };
+      const parsedMode: BackendMode = raw.mode === 'oic' && OIC_CONFIGURED ? 'oic' : 'ords';
+      const parsedPhases = normalizeEnabledPhases(raw.oic_phases);
+      return {
+        mode: parsedMode,
+        oic_phases: parsedPhases.length > 0 ? parsedPhases : [...ALL_OIC_PHASES],
+      };
+    }
+  } catch {
+    // Fall back to ORDS defaults
+  }
+  return { mode: 'ords', oic_phases: [...ALL_OIC_PHASES] };
+}
+
+function writeBackendState(next: PersistedBackendState): void {
+  try {
+    fs.mkdirSync(path.dirname(BACKEND_MODE_PATH), { recursive: true });
+    fs.writeFileSync(BACKEND_MODE_PATH, JSON.stringify(next, null, 2), 'utf8');
+  } catch {
+    // Keep in-memory state if disk write fails
+  }
+}
+
+let backendState: PersistedBackendState = readBackendState();
+
+function resolveUpstreamTarget(endpoint: string): {
+  backend: BackendMode;
+  phase: OicPhaseId;
+  url: string;
+  headers: Record<string, string>;
+} {
+  const phase = classifyEndpointPhase(endpoint);
+  const useOic = shouldUseOicForEndpoint(
+    backendState.mode,
+    backendState.oic_phases,
+    endpoint,
+    OIC_CONFIGURED,
+  );
+  const backend: BackendMode = useOic ? 'oic' : 'ords';
+  const url = buildUpstreamUrl(ORDS_BASE_URL, OIC_BASE_URL, endpoint, backend);
+  const headers: Record<string, string> = {};
+  if (useOic) {
+    const auth = Buffer.from(`${OIC_USERNAME}:${OIC_PASSWORD}`).toString('base64');
+    headers.Authorization = `Basic ${auth}`;
+  }
+  return { backend, phase, url, headers };
+}
+
 const SESSION_SECRET = process.env.SESSION_SECRET || 'carepulse-opd-dev-session-secret-2026';
 const SESSION_COOKIE = 'carepulse_opd_session';
 
@@ -277,12 +354,13 @@ function clearSessionCookie(req: Request, res: Response): void {
 }
 
 async function fetchOrdsJson<T>(endpoint: string, init?: RequestInit): Promise<T> {
-  const url = `${ORDS_BASE_URL}/${endpoint.replace(/^\/+/, '')}`;
-  const response = await fetch(url, {
+  const target = resolveUpstreamTarget(endpoint);
+  const response = await fetch(target.url, {
     ...init,
     headers: {
       Accept: 'application/json',
       ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...target.headers,
       ...(init?.headers || {}),
     },
   });
@@ -290,13 +368,14 @@ async function fetchOrdsJson<T>(endpoint: string, init?: RequestInit): Promise<T
   let parsed: unknown = {};
   if (text) {
     try {
-      parsed = JSON.parse(text);
+      parsed = normalizeBackendPayload(JSON.parse(text));
     } catch {
       parsed = { message: text };
     }
   }
   if (!response.ok) {
-    const err = new Error(normalizeOrdsError(parsed, `ORDS returned HTTP ${response.status}`));
+    const label = target.backend === 'oic' ? 'OIC' : 'ORDS';
+    const err = new Error(normalizeOrdsError(parsed, `${label} returned HTTP ${response.status}`));
     (err as Error & { statusCode?: number }).statusCode = response.status;
     throw err;
   }
@@ -4422,16 +4501,24 @@ async function startServer() {
     res.json({ status: 'success', message: 'Prescription deleted.' });
   });
   // ============================================================================
-  // ORDS <-> OIC BACKEND TOGGLE (demo: Departments list)
+  // FULL-APPLICATION ORDS <-> OIC BACKEND TOGGLE & PHASE PROBE
   // ============================================================================
-  const OIC_BASE_URL = (process.env.OIC_BASE_URL || '').replace(/\/+$/, '');
-  const OIC_USERNAME = process.env.OIC_USERNAME || '';
-  const OIC_PASSWORD = process.env.OIC_PASSWORD || '';
-  const oicConfigured = Boolean(OIC_BASE_URL && OIC_USERNAME && OIC_PASSWORD);
-  let backendMode: 'ords' | 'oic' = 'ords';
-
   app.get('/api/backend-mode', requireAuth, (_req, res) => {
-    res.json({ mode: backendMode, oic_configured: oicConfigured });
+    let oicHostPreview: string | null = null;
+    if (OIC_BASE_URL) {
+      try {
+        const u = new URL(OIC_BASE_URL);
+        oicHostPreview = `${u.host}${u.pathname.replace(/\/+$/, '')}`;
+      } catch {
+        oicHostPreview = 'configured';
+      }
+    }
+    res.json({
+      mode: backendState.mode,
+      oic_configured: OIC_CONFIGURED,
+      oic_phases: backendState.oic_phases,
+      oic_host_preview: oicHostPreview,
+    });
   });
 
   app.post('/api/backend-mode', requireAuth, (req, res) => {
@@ -4440,40 +4527,147 @@ async function startServer() {
       res.status(403).json({ status: 'error', message: 'Only administrators can switch the backend.' });
       return;
     }
-    const requested = String(req.body?.mode || '').toLowerCase();
-    if (requested !== 'ords' && requested !== 'oic') {
+
+    const body = (req.body || {}) as { mode?: unknown; oic_phases?: unknown };
+    const hasMode = body.mode !== undefined;
+    const requestedMode = hasMode ? String(body.mode).toLowerCase() : backendState.mode;
+    if (requestedMode !== 'ords' && requestedMode !== 'oic') {
       res.status(400).json({ status: 'error', message: 'mode must be "ords" or "oic".' });
       return;
     }
-    if (requested === 'oic' && !oicConfigured) {
-      res.status(400).json({ status: 'error', message: 'OIC is not configured. Check OIC_* values in .env.' });
+    if (requestedMode === 'oic' && !OIC_CONFIGURED) {
+      res.status(400).json({
+        status: 'error',
+        message: 'OIC is not configured. Set OIC_BASE_URL, OIC_USERNAME, and OIC_PASSWORD in .env.',
+      });
       return;
     }
-    backendMode = requested;
-    res.json({ status: 'success', mode: backendMode });
+
+    const nextPhases =
+      body.oic_phases !== undefined
+        ? normalizeEnabledPhases(body.oic_phases)
+        : backendState.oic_phases;
+    if (requestedMode === 'oic' && nextPhases.length === 0) {
+      res.status(400).json({
+        status: 'error',
+        message: 'Select at least one OIC phase before switching to OIC mode.',
+      });
+      return;
+    }
+
+    const previousMode = backendState.mode;
+    const previousPhases = backendState.oic_phases.join(',');
+    backendState = {
+      mode: requestedMode as BackendMode,
+      oic_phases: nextPhases.length > 0 ? nextPhases : [...ALL_OIC_PHASES],
+    };
+    writeBackendState(backendState);
+
+    if (previousMode !== backendState.mode || previousPhases !== backendState.oic_phases.join(',')) {
+      recordRbacAuditLog({
+        actor_user_id: user.user_id,
+        actor_name: user.full_name,
+        actor_role: user.role,
+        target_label: 'application_backend',
+        action: 'BACKEND_MODE_CHANGED',
+        category: 'SECURITY',
+        previous_value: `${previousMode.toUpperCase()} [${previousPhases}]`,
+        new_value: `${backendState.mode.toUpperCase()} [${backendState.oic_phases.join(',')}]`,
+        details: `${user.full_name} set application data source to ${backendState.mode.toUpperCase()} (OIC phases: ${backendState.oic_phases.join(', ')}).`,
+        severity: 'info',
+      });
+    }
+
+    res.json({
+      status: 'success',
+      mode: backendState.mode,
+      oic_configured: OIC_CONFIGURED,
+      oic_phases: backendState.oic_phases,
+    });
   });
 
-  app.get(['/api/ords/departments', '/api/ords/departments/'], requireAuth, async (_req, res, next) => {
-    if (backendMode !== 'oic') {
-      res.setHeader('X-Backend', 'ords');
-      next();
+  app.post('/api/backend-mode/test', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+      res.status(403).json({ status: 'error', message: 'Only administrators can test OIC endpoints.' });
       return;
     }
-    try {
-      const auth = Buffer.from(`${OIC_USERNAME}:${OIC_PASSWORD}`).toString('base64');
-      const response = await fetch(`${OIC_BASE_URL}/departments`, {
-        headers: { Accept: 'application/json', Authorization: `Basic ${auth}` },
+    if (!OIC_CONFIGURED) {
+      res.status(400).json({
+        status: 'error',
+        message: 'OIC is not configured. Set OIC_BASE_URL, OIC_USERNAME, and OIC_PASSWORD in .env.',
       });
-      const text = await response.text();
-      if (!response.ok) {
-        res.status(response.status).json({ status: 'error', message: `OIC returned HTTP ${response.status}` });
-        return;
-      }
-      res.setHeader('X-Backend', 'oic');
-      res.json(JSON.parse(text));
-    } catch (err) {
-      res.status(502).json({ status: 'error', message: `OIC call failed: ${(err as Error).message}` });
+      return;
     }
+
+    const requestedPhase = req.body?.phaseId ? (String(req.body.phaseId) as OicPhaseId) : null;
+    const specsToProbe = requestedPhase
+      ? OIC_PHASE_SPECS.filter((p) => p.id === requestedPhase)
+      : OIC_PHASE_SPECS;
+
+    const auth = Buffer.from(`${OIC_USERNAME}:${OIC_PASSWORD}`).toString('base64');
+    const results: Array<{
+      phaseId: OicPhaseId;
+      endpointId: string;
+      oicPath: string;
+      ok: boolean;
+      status: number;
+      latencyMs: number;
+      itemCount: number | null;
+      error?: string;
+    }> = [];
+
+    for (const phase of specsToProbe) {
+      for (const ep of phase.endpoints) {
+        if (!ep.probePath) continue;
+        const targetUrl = buildUpstreamUrl(ORDS_BASE_URL, OIC_BASE_URL, ep.probePath, 'oic');
+        const started = Date.now();
+        try {
+          const response = await fetch(targetUrl, {
+            headers: { Accept: 'application/json', Authorization: `Basic ${auth}` },
+            signal: AbortSignal.timeout(10000),
+          });
+          const latencyMs = Date.now() - started;
+          const bodyText = await response.text();
+          let itemCount: number | null = null;
+          if (bodyText.trim()) {
+            try {
+              const normalized = normalizeBackendPayload(JSON.parse(bodyText)) as {
+                items?: unknown[];
+              };
+              if (Array.isArray(normalized?.items)) {
+                itemCount = normalized.items.length;
+              }
+            } catch {
+              // Non-JSON payload
+            }
+          }
+          results.push({
+            phaseId: phase.id,
+            endpointId: ep.id,
+            oicPath: ep.oicPath,
+            ok: response.ok,
+            status: response.status,
+            latencyMs,
+            itemCount,
+            ...(!response.ok ? { error: `HTTP ${response.status}` } : {}),
+          });
+        } catch (err) {
+          results.push({
+            phaseId: phase.id,
+            endpointId: ep.id,
+            oicPath: ep.oicPath,
+            ok: false,
+            status: 0,
+            latencyMs: Date.now() - started,
+            itemCount: null,
+            error: err instanceof Error ? err.message : 'Request failed',
+          });
+        }
+      }
+    }
+
+    res.json({ status: 'success', results });
   });
   // ============================================================================
   // GENERIC AUTHENTICATED ORDS BFF PROXY WITH DENY-BY-DEFAULT MODULE:ACTION RBAC
@@ -5033,12 +5227,15 @@ async function startServer() {
     }
 
     try {
-      const targetUrl = `${ORDS_BASE_URL}/${subPath}${queryString}`;
-      const upstream = await fetch(targetUrl, {
+      const target = resolveUpstreamTarget(`${subPath}${queryString}`);
+      res.setHeader('X-Backend', target.backend);
+      res.setHeader('X-Backend-Phase', target.phase);
+      const upstream = await fetch(target.url, {
         method,
         headers: {
           Accept: 'application/json',
           ...(method !== 'GET' && method !== 'HEAD' ? { 'Content-Type': 'application/json' } : {}),
+          ...target.headers,
         },
         body: method !== 'GET' && method !== 'HEAD' ? JSON.stringify(outgoingBody) : undefined,
       });
@@ -5267,10 +5464,10 @@ async function startServer() {
         }
       }
 
-      // Enforce row-level privacy isolation on GET collections for PATIENT and DOCTOR
-      if (upstream.ok && method === 'GET' && contentType.includes('json') && text) {
+      // Enforce row-level privacy isolation & normalize OIC/ORDS collection payloads on GET
+      if (upstream.ok && method === 'GET' && text.trim()) {
         try {
-          const parsed = JSON.parse(text) as { items?: unknown[] };
+          const parsed = normalizeBackendPayload(JSON.parse(text)) as { items?: unknown[] };
           if (Array.isArray(parsed.items)) {
             if (subPath === 'patients' && user.role === 'PATIENT') {
               parsed.items = attachRegionsToPatients(
@@ -5339,6 +5536,8 @@ async function startServer() {
             res.status(upstream.status).json(parsed);
             return;
           }
+          res.status(upstream.status).json(parsed);
+          return;
         } catch {
           // Fall through to raw upstream response
         }

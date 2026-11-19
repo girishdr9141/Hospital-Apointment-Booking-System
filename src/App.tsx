@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, Bell, CalendarPlus, CheckCheck, ChevronRight, ClipboardCheck } from 'lucide-react';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { ToastProvider, useToast } from './context/ToastContext';
@@ -108,6 +108,7 @@ function PortalContent() {
   const [outcomeCheckNow, setOutcomeCheckNow] = useState<number>(() => Date.now());
   const [notifications, setNotifications] = useState<PortalNotification[]>([]);
   const [quickGenerating, setQuickGenerating] = useState(false);
+  const [backendEpoch, setBackendEpoch] = useState(0);
 
   useEffect(() => {
     const onHashChange = () => {
@@ -582,6 +583,10 @@ function PortalContent() {
       onNotificationClick={handleNotificationClick}
       onMarkNotificationRead={handleMarkNotificationRead}
       onDismissAllNotifications={handleDismissAllNotifications}
+      onBackendChanged={() => {
+        setBackendEpoch((prev) => prev + 1);
+        void loadDashboard();
+      }}
     >
       {/* Persistent banner across all Doctor pages when finished appointments await Completed / No-Show */}
       {user.role === 'DOCTOR' && pendingOutcomeAppointments.length > 0 && (
@@ -630,7 +635,7 @@ function PortalContent() {
         </div>
       )}
 
-      {renderActiveRoute()}
+      <Fragment key={backendEpoch}>{renderActiveRoute()}</Fragment>
 
       {/* One-time First-Login Shift Registration Modal for Doctors */}
       {user.role === 'DOCTOR' && (
