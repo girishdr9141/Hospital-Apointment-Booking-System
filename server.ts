@@ -4421,7 +4421,60 @@ async function startServer() {
     });
     res.json({ status: 'success', message: 'Prescription deleted.' });
   });
+  // ============================================================================
+  // ORDS <-> OIC BACKEND TOGGLE (demo: Departments list)
+  // ============================================================================
+  const OIC_BASE_URL = (process.env.OIC_BASE_URL || '').replace(/\/+$/, '');
+  const OIC_USERNAME = process.env.OIC_USERNAME || '';
+  const OIC_PASSWORD = process.env.OIC_PASSWORD || '';
+  const oicConfigured = Boolean(OIC_BASE_URL && OIC_USERNAME && OIC_PASSWORD);
+  let backendMode: 'ords' | 'oic' = 'ords';
 
+  app.get('/api/backend-mode', requireAuth, (_req, res) => {
+    res.json({ mode: backendMode, oic_configured: oicConfigured });
+  });
+
+  app.post('/api/backend-mode', requireAuth, (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+      res.status(403).json({ status: 'error', message: 'Only administrators can switch the backend.' });
+      return;
+    }
+    const requested = String(req.body?.mode || '').toLowerCase();
+    if (requested !== 'ords' && requested !== 'oic') {
+      res.status(400).json({ status: 'error', message: 'mode must be "ords" or "oic".' });
+      return;
+    }
+    if (requested === 'oic' && !oicConfigured) {
+      res.status(400).json({ status: 'error', message: 'OIC is not configured. Check OIC_* values in .env.' });
+      return;
+    }
+    backendMode = requested;
+    res.json({ status: 'success', mode: backendMode });
+  });
+
+  app.get(['/api/ords/departments', '/api/ords/departments/'], requireAuth, async (_req, res, next) => {
+    if (backendMode !== 'oic') {
+      res.setHeader('X-Backend', 'ords');
+      next();
+      return;
+    }
+    try {
+      const auth = Buffer.from(`${OIC_USERNAME}:${OIC_PASSWORD}`).toString('base64');
+      const response = await fetch(`${OIC_BASE_URL}/departments`, {
+        headers: { Accept: 'application/json', Authorization: `Basic ${auth}` },
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        res.status(response.status).json({ status: 'error', message: `OIC returned HTTP ${response.status}` });
+        return;
+      }
+      res.setHeader('X-Backend', 'oic');
+      res.json(JSON.parse(text));
+    } catch (err) {
+      res.status(502).json({ status: 'error', message: `OIC call failed: ${(err as Error).message}` });
+    }
+  });
   // ============================================================================
   // GENERIC AUTHENTICATED ORDS BFF PROXY WITH DENY-BY-DEFAULT MODULE:ACTION RBAC
   // ============================================================================

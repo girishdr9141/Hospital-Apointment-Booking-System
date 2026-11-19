@@ -240,7 +240,14 @@ export const apiClient = {
       body: JSON.stringify(payload),
     });
   },
-
+  // Backend toggle (ORDS <-> OIC)
+  getBackendMode: () =>
+    requestJson<{ mode: 'ords' | 'oic'; oic_configured: boolean }>('/api/backend-mode'),
+  setBackendMode: (mode: 'ords' | 'oic') =>
+    requestJson<{ status: string; mode: 'ords' | 'oic' }>('/api/backend-mode', {
+      method: 'POST',
+      body: JSON.stringify({ mode }),
+    }),
   // Departments
   getDepartments: () => fetchCollection<Department>('departments/'),
   getDepartmentById: async (id: number) => {

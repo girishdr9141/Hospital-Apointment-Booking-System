@@ -1,5 +1,67 @@
 [
   {
+    "id": "AUD-1794983345631-98",
+    "timestamp": "2026-11-18T06:29:05.631Z",
+    "actor_user_id": 9001,
+    "actor_name": "Karan Tulsani",
+    "actor_role": "SUPER_ADMIN",
+    "target_label": "karan.tulsani@hospital.com",
+    "action": "LOGIN_SUCCESS",
+    "category": "AUTH",
+    "details": "Signed in via system portal.",
+    "severity": "info"
+  },
+  {
+    "id": "AUD-1794915326152-541",
+    "timestamp": "2026-11-17T11:35:26.152Z",
+    "actor_user_id": 66,
+    "actor_name": "Dr. Rohit Ramachandra",
+    "actor_role": "DOCTOR",
+    "target_label": "APT6060D1F7CAB1074AE",
+    "action": "APPOINTMENT_COMPLETED",
+    "category": "CLINICAL",
+    "previous_value": "CONFIRMED",
+    "new_value": "COMPLETED",
+    "details": "Dr. Rohit Ramachandra marked appointment APT6060D1F7CAB1074AE (Nagarathna C) as COMPLETED.",
+    "severity": "info"
+  },
+  {
+    "id": "AUD-1794915317192-494",
+    "timestamp": "2026-11-17T11:35:17.192Z",
+    "actor_user_id": 66,
+    "actor_name": "Dr. Rohit Ramachandra",
+    "actor_role": "DOCTOR",
+    "target_label": "rohit.ramachandra@hospital.com",
+    "action": "LOGIN_SUCCESS",
+    "category": "AUTH",
+    "details": "Signed in via ords portal.",
+    "severity": "info"
+  },
+  {
+    "id": "AUD-1794915291092-672",
+    "timestamp": "2026-11-17T11:34:51.092Z",
+    "actor_user_id": 9001,
+    "actor_name": "Karan Tulsani",
+    "actor_role": "SUPER_ADMIN",
+    "target_label": "karan.tulsani@hospital.com",
+    "action": "LOGOUT",
+    "category": "AUTH",
+    "details": "User signed out cleanly.",
+    "severity": "info"
+  },
+  {
+    "id": "AUD-1794915169507-781",
+    "timestamp": "2026-11-17T11:32:49.507Z",
+    "actor_user_id": 9001,
+    "actor_name": "Karan Tulsani",
+    "actor_role": "SUPER_ADMIN",
+    "target_label": "karan.tulsani@hospital.com",
+    "action": "LOGIN_SUCCESS",
+    "category": "AUTH",
+    "details": "Signed in via system portal.",
+    "severity": "info"
+  },
+  {
     "id": "AUD-1794908513488-208",
     "timestamp": "2026-11-17T09:41:53.488Z",
     "actor_user_id": 21,
