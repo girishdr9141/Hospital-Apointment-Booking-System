@@ -344,7 +344,7 @@ export function isSlotFutureOrActive(
   return (
     slot.status === 'AVAILABLE' &&
     slot.booked_patients < 1_000_000 &&
-    !isSlotStartExpired(slot.slot_date, slot.start_time, now, timeZone)
+    !isSlotEndExpired(slot.slot_date, slot.start_time, slot.end_time, now, timeZone)
   );
 }
 
@@ -400,7 +400,7 @@ export function filterBookableSlots(
     (s) =>
       s.status === 'AVAILABLE' &&
       s.booked_patients < s.max_patients_per_slot &&
-      !isSlotStartExpired(s.slot_date, s.start_time, now, timeZone),
+      !isSlotEndExpired(s.slot_date, s.start_time, s.end_time, now, timeZone),
   );
 }
 

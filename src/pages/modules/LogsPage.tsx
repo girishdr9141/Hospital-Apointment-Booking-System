@@ -23,6 +23,7 @@ const AUDIT_CATEGORIES: Array<'ALL' | RbacAuditLogEntry['category']> = [
   'PERMISSION',
   'SECURITY',
   'CLINICAL',
+  'BILLING',
 ];
 
 export function LogsPage({ mode }: LogsPageProps) {

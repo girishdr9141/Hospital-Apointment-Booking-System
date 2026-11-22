@@ -154,6 +154,19 @@ export interface Appointment {
   department_id?: number | null;
   department_name?: string | null;
   consultation_fee?: number | null;
+  payment_status?: 'UNPAID' | 'SUCCESS' | 'REFUND_PENDING' | 'REFUNDED' | 'NO_REFUND' | null;
+  paid_amount?: number | null;
+  payment_ref?: string | null;
+  payment_method?: string | null;
+  paid_at?: string | null;
+  cancelled_at?: string | null;
+  refund_status?: 'REFUND_PENDING' | 'REFUNDED' | 'NO_REFUND' | null;
+  refund_due_at?: string | null;
+  refund_completed_at?: string | null;
+  refund_amount?: number | null;
+  refund_percentage?: number | null;
+  refund_rule_name?: string | null;
+  cancellation_fee?: number | null;
 }
 
 export interface Payment {
@@ -163,8 +176,17 @@ export interface Payment {
   payment_ref: string;
   amount: number;
   payment_method?: string | null;
-  status: 'SUCCESS' | 'FAILED' | 'REFUNDED';
+  status: 'SUCCESS' | 'FAILED' | 'REFUND_PENDING' | 'REFUNDED';
   created_on: string;
+  paid_amount?: number | null;
+  refund_status?: 'REFUND_PENDING' | 'REFUNDED' | 'NO_REFUND' | null;
+  refund_due_at?: string | null;
+  refund_completed_at?: string | null;
+  refund_amount?: number | null;
+  refund_percentage?: number | null;
+  refund_rule_name?: string | null;
+  cancellation_fee?: number | null;
+  cancelled_at?: string | null;
 }
 
 export interface TokenQueueItem {
@@ -293,7 +315,7 @@ export interface RbacAuditLogEntry {
   target_user_id?: number | null;
   target_label?: string | null;
   action: string;
-  category: 'USER' | 'ROLE' | 'PERMISSION' | 'AUTH' | 'SECURITY' | 'CLINICAL';
+  category: 'USER' | 'ROLE' | 'PERMISSION' | 'AUTH' | 'SECURITY' | 'CLINICAL' | 'BILLING';
   previous_value?: string | null;
   new_value?: string | null;
   details: string;

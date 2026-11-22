@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Download, Plus } from 'lucide-react';
 import type { Appointment, Payment } from '../../types/opd';
 import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient';
@@ -7,6 +7,7 @@ import { useToast } from '../../context/ToastContext';
 import { hasModulePermission } from '../../utils/permissions';
 import { buildCsvString, downloadCsvFile } from '../../utils/csv';
 import { formatCurrencyInr, formatDisplayDateTime } from '../../utils/rules';
+import { formatRefundRemaining, isRefundCompletionDue } from '../../utils/refunds';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
@@ -29,6 +30,8 @@ export function PaymentsPage() {
   const [method, setMethod] = useState('UPI');
   const [status, setStatus] = useState<'SUCCESS' | 'FAILED' | 'REFUNDED'>('SUCCESS');
   const [saving, setSaving] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const autoRefundRefreshedRef = useRef<Set<number>>(new Set());
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -54,6 +57,25 @@ export function PaymentsPage() {
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  useEffect(() => {
+    if (!payments.some((p) => p.status === 'REFUND_PENDING' || p.refund_status === 'REFUND_PENDING')) {
+      return;
+    }
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [payments]);
+
+  useEffect(() => {
+    const due = payments.filter(
+      (p) =>
+        isRefundCompletionDue(p.refund_status || p.status, p.refund_due_at, nowMs) &&
+        !autoRefundRefreshedRef.current.has(p.payment_id),
+    );
+    if (due.length === 0) return;
+    for (const p of due) autoRefundRefreshedRef.current.add(p.payment_id);
+    void loadData();
+  }, [payments, nowMs, loadData]);
 
   const handleRecord = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -132,8 +154,28 @@ export function PaymentsPage() {
     },
     {
       key: 'status',
-      header: 'Status',
-      render: (row) => <StatusIndicator status={row.status} />,
+      header: 'Status & Refund Policy',
+      render: (row) => (
+        <div className="space-y-1">
+          <StatusIndicator status={row.status} />
+          {(row.status === 'REFUND_PENDING' || row.refund_status === 'REFUND_PENDING') && (
+            <p className="text-[11px] font-medium text-amber-700">
+              It will refund within 2 hours
+              {row.refund_due_at ? ` · ${formatRefundRemaining(row.refund_due_at, nowMs)} left` : ''}
+              {row.refund_amount != null
+                ? ` · ${formatCurrencyInr(row.refund_amount)} (${row.refund_percentage ?? 0}%${row.refund_rule_name ? ` · ${row.refund_rule_name}` : ''})`
+                : ''}
+            </p>
+          )}
+          {row.status === 'REFUNDED' && (
+            <p className="text-[11px] font-medium text-emerald-700">
+              {row.refund_amount != null
+                ? `Refunded ${formatCurrencyInr(row.refund_amount)} (${row.refund_percentage ?? 100}%${row.refund_rule_name ? ` · ${row.refund_rule_name}` : ''})`
+                : 'Refund completed'}
+            </p>
+          )}
+        </div>
+      ),
     },
     {
       key: 'created',
@@ -210,8 +252,9 @@ export function PaymentsPage() {
           >
             <option value="ALL">All Statuses</option>
             <option value="SUCCESS">Success</option>
-            <option value="FAILED">Failed</option>
+            <option value="REFUND_PENDING">Will Refund Within 2 Hours</option>
             <option value="REFUNDED">Refunded</option>
+            <option value="FAILED">Failed</option>
           </select>
         }
         emptyTitle="No payment records yet"

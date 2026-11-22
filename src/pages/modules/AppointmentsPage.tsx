@@ -16,11 +16,20 @@ import {
   isAppointmentHoldExpired,
 } from '../../utils/rules';
 import { getAppointmentsAwaitingOutcome, isSlotEndExpired } from '../../utils/calendar';
+import {
+  evaluateCancellationRefund,
+  formatRefundRemaining,
+  isRefundCompletionDue,
+} from '../../utils/refunds';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
 import { ConfirmDialog } from '../../components/layout/ConfirmDialog';
 import { StatusIndicator, ConsultationModeBadge } from '../../components/layout/StatusIndicator';
 import { PatientBookingCalendar } from '../../components/calendar/PatientBookingCalendar';
+import {
+  AppointmentPaymentModal,
+  type PaymentModalAppointmentDetails,
+} from '../../components/modals/AppointmentPaymentModal';
 
 interface AppointmentsPageProps {
   mode?: 'list' | 'book' | 'history';
@@ -54,14 +63,23 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
   // Action Confirmation Dialog
   const [pendingAction, setPendingAction] = useState<{
     appointment: Appointment;
-    type: 'confirm' | 'cancel' | 'COMPLETED' | 'NO_SHOW';
+    type: 'cancel' | 'COMPLETED' | 'NO_SHOW';
   } | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
+  const [paymentTarget, setPaymentTarget] = useState<PaymentModalAppointmentDetails | null>(null);
+  const [paymentBusy, setPaymentBusy] = useState(false);
   const autoExpiredTriggeredRef = useRef<Set<number>>(new Set());
+  const autoRefundTriggeredRef = useRef<Set<number>>(new Set());
 
-  // Refresh hold countdown tick every second when any appointment is HELD
+  // Refresh countdown tick every second when any appointment is HELD or REFUND_PENDING
   useEffect(() => {
-    if (!appointments.some((a) => a.status === 'HELD')) return;
+    if (
+      !appointments.some(
+        (a) => a.status === 'HELD' || a.refund_status === 'REFUND_PENDING',
+      )
+    ) {
+      return;
+    }
     const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [appointments]);
@@ -105,29 +123,88 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
     loadData();
   }, [loadData]);
 
-  // Automatically release expired holds & refresh slots/appointments as soon as countdown hits 00:00
+  // Automatically release expired holds & complete due 2-hour refunds on countdown tick
   useEffect(() => {
     const newlyExpired = appointments.filter(
       (a) => isAppointmentHoldExpired(a, nowMs) && !autoExpiredTriggeredRef.current.has(a.appointment_id),
     );
-    if (newlyExpired.length === 0) return;
+    const newlyDueRefunds = appointments.filter(
+      (a) =>
+        isRefundCompletionDue(a.refund_status, a.refund_due_at, nowMs) &&
+        !autoRefundTriggeredRef.current.has(a.appointment_id),
+    );
+    if (newlyExpired.length === 0 && newlyDueRefunds.length === 0) return;
     for (const appt of newlyExpired) {
       autoExpiredTriggeredRef.current.add(appt.appointment_id);
     }
+    for (const appt of newlyDueRefunds) {
+      autoRefundTriggeredRef.current.add(appt.appointment_id);
+    }
     void loadData();
   }, [appointments, nowMs, loadData]);
+
+  const handleOpenConfirmPaymentModal = (appt: Appointment) => {
+    const doc = doctors.find((d) => d.doctor_id === appt.doctor_id);
+    const fee = Number(appt.consultation_fee ?? doc?.consultation_fee ?? 0);
+    setPaymentTarget({
+      appointment_id: appt.appointment_id,
+      appointment_ref: appt.appointment_ref,
+      doctor_name:
+        appt.doctor_name ||
+        (doc ? `Dr. ${doc.first_name} ${doc.last_name}` : `Slot #${appt.slot_id}`),
+      department_name: appt.department_name || 'OPD',
+      patient_name: appt.patient_name,
+      slot_date: appt.slot_date,
+      start_time: appt.start_time,
+      end_time: appt.end_time,
+      consultation_mode: appt.consultation_mode,
+      consultation_fee: fee,
+    });
+  };
+
+  const handlePayAndConfirmAppointment = async (
+    paymentMethod: 'UPI' | 'CARD' | 'NET_BANKING' | 'CASH',
+  ) => {
+    if (!paymentTarget) return;
+    setPaymentBusy(true);
+    try {
+      const res = await apiClient.payAndConfirmAppointment(paymentTarget.appointment_id, {
+        payment_method: paymentMethod,
+      });
+      notify(
+        `Paid ${formatCurrencyInr(paymentTarget.consultation_fee)} (${res.payment_ref || paymentMethod}) · Appointment ${paymentTarget.appointment_ref} confirmed!`,
+        'success',
+      );
+      setPaymentTarget(null);
+      await loadData();
+      await onDataChanged?.();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Payment or confirmation failed', 'error');
+    } finally {
+      setPaymentBusy(false);
+    }
+  };
 
   const executeAppointmentAction = async () => {
     if (!pendingAction) return;
     setActionBusy(true);
     try {
       const { appointment, type } = pendingAction;
-      if (type === 'confirm') {
-        await apiClient.confirmAppointment(appointment.appointment_id);
-        notify(`Appointment ${appointment.appointment_ref} confirmed`, 'success');
-      } else if (type === 'cancel') {
-        await apiClient.cancelAppointment(appointment.appointment_id);
-        notify(`Appointment ${appointment.appointment_ref} cancelled and slot freed`, 'success');
+      if (type === 'cancel') {
+        const res = await apiClient.cancelAppointment(appointment.appointment_id);
+        if (res.refund?.applicable && res.refund.refund_status === 'REFUND_PENDING') {
+          notify(
+            `Appointment ${appointment.appointment_ref} cancelled & slot freed. Refund of ${formatCurrencyInr(res.refund.refund_amount)} (${res.refund.refund_percentage}% · ${res.refund.refund_rule_name}) will be completed within 2 hours.`,
+            'success',
+          );
+        } else if (res.refund?.applicable && res.refund.refund_status === 'NO_REFUND') {
+          notify(
+            `Appointment ${appointment.appointment_ref} cancelled & slot freed. Per ${res.refund.refund_rule_name}, 0% refund applies.`,
+            'info',
+          );
+        } else {
+          notify(`Appointment ${appointment.appointment_ref} cancelled and slot freed`, 'success');
+        }
       } else {
         await apiClient.updateAppointmentOutcome(appointment.appointment_id, type);
         notify(`Appointment marked ${type}`, 'success');
@@ -263,7 +340,31 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
     {
       key: 'status',
       header: 'Status',
-      render: (row) => <StatusIndicator status={row.status} />,
+      render: (row) => (
+        <div className="space-y-1">
+          <StatusIndicator status={row.status} />
+          {row.status === 'CANCELLED' && row.refund_status === 'REFUND_PENDING' && (
+            <p className="text-[11px] font-medium text-amber-700">
+              Will refund within 2 hours
+              {row.refund_due_at ? ` (${formatRefundRemaining(row.refund_due_at, nowMs)} left)` : ''}
+              {row.refund_amount != null
+                ? ` · ${formatCurrencyInr(row.refund_amount)} (${row.refund_percentage ?? 0}%)`
+                : ''}
+            </p>
+          )}
+          {row.status === 'CANCELLED' && row.refund_status === 'REFUNDED' && (
+            <p className="text-[11px] font-medium text-emerald-700">
+              Refunded {formatCurrencyInr(row.refund_amount)} ({row.refund_percentage ?? 0}%
+              {row.refund_rule_name ? ` · ${row.refund_rule_name}` : ''})
+            </p>
+          )}
+          {row.status === 'CANCELLED' && row.refund_status === 'NO_REFUND' && (
+            <p className="text-[11px] text-slate-500">
+              No refund ({row.refund_rule_name || 'Cancellation rule'})
+            </p>
+          )}
+        </div>
+      ),
     },
     {
       key: 'actions',
@@ -274,11 +375,11 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
           {row.status === 'HELD' && !isAppointmentHoldExpired(row, nowMs) && canConfirm && (
             <button
               type="button"
-              onClick={() => setPendingAction({ appointment: row, type: 'confirm' })}
+              onClick={() => handleOpenConfirmPaymentModal(row)}
               className="inline-flex items-center gap-1 rounded-md border border-emerald-200 bg-white px-2 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-50"
             >
               <Check className="h-3 w-3" aria-hidden="true" />
-              <span>Confirm</span>
+              <span>Confirm &amp; Pay</span>
             </button>
           )}
           {['HELD', 'CONFIRMED'].includes(row.status) && canCancel && (
@@ -546,32 +647,50 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
       <ConfirmDialog
         open={Boolean(pendingAction)}
         title={
-          pendingAction?.type === 'confirm'
-            ? 'Confirm held appointment?'
-            : pendingAction?.type === 'cancel'
-              ? 'Cancel appointment?'
-              : `Mark appointment ${pendingAction?.type}?`
+          pendingAction?.type === 'cancel'
+            ? 'Cancel appointment?'
+            : `Mark appointment ${pendingAction?.type}?`
         }
         description={
           pendingAction
-            ? pendingAction.type === 'cancel' && cancellationRules.length > 0
-              ? `Ref ${pendingAction.appointment.appointment_ref} for ${pendingAction.appointment.patient_name}. Policy: ${cancellationRules.map((r) => `${r.rule_name} (${r.refund_percentage}% refund)`).join(' · ')}.`
-              : pendingAction.type === 'COMPLETED' || pendingAction.type === 'NO_SHOW'
-                ? `Ref ${pendingAction.appointment.appointment_ref} for ${pendingAction.appointment.patient_name}. Note: Oracle only allows ${pendingAction.type} after the slot end time has passed.`
-                : `Ref ${pendingAction.appointment.appointment_ref} for ${pendingAction.appointment.patient_name}.`
+            ? pendingAction.type === 'cancel'
+              ? (() => {
+                  const appt = pendingAction.appointment;
+                  const paidAmt = Number(appt.paid_amount || 0);
+                  if (paidAmt > 0) {
+                    const preview = evaluateCancellationRefund({
+                      rules: cancellationRules,
+                      slotDate: appt.slot_date,
+                      startTime: appt.start_time,
+                      paidAmount: paidAmt,
+                    });
+                    if (preview.refund_status === 'REFUND_PENDING') {
+                      return `Ref ${appt.appointment_ref} for ${appt.patient_name}. Paid ${formatCurrencyInr(paidAmt)}. Applicable rule "${preview.rule_name}" grants ${preview.refund_percentage}% refund (${formatCurrencyInr(preview.refund_amount)}). Status will show "Will refund within 2 hours" and complete automatically in 2 hours. The slot will be released immediately for other patients.`;
+                    }
+                    return `Ref ${appt.appointment_ref} for ${appt.patient_name}. Paid ${formatCurrencyInr(paidAmt)}. Applicable rule "${preview.rule_name}" grants 0% refund. The slot will be released immediately for other patients.`;
+                  }
+                  return `Ref ${appt.appointment_ref} for ${appt.patient_name}. Cancelling releases the slot immediately for other patients to book.${cancellationRules.length > 0 ? ` Refund rules: ${cancellationRules.map((r) => `${r.rule_name} (${r.refund_percentage}%)`).join(' · ')}.` : ''}`;
+                })()
+              : `Ref ${pendingAction.appointment.appointment_ref} for ${pendingAction.appointment.patient_name}. Note: Oracle only allows ${pendingAction.type} after the slot end time has passed.`
             : ''
         }
         confirmLabel={
           pendingAction?.type === 'cancel'
             ? 'Cancel Appointment'
-            : pendingAction?.type === 'confirm'
-              ? 'Confirm Appointment'
-              : 'Confirm Action'
+            : 'Confirm Action'
         }
         tone={pendingAction?.type === 'cancel' ? 'danger' : 'primary'}
         busy={actionBusy}
         onConfirm={executeAppointmentAction}
         onCancel={() => setPendingAction(null)}
+      />
+
+      <AppointmentPaymentModal
+        open={Boolean(paymentTarget)}
+        appointment={paymentTarget}
+        onPayAndConfirm={handlePayAndConfirmAppointment}
+        onClose={() => setPaymentTarget(null)}
+        busy={paymentBusy}
       />
     </div>
   );

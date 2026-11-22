@@ -5,6 +5,7 @@ import {
   buildWorkingHourWindows,
   computeShiftSession,
   doesSessionCrossMidnight,
+  filterBookableSlots,
   formatMinutesToHHMM,
   formatShiftSummary,
   getAppointmentsAwaitingOutcome,
@@ -276,4 +277,35 @@ test('getAppointmentsAwaitingOutcome selects only CONFIRMED appointments past sl
     [1, 6],
   );
 });
+
+test('13:00-13:20 slot remains bookable and re-bookable until 13:20 IST and expires only at 13:20', () => {
+  // 2026-11-22 13:10 IST = 2026-11-22 07:40 UTC
+  const at1310IST = new Date('2026-11-22T07:40:00.000Z');
+  // 2026-11-22 13:20 IST = 2026-11-22 07:50 UTC
+  const at1320IST = new Date('2026-11-22T07:50:00.000Z');
+
+  const middaySlot: Slot = {
+    slot_id: 901,
+    template_id: 1,
+    slot_date: '2026-11-22',
+    start_time: '13:00',
+    end_time: '13:20',
+    max_patients_per_slot: 1,
+    booked_patients: 0,
+    status: 'AVAILABLE',
+  };
+
+  assert.equal(isSlotEndExpired('2026-11-22', '13:00', '13:20', at1310IST, 'Asia/Kolkata'), false);
+  assert.equal(isSlotFutureOrActive(middaySlot, at1310IST, 'Asia/Kolkata'), true);
+  assert.deepEqual(
+    filterBookableSlots([middaySlot], at1310IST, 'Asia/Kolkata').map((s) => s.slot_id),
+    [901],
+  );
+
+  // At 13:20 IST (end_time reached), slot expires and is no longer bookable
+  assert.equal(isSlotEndExpired('2026-11-22', '13:00', '13:20', at1320IST, 'Asia/Kolkata'), true);
+  assert.equal(isSlotFutureOrActive(middaySlot, at1320IST, 'Asia/Kolkata'), false);
+  assert.deepEqual(filterBookableSlots([middaySlot], at1320IST, 'Asia/Kolkata'), []);
+});
+
 

@@ -139,9 +139,22 @@ export interface RegisterPatientInput {
 export interface OrdsActionResponse {
   status: string;
   message?: string;
+  appointment_id?: number | null;
   appointment_ref?: string;
+  appointment_status?: string;
+  hold_expires_at?: string | null;
   consultation_mode?: ConsultationMode;
   expired_count?: number;
+  payment_ref?: string;
+  amount?: number;
+  refund?: {
+    applicable?: boolean;
+    refund_status?: 'REFUND_PENDING' | 'REFUNDED' | 'NO_REFUND' | null;
+    refund_amount?: number;
+    refund_percentage?: number;
+    refund_rule_name?: string;
+    refund_due_at?: string | null;
+  } | null;
 }
 
 export const apiClient = {
@@ -499,6 +512,14 @@ export const apiClient = {
       method: 'POST',
       body: JSON.stringify({}),
     }),
+  payAndConfirmAppointment: (
+    appointmentId: number,
+    payload: { payment_method: 'UPI' | 'CARD' | 'NET_BANKING' | 'CASH'; amount?: number },
+  ) =>
+    requestJson<OrdsActionResponse>(`/api/appointments/${appointmentId}/pay-and-confirm`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   cancelAppointment: (appointmentId: number) =>
     requestJson<OrdsActionResponse>(`/api/ords/appointments/${appointmentId}/cancel`, {
       method: 'POST',
@@ -522,7 +543,7 @@ export const apiClient = {
     appointment_id: number;
     amount: number;
     payment_method: string;
-    status: 'SUCCESS' | 'FAILED' | 'REFUNDED';
+    status: 'SUCCESS' | 'FAILED' | 'REFUNDED' | 'REFUND_PENDING';
   }) =>
     requestJson<OrdsActionResponse>('/api/ords/payments', {
       method: 'POST',

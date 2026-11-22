@@ -22,7 +22,6 @@ import {
   getWeekdayName,
   isDateCoveredByApprovedLeave,
   isSlotEndExpired,
-  isSlotStartExpired,
   isValidSlotTimeRange,
   mergeDayWorkingSlots,
   type DayWorkingSlotItem,
@@ -104,9 +103,7 @@ export function DoctorSlotCalendar({
       const d = getIsoDatePart(s.slot_date);
       if (!d) continue;
       const isBooked = s.booked_patients > 0 || s.status === 'SOLD_OUT';
-      const isExpired = isBooked
-        ? isSlotEndExpired(d, s.start_time, s.end_time)
-        : isSlotStartExpired(d, s.start_time);
+      const isExpired = isSlotEndExpired(d, s.start_time, s.end_time);
       if (isExpired) continue;
       const cur = map.get(d) || { total: 0, available: 0, booked: 0 };
       cur.total += 1;
@@ -148,7 +145,7 @@ export function DoctorSlotCalendar({
         const targetDate = item.slot_date || selectedDate;
         return (
           item.status === 'UNCONFIRMED' &&
-          !isSlotStartExpired(targetDate, item.start_time) &&
+          !isSlotEndExpired(targetDate, item.start_time, item.end_time) &&
           !isDateCoveredByApprovedLeave(targetDate, leaves, doctorId)
         );
       }),
@@ -160,7 +157,7 @@ export function DoctorSlotCalendar({
       open: daySlotItems.filter(
         (i) =>
           i.status === 'AVAILABLE' &&
-          !isSlotStartExpired(i.slot_date || selectedDate, i.start_time),
+          !isSlotEndExpired(i.slot_date || selectedDate, i.start_time, i.end_time),
       ).length,
       booked: daySlotItems.filter(
         (i) =>
@@ -190,10 +187,10 @@ export function DoctorSlotCalendar({
       );
       return;
     }
-    if (isSlotStartExpired(targetDate, item.start_time)) {
+    if (isSlotEndExpired(targetDate, item.start_time, item.end_time)) {
       const nowParts = getHospitalNowParts();
       notify(
-        `Cannot generate expired slot starting at ${item.start_time} (current hospital time ${nowParts.timeHHMM} IST).`,
+        `Cannot generate expired slot ending at ${item.end_time} (current hospital time ${nowParts.timeHHMM} IST).`,
         'error',
       );
       return;
@@ -303,16 +300,16 @@ export function DoctorSlotCalendar({
   const handleAddCustomSlot = async (e: React.FormEvent) => {
     e.preventDefault();
     if (readOnly || selectedDateIsPast || selectedDateOnLeave) return;
-    if (isSlotStartExpired(selectedDate, customStart)) {
-      const nowParts = getHospitalNowParts();
-      notify(
-        `Cannot generate a slot at ${customStart} on ${selectedDate}: start time must be after ${nowParts.timeHHMM} IST.`,
-        'error',
-      );
-      return;
-    }
     if (!customStart || !customEnd || !isValidSlotTimeRange(customStart, customEnd)) {
       notify('Custom slot end time must be after start time (midnight rollover supported)', 'error');
+      return;
+    }
+    if (isSlotEndExpired(selectedDate, customStart, customEnd)) {
+      const nowParts = getHospitalNowParts();
+      notify(
+        `Cannot generate a slot ending at ${customEnd} on ${selectedDate}: end time must be after ${nowParts.timeHHMM} IST.`,
+        'error',
+      );
       return;
     }
     setSubmitting(true);
@@ -589,7 +586,7 @@ export function DoctorSlotCalendar({
                     !isNextDay && doesSessionCrossMidnight(item.start_time, item.end_time);
 
                   if (item.status === 'UNCONFIRMED') {
-                    const expiredNow = isSlotStartExpired(itemDate, item.start_time);
+                    const expiredNow = isSlotEndExpired(itemDate, item.start_time, item.end_time);
                     const leaveOnTarget = isDateCoveredByApprovedLeave(itemDate, leaves, doctorId);
                     if (readOnly || expiredNow || leaveOnTarget) {
                       return (

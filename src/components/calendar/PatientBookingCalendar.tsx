@@ -16,9 +16,13 @@ import { useToast } from '../../context/ToastContext';
 import {
   getHospitalNowParts,
   getMonthGridDates,
-  isSlotStartExpired,
+  isSlotEndExpired,
 } from '../../utils/calendar';
 import { formatCurrencyInr, formatDisplayDate, getIsoDatePart } from '../../utils/rules';
+import {
+  AppointmentPaymentModal,
+  type PaymentModalAppointmentDetails,
+} from '../modals/AppointmentPaymentModal';
 
 interface PatientBookingCalendarProps {
   slots: Slot[];
@@ -80,6 +84,8 @@ export function PatientBookingCalendar({
     isPatientRole ? 'ONLINE' : 'WALK_IN',
   );
   const [bookingBusy, setBookingBusy] = useState(false);
+  const [pendingPayment, setPendingPayment] = useState<PaymentModalAppointmentDetails | null>(null);
+  const [paymentBusy, setPaymentBusy] = useState(false);
 
   useEffect(() => {
     if (patients[0] && !selectedPatientId) {
@@ -103,8 +109,8 @@ export function PatientBookingCalendar({
       .filter((s) => {
         if (s.status !== 'AVAILABLE' || s.booked_patients >= s.max_patients_per_slot) return false;
         const dStr = getIsoDatePart(s.slot_date);
-        if (!dStr || dStr < todayIso) return false;
-        if (isSlotStartExpired(dStr, s.start_time)) return false;
+        if (!dStr) return false;
+        if (isSlotEndExpired(dStr, s.start_time, s.end_time)) return false;
         if (selectedDoctorId !== 'ALL') {
           return String(s.doctor_id || '') === selectedDoctorId;
         }
@@ -118,7 +124,7 @@ export function PatientBookingCalendar({
         if (dCmp !== 0) return dCmp;
         return (a.start_time || '').localeCompare(b.start_time || '');
       });
-  }, [slots, filteredDoctors, selectedDoctorId, selectedDeptId, todayIso]);
+  }, [slots, filteredDoctors, selectedDoctorId, selectedDeptId]);
 
   const availableCountByDate = useMemo(() => {
     const map = new Map<string, number>();
@@ -167,8 +173,8 @@ export function PatientBookingCalendar({
     if (!selectedSlot) return;
     setBookingError(null);
 
-    if (isSlotStartExpired(selectedSlot.slot_date, selectedSlot.start_time)) {
-      const msg = 'Selected slot time has already passed. Available slots have been refreshed.';
+    if (isSlotEndExpired(selectedSlot.slot_date, selectedSlot.start_time, selectedSlot.end_time)) {
+      const msg = 'Selected slot end time has already passed. Available slots have been refreshed.';
       setBookingError(msg);
       notify(msg, 'error');
       setSelectedSlot(null);
@@ -197,14 +203,40 @@ export function PatientBookingCalendar({
         booking_source: isPatientRole ? 'ONLINE' : bookingSource,
         consultation_mode: consultationMode,
       });
-      notify(
-        `Appointment booked successfully (${res.appointment_ref || 'Ref generated'}) · ${consultationMode === 'ONLINE' ? 'Online Consultation' : 'Face-to-Face'}`,
-        'success',
-      );
-      setSelectedSlot(null);
-      setConsultationMode('');
-      setBookingError(null);
-      await onBooked();
+
+      const doc = selectedSlot.doctor_id ? doctorById.get(selectedSlot.doctor_id) : undefined;
+      const patientObj = patients.find((p) => p.patient_id === patientIdToUse);
+      const fee = Number(doc?.consultation_fee ?? 0);
+
+      if (res.appointment_id && res.appointment_id > 0) {
+        setPendingPayment({
+          appointment_id: res.appointment_id,
+          appointment_ref: res.appointment_ref || `APT#${res.appointment_id}`,
+          doctor_name:
+            selectedSlot.doctor_name ||
+            (doc ? `Dr. ${doc.first_name} ${doc.last_name}` : `Doctor #${selectedSlot.doctor_id || ''}`),
+          department_name: selectedSlot.department_name || 'OPD',
+          patient_name: patientObj ? `${patientObj.first_name} ${patientObj.last_name}` : undefined,
+          slot_date: selectedSlot.slot_date,
+          start_time: selectedSlot.start_time,
+          end_time: selectedSlot.end_time,
+          consultation_mode: consultationMode,
+          consultation_fee: fee,
+        });
+        setSelectedSlot(null);
+        setConsultationMode('');
+        setBookingError(null);
+        await onRefreshSlots?.();
+      } else {
+        notify(
+          `Appointment booked successfully (${res.appointment_ref || 'Ref generated'}) · ${consultationMode === 'ONLINE' ? 'Online Consultation' : 'Face-to-Face'}`,
+          'success',
+        );
+        setSelectedSlot(null);
+        setConsultationMode('');
+        setBookingError(null);
+        await onBooked();
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unable to book appointment';
       setBookingError(msg);
@@ -214,6 +246,36 @@ export function PatientBookingCalendar({
     } finally {
       setBookingBusy(false);
     }
+  };
+
+  const handlePayAndConfirm = async (paymentMethod: 'UPI' | 'CARD' | 'NET_BANKING' | 'CASH') => {
+    if (!pendingPayment) return;
+    setPaymentBusy(true);
+    try {
+      const res = await apiClient.payAndConfirmAppointment(pendingPayment.appointment_id, {
+        payment_method: paymentMethod,
+      });
+      notify(
+        `Payment ${formatCurrencyInr(pendingPayment.consultation_fee)} (${res.payment_ref || paymentMethod}) succeeded — slot ${pendingPayment.appointment_ref} is now booked & confirmed!`,
+        'success',
+      );
+      setPendingPayment(null);
+      await onBooked();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to complete payment', 'error');
+    } finally {
+      setPaymentBusy(false);
+    }
+  };
+
+  const handlePayLater = async () => {
+    if (!pendingPayment) return;
+    notify(
+      `Booking ${pendingPayment.appointment_ref} placed on 10-minute hold. Pay consultation fee from My Appointments to confirm.`,
+      'info',
+    );
+    setPendingPayment(null);
+    await onBooked();
   };
 
   return (
@@ -622,6 +684,16 @@ export function PatientBookingCalendar({
           </div>
         </section>
       </div>
+
+      <AppointmentPaymentModal
+        open={Boolean(pendingPayment)}
+        appointment={pendingPayment}
+        onPayAndConfirm={handlePayAndConfirm}
+        allowPayLater={isPatientRole || bookingSource === 'ONLINE'}
+        onPayLater={() => void handlePayLater()}
+        onClose={() => void handlePayLater()}
+        busy={paymentBusy}
+      />
     </div>
   );
 }

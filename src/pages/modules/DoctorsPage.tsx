@@ -7,7 +7,7 @@ import { useToast } from '../../context/ToastContext';
 import { hasModulePermission } from '../../utils/permissions';
 import { buildCsvString, downloadCsvFile } from '../../utils/csv';
 import { enrichAppointments, enrichSlots, formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
-import { formatShiftSummary, isSlotEndExpired, isSlotStartExpired } from '../../utils/calendar';
+import { formatShiftSummary, isSlotEndExpired } from '../../utils/calendar';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
 import { ConfirmDialog } from '../../components/layout/ConfirmDialog';
@@ -215,11 +215,7 @@ export function DoctorsPage() {
       inspectDoctor
         ? slots.filter((s) => {
             if (s.doctor_id !== inspectDoctor.doctor_id || s.status === 'CANCELLED') return false;
-            const isBooked = s.booked_patients > 0 || s.status === 'SOLD_OUT';
-            if (isBooked) {
-              return !isSlotEndExpired(s.slot_date, s.start_time, s.end_time);
-            }
-            return !isSlotStartExpired(s.slot_date, s.start_time);
+            return !isSlotEndExpired(s.slot_date, s.start_time, s.end_time);
           })
         : [],
     [inspectDoctor, slots],
@@ -581,7 +577,7 @@ export function DoctorsPage() {
             (s) =>
               s.status === 'AVAILABLE' &&
               s.booked_patients < s.max_patients_per_slot &&
-              !isSlotStartExpired(s.slot_date, s.start_time),
+              !isSlotEndExpired(s.slot_date, s.start_time, s.end_time),
           ).length;
           const bookedCount = inspectDoctorSlots.filter(
             (s) =>

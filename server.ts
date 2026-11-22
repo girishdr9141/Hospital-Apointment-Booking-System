@@ -11,6 +11,7 @@ import type {
   AnalyticsVisitRecord,
   Appointment,
   AuthUser,
+  CancellationRule,
   ConsultationMode,
   DashboardSummaryResponse,
   Department,
@@ -78,10 +79,14 @@ import {
   isAppointmentTimeReached,
   isDateCoveredByApprovedLeave,
   isSlotEndExpired,
-  isSlotStartExpired,
   isValidSlotTimeRange,
   validateShiftSessions,
 } from './src/utils/calendar.ts';
+import {
+  evaluateCancellationRefund,
+  isRefundCompletionDue,
+  type RefundLifecycleStatus,
+} from './src/utils/refunds.ts';
 import {
   DEFAULT_SEEDED_PATIENT_REGIONS,
   normalizeRegionText,
@@ -539,6 +544,19 @@ interface AppointmentMetadataEntry {
   recorded_outcome?: 'COMPLETED' | 'NO_SHOW' | null;
   outcome_recorded_at?: string | null;
   outcome_recorded_by?: string | null;
+  payment_status?: 'UNPAID' | 'SUCCESS' | 'REFUND_PENDING' | 'REFUNDED' | 'NO_REFUND' | null;
+  paid_amount?: number | null;
+  payment_ref?: string | null;
+  payment_method?: string | null;
+  paid_at?: string | null;
+  cancelled_at?: string | null;
+  refund_status?: RefundLifecycleStatus | null;
+  refund_due_at?: string | null;
+  refund_completed_at?: string | null;
+  refund_amount?: number | null;
+  refund_percentage?: number | null;
+  refund_rule_name?: string | null;
+  cancellation_fee?: number | null;
   updated_at: string;
 }
 
@@ -556,14 +574,139 @@ function readAppointmentMetadata(): Record<string, AppointmentMetadataEntry> {
 
 function saveAppointmentMetadata(entry: AppointmentMetadataEntry): void {
   const store = readAppointmentMetadata();
-  if (entry.appointment_id && entry.appointment_id > 0) {
-    store[`id:${entry.appointment_id}`] = entry;
+  const existing =
+    (entry.appointment_id && entry.appointment_id > 0 ? store[`id:${entry.appointment_id}`] : undefined) ||
+    (entry.appointment_ref ? store[`ref:${entry.appointment_ref}`] : undefined);
+  const merged: AppointmentMetadataEntry = {
+    ...(existing || {}),
+    ...entry,
+    updated_at: entry.updated_at || new Date().toISOString(),
+  };
+  if (merged.appointment_id && merged.appointment_id > 0) {
+    store[`id:${merged.appointment_id}`] = merged;
   }
-  if (entry.appointment_ref) {
-    store[`ref:${entry.appointment_ref}`] = entry;
+  if (merged.appointment_ref) {
+    store[`ref:${merged.appointment_ref}`] = merged;
   }
   fs.mkdirSync(SHIFT_STORE_DIR, { recursive: true });
   fs.writeFileSync(APPT_METADATA_PATH, JSON.stringify(store, null, 2), 'utf8');
+}
+
+function syncDueRefunds(nowMs = Date.now()): boolean {
+  const store = readAppointmentMetadata();
+  let changed = false;
+  const completedKeys = new Set<string>();
+
+  for (const [key, entry] of Object.entries(store)) {
+    if (!entry || entry.refund_status !== 'REFUND_PENDING') continue;
+    if (!isRefundCompletionDue(entry.refund_status, entry.refund_due_at, nowMs)) continue;
+
+    const completedAt = entry.refund_due_at || new Date(nowMs).toISOString();
+    const updated: AppointmentMetadataEntry = {
+      ...entry,
+      refund_status: 'REFUNDED',
+      payment_status: 'REFUNDED',
+      refund_completed_at: completedAt,
+      updated_at: new Date(nowMs).toISOString(),
+    };
+    store[key] = updated;
+    if (updated.appointment_id && updated.appointment_id > 0) {
+      store[`id:${updated.appointment_id}`] = updated;
+    }
+    if (updated.appointment_ref) {
+      store[`ref:${updated.appointment_ref}`] = updated;
+    }
+    changed = true;
+
+    const dedupeId = updated.appointment_ref || String(updated.appointment_id || key);
+    if (!completedKeys.has(dedupeId)) {
+      completedKeys.add(dedupeId);
+      recordRbacAuditLog({
+        actor_user_id: 0,
+        actor_name: 'Refund Scheduler',
+        actor_role: 'SUPER_ADMIN',
+        target_label: dedupeId,
+        action: 'REFUND_COMPLETED',
+        category: 'BILLING',
+        previous_value: 'REFUND_PENDING',
+        new_value: 'REFUNDED',
+        details: `Completed 2-hour rule-based refund of ₹${Number(updated.refund_amount || 0).toFixed(2)} (${updated.refund_percentage ?? 0}% via ${updated.refund_rule_name || 'Cancellation Rule'}) for ${dedupeId}.`,
+        severity: 'info',
+      });
+    }
+  }
+
+  if (changed) {
+    fs.mkdirSync(SHIFT_STORE_DIR, { recursive: true });
+    fs.writeFileSync(APPT_METADATA_PATH, JSON.stringify(store, null, 2), 'utf8');
+  }
+  return changed;
+}
+
+function attachRefundsToPayments(payments: Payment[]): Payment[] {
+  syncDueRefunds();
+  const meta = readAppointmentMetadata();
+  return payments.map((p) => {
+    const metaEntry =
+      meta[`id:${p.appointment_id}`] ||
+      (p.appointment_ref ? meta[`ref:${p.appointment_ref}`] : undefined);
+    if (!metaEntry || !metaEntry.refund_status) return p;
+
+    if (p.status === 'FAILED') return p;
+    const paidAmt = Number(metaEntry.paid_amount ?? p.amount ?? 0);
+    if (metaEntry.refund_status === 'REFUND_PENDING') {
+      return {
+        ...p,
+        status: 'REFUND_PENDING',
+        paid_amount: paidAmt,
+        refund_status: 'REFUND_PENDING',
+        refund_due_at: metaEntry.refund_due_at ?? null,
+        refund_completed_at: null,
+        refund_amount: metaEntry.refund_amount ?? 0,
+        refund_percentage: metaEntry.refund_percentage ?? 0,
+        refund_rule_name: metaEntry.refund_rule_name ?? null,
+        cancellation_fee: metaEntry.cancellation_fee ?? 0,
+        cancelled_at: metaEntry.cancelled_at ?? null,
+      };
+    }
+    if (metaEntry.refund_status === 'REFUNDED') {
+      return {
+        ...p,
+        status: 'REFUNDED',
+        paid_amount: paidAmt,
+        refund_status: 'REFUNDED',
+        refund_due_at: metaEntry.refund_due_at ?? null,
+        refund_completed_at: metaEntry.refund_completed_at ?? null,
+        refund_amount: metaEntry.refund_amount ?? paidAmt,
+        refund_percentage: metaEntry.refund_percentage ?? 100,
+        refund_rule_name: metaEntry.refund_rule_name ?? null,
+        cancellation_fee: metaEntry.cancellation_fee ?? 0,
+        cancelled_at: metaEntry.cancelled_at ?? null,
+      };
+    }
+    return {
+      ...p,
+      paid_amount: paidAmt,
+      refund_status: 'NO_REFUND',
+      refund_amount: 0,
+      refund_percentage: metaEntry.refund_percentage ?? 0,
+      refund_rule_name: metaEntry.refund_rule_name ?? null,
+      cancellation_fee: metaEntry.cancellation_fee ?? 0,
+      cancelled_at: metaEntry.cancelled_at ?? null,
+    };
+  });
+}
+
+function getEffectiveCollectedPaymentAmount(p: Payment): number {
+  if (p.status === 'SUCCESS' || p.status === 'REFUND_PENDING') {
+    return Number(p.amount || 0);
+  }
+  if (p.status === 'REFUNDED') {
+    const gross = Number(p.paid_amount ?? p.amount ?? 0);
+    const refunded = Number(p.refund_amount ?? gross);
+    return Math.max(0, Math.round((gross - refunded) * 100) / 100);
+  }
+  return 0;
 }
 
 function recordAppointmentOutcomeOverlay(
@@ -599,11 +742,22 @@ function normalizeConsultationModeInput(value: unknown): ConsultationMode | null
   return null;
 }
 
-function attachConsultationMode(appointments: Appointment[]): Appointment[] {
+function attachConsultationMode(
+  appointments: Appointment[],
+  payments: Payment[] = [],
+): Appointment[] {
+  syncDueRefunds();
   const meta = readAppointmentMetadata();
+  const payByApptId = new Map<number, Payment>();
+  for (const p of payments) {
+    if (p.status === 'SUCCESS' || p.status === 'REFUND_PENDING' || p.status === 'REFUNDED') {
+      payByApptId.set(p.appointment_id, p);
+    }
+  }
   return appointments.map((a) => {
     const directMode = normalizeConsultationModeInput(a.consultation_mode);
     const metaEntry = meta[`id:${a.appointment_id}`] || (a.appointment_ref ? meta[`ref:${a.appointment_ref}`] : undefined);
+    const matchedPay = payByApptId.get(a.appointment_id);
     const mode: ConsultationMode = directMode || metaEntry?.consultation_mode || 'FACE_TO_FACE';
     const rescheduledFrom = a.rescheduled_from_id ?? metaEntry?.rescheduled_from_id ?? null;
     const effectiveStatus =
@@ -611,11 +765,34 @@ function attachConsultationMode(appointments: Appointment[]): Appointment[] {
       (metaEntry?.recorded_outcome === 'COMPLETED' || metaEntry?.recorded_outcome === 'NO_SHOW')
         ? metaEntry.recorded_outcome
         : a.status;
+    const paidAmount =
+      metaEntry?.paid_amount ?? (matchedPay ? Number(matchedPay.amount || 0) : null);
+    const paymentStatus =
+      metaEntry?.refund_status ||
+      metaEntry?.payment_status ||
+      (matchedPay
+        ? matchedPay.status === 'FAILED'
+          ? 'UNPAID'
+          : matchedPay.status
+        : 'UNPAID');
     return {
       ...a,
       status: effectiveStatus,
       consultation_mode: mode,
       rescheduled_from_id: rescheduledFrom,
+      payment_status: paymentStatus,
+      paid_amount: paidAmount,
+      payment_ref: metaEntry?.payment_ref ?? matchedPay?.payment_ref ?? null,
+      payment_method: metaEntry?.payment_method ?? matchedPay?.payment_method ?? null,
+      paid_at: metaEntry?.paid_at ?? matchedPay?.created_on ?? null,
+      cancelled_at: metaEntry?.cancelled_at ?? null,
+      refund_status: metaEntry?.refund_status ?? null,
+      refund_due_at: metaEntry?.refund_due_at ?? null,
+      refund_completed_at: metaEntry?.refund_completed_at ?? null,
+      refund_amount: metaEntry?.refund_amount ?? null,
+      refund_percentage: metaEntry?.refund_percentage ?? null,
+      refund_rule_name: metaEntry?.refund_rule_name ?? null,
+      cancellation_fee: metaEntry?.cancellation_fee ?? null,
     };
   });
 }
@@ -1950,12 +2127,13 @@ async function startServer() {
       const departmentsForJoin = [...departments, ...extraDepts];
 
       const shiftStore = readShiftStore();
+      const paymentsWithRefunds = attachRefundsToPayments(payments);
       const confirmedRawSlots = filterConfirmedSlots(rawSlots, templates, shiftStore);
       const rawSlotsWithDoctors = attachDoctorIdsToSlots(rawSlots, templates, shiftStore);
       const fullSlotsForApptJoin = enrichSlots(rawSlotsWithDoctors, templates, doctors, departmentsForJoin);
       const enrichedSlots = enrichSlots(confirmedRawSlots, templates, doctors, departmentsForJoin);
       const enrichedAppointments = enrichAppointments(
-        attachConsultationMode(rawAppointments),
+        attachConsultationMode(rawAppointments, paymentsWithRefunds),
         fullSlotsForApptJoin,
         doctors,
       );
@@ -1964,7 +2142,7 @@ async function startServer() {
       let scopedAppointments = enrichedAppointments;
       let scopedSlots = enrichedSlots;
       let scopedPayments = hasEffectivePermission(user.permissions, user.role, 'PAYMENTS:VIEW')
-        ? payments
+        ? paymentsWithRefunds
         : [];
       let scopedTokens = tokenQueue;
       let scopedUtilisation = utilisation;
@@ -2049,7 +2227,7 @@ async function startServer() {
             getIsoDatePart(s.slot_date) >= todayIso &&
             s.status === 'AVAILABLE' &&
             s.doctor_name &&
-            !isSlotStartExpired(s.slot_date, s.start_time, new Date(), HOSPITAL_TIMEZONE),
+            !isSlotEndExpired(s.slot_date, s.start_time, s.end_time, new Date(), HOSPITAL_TIMEZONE),
         );
         const fallbackUpcoming = enrichedSlots.filter(
           (s) =>
@@ -2114,12 +2292,13 @@ async function startServer() {
           available_slots_today: referenceSlots.filter(
             (s) =>
               s.status === 'AVAILABLE' &&
-              !isSlotStartExpired(s.slot_date, s.start_time, new Date(), HOSPITAL_TIMEZONE),
+              !isSlotEndExpired(s.slot_date, s.start_time, s.end_time, new Date(), HOSPITAL_TIMEZONE),
           ).length,
           total_slots_today: referenceSlots.length,
-          total_payments_amount: scopedPayments
-            .filter((p) => p.status === 'SUCCESS')
-            .reduce((sum, p) => sum + Number(p.amount || 0), 0),
+          total_payments_amount: scopedPayments.reduce(
+            (sum, p) => sum + getEffectiveCollectedPaymentAmount(p),
+            0,
+          ),
           payments_count: scopedPayments.length,
           waiting_tokens: scopedTokens.filter((t) => t.status === 'WAITING').length,
           in_consultation_tokens: scopedTokens.filter((t) => t.status === 'IN_CONSULTATION').length,
@@ -2225,9 +2404,10 @@ async function startServer() {
       const deptNameMap = new Map<number, string>(
         allDepartments.map((d) => [d.department_id, d.department_name]),
       );
+      const paymentsWithRefunds = attachRefundsToPayments(payments);
       const paymentByApptId = new Map<number, Payment>();
-      for (const p of payments) {
-        if (p.status === 'SUCCESS') {
+      for (const p of paymentsWithRefunds) {
+        if (p.status === 'SUCCESS' || p.status === 'REFUND_PENDING' || p.status === 'REFUNDED') {
           paymentByApptId.set(p.appointment_id, p);
         }
       }
@@ -2909,10 +3089,10 @@ async function startServer() {
         res.status(400).json({ status: 'error', message: `Cannot generate slots for past date ${s.slot_date}` });
         return;
       }
-      if (isSlotStartExpired(s.slot_date, s.start_time, now, HOSPITAL_TIMEZONE)) {
+      if (isSlotEndExpired(s.slot_date, s.start_time, s.end_time, now, HOSPITAL_TIMEZONE)) {
         res.status(400).json({
           status: 'error',
-          message: `Cannot generate slot starting at ${s.start_time} on ${s.slot_date}: start time must be after current hospital time (${nowParts.timeHHMM} ${HOSPITAL_TIMEZONE}).`,
+          message: `Cannot generate slot ending at ${s.end_time} on ${s.slot_date}: end time must be after current hospital time (${nowParts.timeHHMM} ${HOSPITAL_TIMEZONE}).`,
         });
         return;
       }
@@ -3087,7 +3267,7 @@ async function startServer() {
       const windows = allWindows.filter((w) => {
         const wDate = w.slot_date || targetDate;
         return (
-          !isSlotStartExpired(wDate, w.start_time, now, HOSPITAL_TIMEZONE) &&
+          !isSlotEndExpired(wDate, w.start_time, w.end_time, now, HOSPITAL_TIMEZONE) &&
           !isDateCoveredByApprovedLeave(wDate, leaves, targetDoctorId)
         );
       });
@@ -3173,6 +3353,181 @@ async function startServer() {
       res.status(400).json({
         status: 'error',
         message: err instanceof Error ? err.message : 'Unable to confirm day slots',
+      });
+    }
+  });
+
+  // Pay concerned doctor fee & confirm/finalize appointment booking
+  app.post('/api/appointments/:id/pay-and-confirm', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    const apptId = Number(req.params.id);
+    if (!apptId || Number.isNaN(apptId)) {
+      res.status(400).json({ status: 'error', message: 'Invalid appointment ID.' });
+      return;
+    }
+
+    const allowedPerms =
+      user.role === 'PATIENT'
+        ? ['APPOINTMENTS:UPDATE', 'APPOINTMENTS:CREATE']
+        : ['APPOINTMENTS:UPDATE'];
+    if (!requireAnyPermission(user, res, allowedPerms, `Pay & Confirm Appointment #${apptId}`)) {
+      return;
+    }
+
+    const rawMethod = String(req.body?.payment_method || 'UPI').trim().toUpperCase();
+    const paymentMethod = ['UPI', 'CARD', 'NET_BANKING', 'CASH'].includes(rawMethod)
+      ? rawMethod
+      : 'UPI';
+
+    try {
+      await ensureOverdueHoldsExpired();
+      const [rawAppts, rawSlots, templates, doctors, departments, existingPayments] =
+        await Promise.all([
+          fetchOrdsItems<Appointment>('appointments'),
+          fetchOrdsItems<Slot>('slots'),
+          fetchOrdsItems<SlotTemplate>('slot_templates'),
+          fetchOrdsItems<Doctor>('doctors'),
+          fetchOrdsItems<Department>('departments/'),
+          fetchOrdsItems<Payment>('payments').catch(() => [] as Payment[]),
+        ]);
+
+      const shiftStore = readShiftStore();
+      const slotsWithDoc = attachDoctorIdsToSlots(rawSlots, templates, shiftStore);
+      const fullSlots = enrichSlots(slotsWithDoc, templates, doctors, departments);
+      const enrichedAppts = enrichAppointments(
+        attachConsultationMode(rawAppts, existingPayments),
+        fullSlots,
+        doctors,
+      );
+
+      const targetAppt = enrichedAppts.find((a) => a.appointment_id === apptId);
+      if (!targetAppt) {
+        res.status(404).json({ status: 'error', message: 'Appointment not found.' });
+        return;
+      }
+      if (user.role === 'PATIENT' && targetAppt.patient_id !== user.patient_id) {
+        res.status(403).json({
+          status: 'error',
+          message: 'Patients can only pay for and confirm their own appointments.',
+        });
+        return;
+      }
+      if (targetAppt.status === 'CANCELLED') {
+        res.status(400).json({
+          status: 'error',
+          message: 'Cancelled appointments cannot be paid or confirmed.',
+        });
+        return;
+      }
+      if (isAppointmentHoldExpired(targetAppt)) {
+        await ensureOverdueHoldsExpired({ force: true });
+        res.status(409).json({
+          status: 'error',
+          code: 'HOLD_EXPIRED',
+          message:
+            'This 10-minute booking hold has expired and the slot has been released. Please book a new slot.',
+        });
+        return;
+      }
+
+      const doctorFee = Math.max(
+        0,
+        Number(targetAppt.consultation_fee ?? req.body?.amount ?? 0),
+      );
+      const alreadyPaid = existingPayments.find(
+        (p) => p.appointment_id === apptId && p.status === 'SUCCESS',
+      );
+
+      let paymentRef = alreadyPaid?.payment_ref || '';
+      if (!alreadyPaid) {
+        const payRes = await fetchOrdsJson<{
+          status?: string;
+          message?: string;
+          payment_ref?: string;
+        }>('payments', {
+          method: 'POST',
+          body: JSON.stringify({
+            appointment_id: apptId,
+            amount: doctorFee,
+            payment_method: paymentMethod,
+            status: 'SUCCESS',
+          }),
+        });
+        if (payRes.status === 'error') {
+          res.status(400).json({
+            status: 'error',
+            message: payRes.message || 'Unable to record consultation fee payment.',
+          });
+          return;
+        }
+        paymentRef = payRes.payment_ref || `PAY${Date.now()}`;
+      }
+
+      // Ensure HELD appointment transitions to CONFIRMED even if upstream payment handler does not auto-confirm
+      const refreshedAppts = await fetchOrdsItems<Appointment>('appointments').catch(
+        () => [] as Appointment[],
+      );
+      const latestTarget = refreshedAppts.find((a) => a.appointment_id === apptId);
+      if (latestTarget && latestTarget.status === 'HELD') {
+        const confirmRes = await fetchOrdsJson<{ status?: string; message?: string }>(
+          `appointments/${apptId}/confirm`,
+          {
+            method: 'POST',
+            body: JSON.stringify({}),
+          },
+        );
+        if (confirmRes.status === 'error') {
+          res.status(400).json({
+            status: 'error',
+            message: confirmRes.message || 'Payment recorded, but appointment confirmation failed.',
+          });
+          return;
+        }
+      }
+
+      const paidAt = new Date().toISOString();
+      saveAppointmentMetadata({
+        consultation_mode: targetAppt.consultation_mode || 'FACE_TO_FACE',
+        rescheduled_from_id: targetAppt.rescheduled_from_id ?? null,
+        appointment_ref: targetAppt.appointment_ref,
+        appointment_id: apptId,
+        patient_id: targetAppt.patient_id,
+        slot_id: targetAppt.slot_id,
+        payment_status: 'SUCCESS',
+        paid_amount: doctorFee,
+        payment_ref: paymentRef,
+        payment_method: paymentMethod,
+        paid_at: paidAt,
+        updated_at: paidAt,
+      });
+
+      recordRbacAuditLog({
+        actor_user_id: user.user_id,
+        actor_name: user.full_name,
+        actor_role: user.role,
+        target_label: targetAppt.appointment_ref,
+        action: 'APPOINTMENT_PAID_AND_CONFIRMED',
+        category: 'BILLING',
+        previous_value: targetAppt.status,
+        new_value: 'CONFIRMED',
+        details: `${user.full_name} paid ₹${doctorFee.toFixed(2)} via ${paymentMethod} (${paymentRef}) and confirmed appointment ${targetAppt.appointment_ref}.`,
+        severity: 'info',
+      });
+
+      res.json({
+        status: 'success',
+        appointment_id: apptId,
+        appointment_ref: targetAppt.appointment_ref,
+        appointment_status: 'CONFIRMED',
+        payment_ref: paymentRef,
+        amount: doctorFee,
+        payment_method: paymentMethod,
+        message: `Payment of ₹${doctorFee.toFixed(2)} recorded and booking confirmed.`,
+      });
+    } catch (err) {
+      res.status(502).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to process payment and confirm booking',
       });
     }
   });
@@ -4820,11 +5175,11 @@ async function startServer() {
             });
             return;
           }
-          if (isSlotStartExpired(slotDate, startTime, new Date(), HOSPITAL_TIMEZONE)) {
+          if (isSlotEndExpired(slotDate, startTime, endTime, new Date(), HOSPITAL_TIMEZONE)) {
             const nowParts = getHospitalNowParts(new Date(), HOSPITAL_TIMEZONE);
             res.status(400).json({
               status: 'error',
-              message: `Cannot generate expired slot starting at ${startTime} on ${slotDate} (current time: ${nowParts.timeHHMM} ${HOSPITAL_TIMEZONE}).`,
+              message: `Cannot generate expired slot ending at ${endTime || startTime} on ${slotDate} (current time: ${nowParts.timeHHMM} ${HOSPITAL_TIMEZONE}).`,
             });
             return;
           }
@@ -4937,6 +5292,21 @@ async function startServer() {
         )
       ) {
         return;
+      }
+    } else if (subPath.startsWith('cancellation-rules')) {
+      if (method === 'GET') {
+        if (
+          !requireAnyPermission(
+            user,
+            res,
+            ['APPOINTMENTS:VIEW', 'APPOINTMENTS:CREATE', 'PAYMENTS:VIEW', 'SYSTEM_SETTINGS:VIEW'],
+            `ORDS ${subPath}`,
+          )
+        ) {
+          return;
+        }
+      } else {
+        if (!enforceModulePerm('SYSTEM_SETTINGS', actionForMethod(method), `ORDS ${subPath}`)) return;
       }
     } else {
       // Strict deny-by-default for any unmapped ORDS endpoint unless SUPER_ADMIN
@@ -5055,11 +5425,11 @@ async function startServer() {
         return;
       }
 
-      if (isSlotStartExpired(targetSlot.slot_date, targetSlot.start_time, new Date(), HOSPITAL_TIMEZONE)) {
+      if (isSlotEndExpired(targetSlot.slot_date, targetSlot.start_time, targetSlot.end_time, new Date(), HOSPITAL_TIMEZONE)) {
         res.status(400).json({
           status: 'error',
           code: 'SLOT_EXPIRED',
-          message: 'Selected slot time has already passed. Available slots have been refreshed.',
+          message: 'Selected slot end time has already passed. Available slots have been refreshed.',
         });
         return;
       }
@@ -5116,12 +5486,28 @@ async function startServer() {
       };
     }
 
+    let pendingCancelContext: {
+      appointment: Appointment;
+      slot: Slot | null;
+      paid_amount: number;
+      payment_ref: string | null;
+      payment_method: string | null;
+      cancellation_rules: CancellationRule[];
+    } | null = null;
+
     if (/^appointments\/\d+\/(confirm|cancel)$/.test(subPath) && method === 'POST') {
       const isConfirmAction = subPath.endsWith('/confirm');
+      const isCancelAction = subPath.endsWith('/cancel');
       const apptId = Number(subPath.split('/')[1]);
-      if (user.role === 'PATIENT' || isConfirmAction) {
-        const appts = await fetchOrdsItems<Appointment>('appointments');
-        const target = appts.find((a) => a.appointment_id === apptId);
+      if (user.role === 'PATIENT' || isConfirmAction || isCancelAction) {
+        const [appts, rawSlots, templates, payments, rules] = await Promise.all([
+          fetchOrdsItems<Appointment>('appointments'),
+          isCancelAction ? fetchOrdsItems<Slot>('slots').catch(() => [] as Slot[]) : Promise.resolve([] as Slot[]),
+          isCancelAction ? fetchOrdsItems<SlotTemplate>('slot_templates').catch(() => [] as SlotTemplate[]) : Promise.resolve([] as SlotTemplate[]),
+          isCancelAction ? fetchOrdsItems<Payment>('payments').catch(() => [] as Payment[]) : Promise.resolve([] as Payment[]),
+          isCancelAction ? fetchOrdsItems<CancellationRule>('cancellation-rules').catch(() => [] as CancellationRule[]) : Promise.resolve([] as CancellationRule[]),
+        ]);
+        const target = attachConsultationMode(appts, payments).find((a) => a.appointment_id === apptId);
         if (user.role === 'PATIENT' && (!target || target.patient_id !== user.patient_id)) {
           res.status(403).json({ status: 'error', message: 'Patients can only manage their own appointments' });
           return;
@@ -5134,6 +5520,25 @@ async function startServer() {
             message: 'This 10-minute booking hold has expired and the slot has been released. Please book a new slot.',
           });
           return;
+        }
+        if (isCancelAction && target) {
+          const shiftStore = readShiftStore();
+          const slotsWithDoc = attachDoctorIdsToSlots(rawSlots, templates, shiftStore);
+          const matchedSlot = slotsWithDoc.find((s) => s.slot_id === target.slot_id) || null;
+          const successPay = payments.find(
+            (p) => p.appointment_id === apptId && p.status === 'SUCCESS',
+          );
+          const paidAmount = Number(
+            target.paid_amount ?? (successPay ? Number(successPay.amount || 0) : 0),
+          );
+          pendingCancelContext = {
+            appointment: target,
+            slot: matchedSlot,
+            paid_amount: paidAmount,
+            payment_ref: target.payment_ref ?? successPay?.payment_ref ?? null,
+            payment_method: target.payment_method ?? successPay?.payment_method ?? null,
+            cancellation_rules: rules,
+          };
         }
       }
     }
@@ -5335,12 +5740,147 @@ async function startServer() {
 
             res.status(upstream.status).json({
               ...parsedBody,
+              appointment_id: matchedCreated?.appointment_id ?? null,
+              appointment_status: matchedCreated?.status ?? null,
+              hold_expires_at: matchedCreated?.hold_expires_at ?? null,
               consultation_mode: pendingBookingInfo.consultation_mode,
             });
             return;
           }
         } catch {
           // Fall through to raw ORDS response if parsing fails
+        }
+      }
+
+      if (upstream.ok && pendingCancelContext) {
+        try {
+          const parsedBody = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+          if (parsedBody?.status !== 'error') {
+            // 1. Ensure cancelled slot remains in opened_slot_keys so other patients can re-book it until end_time
+            const cancelledSlot = pendingCancelContext.slot;
+            if (
+              cancelledSlot &&
+              cancelledSlot.doctor_id &&
+              !isSlotEndExpired(
+                cancelledSlot.slot_date,
+                cancelledSlot.start_time,
+                cancelledSlot.end_time,
+                new Date(),
+                HOSPITAL_TIMEZONE,
+              )
+            ) {
+              const store = readShiftStore();
+              const reopenedKey = makeSlotKey(
+                cancelledSlot.doctor_id,
+                cancelledSlot.slot_date,
+                cancelledSlot.start_time,
+              );
+              if (!store.opened_slot_keys.includes(reopenedKey)) {
+                store.opened_slot_keys.push(reopenedKey);
+                writeShiftStore(store);
+              }
+            }
+
+            // 2. Evaluate cancellation rule refund & 2-hour refund window if payment existed
+            let refundPayload: Record<string, unknown> | null = null;
+            if (pendingCancelContext.paid_amount > 0) {
+              const refundEval = evaluateCancellationRefund({
+                rules: pendingCancelContext.cancellation_rules,
+                slotDate: cancelledSlot?.slot_date ?? pendingCancelContext.appointment.slot_date,
+                startTime: cancelledSlot?.start_time ?? pendingCancelContext.appointment.start_time,
+                paidAmount: pendingCancelContext.paid_amount,
+                timeZone: HOSPITAL_TIMEZONE,
+              });
+              saveAppointmentMetadata({
+                consultation_mode:
+                  normalizeConsultationModeInput(pendingCancelContext.appointment.consultation_mode) ||
+                  'FACE_TO_FACE',
+                rescheduled_from_id: pendingCancelContext.appointment.rescheduled_from_id ?? null,
+                appointment_ref: pendingCancelContext.appointment.appointment_ref,
+                appointment_id: pendingCancelContext.appointment.appointment_id,
+                patient_id: pendingCancelContext.appointment.patient_id,
+                slot_id: pendingCancelContext.appointment.slot_id,
+                paid_amount: pendingCancelContext.paid_amount,
+                payment_ref: pendingCancelContext.payment_ref,
+                payment_method: pendingCancelContext.payment_method,
+                payment_status: refundEval.refund_status || 'UNPAID',
+                cancelled_at: refundEval.cancelled_at,
+                refund_status: refundEval.refund_status,
+                refund_due_at: refundEval.refund_due_at,
+                refund_completed_at: null,
+                refund_amount: refundEval.refund_amount,
+                refund_percentage: refundEval.refund_percentage,
+                refund_rule_name: refundEval.rule_name,
+                cancellation_fee: refundEval.cancellation_fee,
+                updated_at: refundEval.cancelled_at,
+              });
+              recordRbacAuditLog({
+                actor_user_id: user.user_id,
+                actor_name: user.full_name,
+                actor_role: user.role,
+                target_label: pendingCancelContext.appointment.appointment_ref,
+                action: 'APPOINTMENT_CANCELLED_REFUND',
+                category: 'BILLING',
+                previous_value: pendingCancelContext.appointment.status,
+                new_value: refundEval.refund_status || 'CANCELLED',
+                details:
+                  refundEval.refund_status === 'REFUND_PENDING'
+                    ? `${user.full_name} cancelled ${pendingCancelContext.appointment.appointment_ref}; ₹${refundEval.refund_amount.toFixed(2)} (${refundEval.refund_percentage}% via ${refundEval.rule_name}) scheduled to refund within 2 hours.`
+                    : `${user.full_name} cancelled ${pendingCancelContext.appointment.appointment_ref}; 0% refund per ${refundEval.rule_name}.`,
+                severity: 'info',
+              });
+              refundPayload = {
+                applicable: refundEval.applicable,
+                refund_status: refundEval.refund_status,
+                refund_amount: refundEval.refund_amount,
+                refund_percentage: refundEval.refund_percentage,
+                refund_rule_name: refundEval.rule_name,
+                refund_due_at: refundEval.refund_due_at,
+              };
+            }
+
+            res.status(upstream.status).json({
+              ...parsedBody,
+              ...(refundPayload ? { refund: refundPayload } : {}),
+            });
+            return;
+          }
+        } catch {
+          // Fall through to raw ORDS response if parsing fails
+        }
+      }
+
+      if (upstream.ok && subPath === 'payments' && method === 'POST') {
+        try {
+          const parsedBody = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+          const reqPayStatus = String(outgoingBody?.status || 'SUCCESS').trim().toUpperCase();
+          const payApptId = Number(outgoingBody?.appointment_id);
+          const payAmt = Number(outgoingBody?.amount || 0);
+          const payMethod = String(outgoingBody?.payment_method || 'UPI').trim().toUpperCase();
+          if (parsedBody?.status !== 'error' && payApptId > 0 && reqPayStatus === 'SUCCESS') {
+            const appts = await fetchOrdsItems<Appointment>('appointments').catch(
+              () => [] as Appointment[],
+            );
+            const matched = appts.find((a) => a.appointment_id === payApptId);
+            saveAppointmentMetadata({
+              consultation_mode:
+                normalizeConsultationModeInput(matched?.consultation_mode) || 'FACE_TO_FACE',
+              rescheduled_from_id: matched?.rescheduled_from_id ?? null,
+              appointment_ref: matched?.appointment_ref ?? null,
+              appointment_id: payApptId,
+              patient_id: matched?.patient_id,
+              slot_id: matched?.slot_id,
+              payment_status: 'SUCCESS',
+              paid_amount: payAmt,
+              payment_ref:
+                typeof parsedBody?.payment_ref === 'string' ? parsedBody.payment_ref : null,
+              payment_method: payMethod,
+              paid_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            });
+          }
+        } catch {
+          // Non-fatal metadata sync
         }
       }
 
@@ -5490,7 +6030,8 @@ async function startServer() {
                 rawAppts = await fetchOrdsItems<Appointment>('appointments');
                 trackNextHoldExpiry(rawAppts);
               }
-              let appts = attachConsultationMode(rawAppts);
+              const rawPayments = await fetchOrdsItems<Payment>('payments').catch(() => [] as Payment[]);
+              let appts = attachConsultationMode(rawAppts, attachRefundsToPayments(rawPayments));
               if (user.role === 'PATIENT') {
                 appts = appts.filter((a) => a.patient_id === user.patient_id);
               } else if (user.role === 'DOCTOR') {
@@ -5509,12 +6050,16 @@ async function startServer() {
                 appts = appts.filter((a) => docSlotIds.has(a.slot_id));
               }
               parsed.items = appts;
-            } else if (subPath === 'payments' && user.role === 'PATIENT') {
-              const appts = await fetchOrdsItems<Appointment>('appointments');
-              const myApptIds = new Set(
-                appts.filter((a) => a.patient_id === user.patient_id).map((a) => a.appointment_id),
-              );
-              parsed.items = parsed.items.filter((p) => myApptIds.has((p as Payment).appointment_id));
+            } else if (subPath === 'payments') {
+              let paymentRows = attachRefundsToPayments(parsed.items as Payment[]);
+              if (user.role === 'PATIENT') {
+                const appts = await fetchOrdsItems<Appointment>('appointments');
+                const myApptIds = new Set(
+                  appts.filter((a) => a.patient_id === user.patient_id).map((a) => a.appointment_id),
+                );
+                paymentRows = paymentRows.filter((p) => myApptIds.has(p.appointment_id));
+              }
+              parsed.items = paymentRows;
             } else if (subPath === 'token_queue' && user.role === 'PATIENT') {
               const appts = await fetchOrdsItems<Appointment>('appointments');
               const myApptIds = new Set(
@@ -5569,6 +6114,7 @@ async function startServer() {
   }
 
   setInterval(() => {
+    syncDueRefunds();
     if (knownNextHoldExpiryMs !== null && Date.now() < knownNextHoldExpiryMs) return;
     void ensureOverdueHoldsExpired().catch(() => {});
   }, 15_000).unref();

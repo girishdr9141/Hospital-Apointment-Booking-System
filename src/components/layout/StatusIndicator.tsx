@@ -15,7 +15,8 @@ export function StatusIndicator({ status }: StatusIndicatorProps) {
     normalized === 'SUCCESS' ||
     normalized === 'APPROVED' ||
     normalized === 'DONE' ||
-    normalized === 'ACTIVE'
+    normalized === 'ACTIVE' ||
+    normalized === 'REFUNDED'
   ) {
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700 whitespace-nowrap">
@@ -30,12 +31,15 @@ export function StatusIndicator({ status }: StatusIndicatorProps) {
     normalized === 'PENDING' ||
     normalized === 'WAITING' ||
     normalized === 'IN_CONSULTATION' ||
-    normalized === 'SUBMITTED'
+    normalized === 'SUBMITTED' ||
+    normalized === 'REFUND_PENDING'
   ) {
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700 whitespace-nowrap">
         <Clock className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-        <span>{normalized.replaceAll('_', ' ')}</span>
+        <span>
+          {normalized === 'REFUND_PENDING' ? 'WILL REFUND IN 2H' : normalized.replaceAll('_', ' ')}
+        </span>
       </span>
     );
   }

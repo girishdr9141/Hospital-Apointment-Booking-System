@@ -18,7 +18,6 @@ import {
   formatShiftSummary,
   getTodayIsoLocal,
   isSlotEndExpired,
-  isSlotStartExpired,
 } from '../../utils/calendar';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 import { DoctorSlotCalendar } from '../../components/calendar/DoctorSlotCalendar';
@@ -136,7 +135,7 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
       } else if (
         s.status === 'AVAILABLE' &&
         s.booked_patients < s.max_patients_per_slot &&
-        !isSlotStartExpired(s.slot_date, s.start_time)
+        !isSlotEndExpired(s.slot_date, s.start_time, s.end_time)
       ) {
         cur.open += 1;
       }
@@ -179,7 +178,7 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
           if (isBooked) {
             return !isSlotEndExpired(s.slot_date, s.start_time, s.end_time);
           }
-          return !isSlotStartExpired(s.slot_date, s.start_time);
+          return !isSlotEndExpired(s.slot_date, s.start_time, s.end_time);
         })
         .sort((a, b) => {
           const dCmp = getIsoDatePart(a.slot_date).localeCompare(getIsoDatePart(b.slot_date));
@@ -195,7 +194,7 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
         (s) =>
           s.status === 'AVAILABLE' &&
           s.booked_patients < s.max_patients_per_slot &&
-          !isSlotStartExpired(s.slot_date, s.start_time),
+          !isSlotEndExpired(s.slot_date, s.start_time, s.end_time),
       ),
     [calendarSlots],
   );
