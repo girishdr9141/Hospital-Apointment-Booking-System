@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  canCancelAppointment,
+  canConfirmHeldAppointment,
   enrichAppointments,
   enrichSlots,
   formatCurrencyInr,
@@ -8,9 +10,11 @@ import {
   formatHoldRemaining,
   getNextHoldExpiryMs,
   isAppointmentHoldExpired,
+  isHoldExpired,
   normalizeOrdsError,
   paginateItems,
   sortSlotTemplates,
+  wasAppointmentHoldExpired,
 } from './rules';
 
 test('enrichSlots joins template, doctor, and department details', () => {
@@ -266,4 +270,29 @@ test('enrichSlots resolves doctor and department directly from slot.doctor_id wh
   assert.equal(slots[0].doctor_name, 'Dr. Priya Sharma');
   assert.equal(slots[0].department_id, 3);
   assert.equal(slots[0].department_name, 'Cardiology');
+});
+
+test('isHoldExpired, wasAppointmentHoldExpired, canConfirmHeldAppointment, and canCancelAppointment guard hold actions', () => {
+  const base = Date.parse('2026-11-13T10:00:00Z');
+  const activeHold = { status: 'HELD' as const, hold_expires_at: '2026-11-13T10:05:00Z' };
+  const overdueHold = { status: 'HELD' as const, hold_expires_at: '2026-11-13T09:59:59Z' };
+  const confirmed = { status: 'CONFIRMED' as const, hold_expires_at: null };
+  const expiredStatus = { status: 'EXPIRED' as const, hold_expires_at: null };
+
+  assert.equal(isHoldExpired(activeHold.hold_expires_at, base), false);
+  assert.equal(isHoldExpired(overdueHold.hold_expires_at, base), true);
+  assert.equal(isHoldExpired(null, base), false);
+
+  assert.equal(wasAppointmentHoldExpired(activeHold, base), false);
+  assert.equal(wasAppointmentHoldExpired(overdueHold, base), true);
+  assert.equal(wasAppointmentHoldExpired(expiredStatus, base), true);
+
+  assert.equal(canConfirmHeldAppointment(activeHold, base), true);
+  assert.equal(canConfirmHeldAppointment(overdueHold, base), false);
+  assert.equal(canConfirmHeldAppointment(confirmed, base), false);
+
+  assert.equal(canCancelAppointment(activeHold, base), true);
+  assert.equal(canCancelAppointment(overdueHold, base), false);
+  assert.equal(canCancelAppointment(confirmed, base), true);
+  assert.equal(canCancelAppointment(expiredStatus, base), false);
 });

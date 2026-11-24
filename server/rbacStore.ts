@@ -282,7 +282,7 @@ function ensureInitialAuditSeed(): void {
   fs.writeFileSync(RBAC_AUDIT_PATH, JSON.stringify(initialLogs, null, 2), 'utf8');
 }
 
-export function readRbacAuditLogs(limit = 500): RbacAuditLogEntry[] {
+export function readRbacAuditLogs(limit = 1000): RbacAuditLogEntry[] {
   ensureInitialAuditSeed();
   try {
     const raw = JSON.parse(fs.readFileSync(RBAC_AUDIT_PATH, 'utf8'));
@@ -296,13 +296,13 @@ export function readRbacAuditLogs(limit = 500): RbacAuditLogEntry[] {
 export function recordRbacAuditLog(
   entry: Omit<RbacAuditLogEntry, 'id' | 'timestamp'>,
 ): RbacAuditLogEntry {
-  const existing = readRbacAuditLogs(2000);
+  const existing = readRbacAuditLogs(5000);
   const fullEntry: RbacAuditLogEntry = {
     id: `AUD-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
     timestamp: new Date().toISOString(),
     ...entry,
   };
-  const next = [fullEntry, ...existing].slice(0, 2000);
+  const next = [fullEntry, ...existing].slice(0, 5000);
   fs.mkdirSync(DATA_DIR, { recursive: true });
   fs.writeFileSync(RBAC_AUDIT_PATH, JSON.stringify(next, null, 2), 'utf8');
   return fullEntry;

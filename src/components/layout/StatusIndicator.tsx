@@ -3,10 +3,12 @@ import type { ConsultationMode } from '../../types/opd';
 
 interface StatusIndicatorProps {
   status?: string | null;
+  label?: string;
 }
 
-export function StatusIndicator({ status }: StatusIndicatorProps) {
+export function StatusIndicator({ status, label }: StatusIndicatorProps) {
   const normalized = (status || 'UNKNOWN').toUpperCase();
+  const displayLabel = label ?? normalized.replaceAll('_', ' ');
 
   if (
     normalized === 'CONFIRMED' ||
@@ -21,7 +23,7 @@ export function StatusIndicator({ status }: StatusIndicatorProps) {
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700 whitespace-nowrap">
         <CheckCircle2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-        <span>{normalized.replaceAll('_', ' ')}</span>
+        <span>{displayLabel}</span>
       </span>
     );
   }
@@ -38,7 +40,7 @@ export function StatusIndicator({ status }: StatusIndicatorProps) {
       <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700 whitespace-nowrap">
         <Clock className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
         <span>
-          {normalized === 'REFUND_PENDING' ? 'WILL REFUND IN 2H' : normalized.replaceAll('_', ' ')}
+          {label ?? (normalized === 'REFUND_PENDING' ? 'WILL REFUND IN 2H' : normalized.replaceAll('_', ' '))}
         </span>
       </span>
     );
@@ -47,7 +49,7 @@ export function StatusIndicator({ status }: StatusIndicatorProps) {
   return (
     <span className="inline-flex items-center gap-1.5 text-xs font-medium text-red-700 whitespace-nowrap">
       <XCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-      <span>{normalized.replaceAll('_', ' ')}</span>
+      <span>{displayLabel}</span>
     </span>
   );
 }

@@ -98,6 +98,10 @@ import {
   deriveDeterministicConsultationMode,
   generateHistoricalAnalyticsSeed,
 } from './src/utils/analyticsSeed.ts';
+import {
+  describeBookingAuditDetails,
+  describeCancellationAuditDetails,
+} from './src/utils/auditLogs.ts';
 import { normalizeRecordConsultationMode } from './src/utils/analytics.ts';
 import {
   buildRoleDefinitions,
@@ -417,17 +421,51 @@ function trackNextHoldExpiry(appointments: Array<Pick<Appointment, 'status' | 'h
   knownNextHoldExpiryMs = getNextHoldExpiryMs(appointments);
 }
 
-async function runOrdsExpireHolds(): Promise<number> {
+async function runOrdsExpireHolds(options?: {
+  overdueAppointments?: Appointment[];
+  triggerActor?: Pick<AuthUser, 'user_id' | 'full_name' | 'email' | 'role'> | null;
+}): Promise<number> {
   if (inFlightExpireHolds) return inFlightExpireHolds;
   inFlightExpireHolds = (async () => {
     try {
+      let overdueToAudit = (options?.overdueAppointments || []).filter((a) =>
+        isAppointmentHoldExpired(a),
+      );
+      if (overdueToAudit.length === 0) {
+        const currentAppts = await fetchOrdsItems<Appointment>('appointments').catch(
+          () => [] as Appointment[],
+        );
+        overdueToAudit = currentAppts.filter((a) => isAppointmentHoldExpired(a));
+      }
+
       const res = await fetchOrdsJson<{ status?: string; expired_count?: number }>(
         'appointments/expire-holds',
         { method: 'POST', body: '{}' },
       );
       lastExpireHoldsCheckMs = Date.now();
       knownNextHoldExpiryMs = null;
-      return Number(res?.expired_count || 0);
+      const expiredCount = Number(res?.expired_count || 0);
+
+      if (expiredCount > 0 && overdueToAudit.length > 0) {
+        const actor = options?.triggerActor;
+        for (const expiredAppt of overdueToAudit) {
+          recordRbacAuditLog({
+            actor_user_id: actor?.user_id ?? null,
+            actor_name: actor?.full_name || 'Hold Expiry Scheduler',
+            actor_email: actor?.email ?? null,
+            actor_role: actor?.role || 'SYSTEM',
+            target_label: expiredAppt.appointment_ref,
+            action: 'APPOINTMENT_HOLD_EXPIRED',
+            category: 'APPOINTMENTS',
+            previous_value: 'HELD',
+            new_value: 'CANCELLED (HOLD_EXPIRED)',
+            details: `10-minute unpaid hold expired for ${expiredAppt.appointment_ref} (${expiredAppt.patient_name || `Patient #${expiredAppt.patient_id}`}); slot #${expiredAppt.slot_id} released automatically.`,
+            severity: 'info',
+          });
+        }
+      }
+
+      return expiredCount;
     } catch {
       lastExpireHoldsCheckMs = Date.now();
       return 0;
@@ -441,13 +479,18 @@ async function runOrdsExpireHolds(): Promise<number> {
 async function ensureOverdueHoldsExpired(options?: {
   force?: boolean;
   appointmentsHint?: Appointment[];
+  triggerActor?: Pick<AuthUser, 'user_id' | 'full_name' | 'email' | 'role'> | null;
 }): Promise<boolean> {
   if (options?.appointmentsHint) {
     trackNextHoldExpiry(options.appointmentsHint);
-    if (!options.force && !options.appointmentsHint.some((a) => isAppointmentHoldExpired(a))) {
+    const overdue = options.appointmentsHint.filter((a) => isAppointmentHoldExpired(a));
+    if (!options.force && overdue.length === 0) {
       return false;
     }
-    const expired = await runOrdsExpireHolds();
+    const expired = await runOrdsExpireHolds({
+      overdueAppointments: overdue,
+      triggerActor: options.triggerActor,
+    });
     return expired > 0;
   }
 
@@ -457,7 +500,7 @@ async function ensureOverdueHoldsExpired(options?: {
   if (!options?.force && !dueByKnownHold && !dueByInterval) {
     return false;
   }
-  const expired = await runOrdsExpireHolds();
+  const expired = await runOrdsExpireHolds({ triggerActor: options?.triggerActor });
   return expired > 0;
 }
 
@@ -1504,6 +1547,7 @@ async function startServer() {
       recordRbacAuditLog({
         actor_user_id: matchedPatient.patient_id,
         actor_name: `${matchedPatient.first_name} ${matchedPatient.last_name}`,
+        actor_email: emailInput,
         actor_role: 'PATIENT',
         target_label: emailInput,
         action: 'PASSWORD_SELF_RESET',
@@ -1551,6 +1595,7 @@ async function startServer() {
       recordRbacAuditLog({
         actor_user_id: null,
         actor_name: fullNameInput || emailInput,
+        actor_email: emailInput,
         actor_role: expectedRole || 'UNKNOWN',
         target_label: emailInput,
         action: 'LOGIN_LOCKED_OUT',
@@ -1567,6 +1612,17 @@ async function startServer() {
 
     // Never permit legacy fake admin emails
     if (isDisallowedLegacyFakeAdmin(emailInput, fullNameInput)) {
+      recordRbacAuditLog({
+        actor_user_id: null,
+        actor_name: fullNameInput || emailInput,
+        actor_email: emailInput,
+        actor_role: expectedRole || 'ADMIN',
+        target_label: emailInput,
+        action: 'LOGIN_BLOCKED_ADMIN_RESTRICTION',
+        category: 'SECURITY',
+        details: `Blocked disallowed legacy admin login attempt (${emailInput}).`,
+        severity: 'warning',
+      });
       res.status(403).json({
         status: 'error',
         message: `Restricted system administrator account (${SINGLE_ADMIN_EMAIL}) required for Admin access.`,
@@ -1581,6 +1637,7 @@ async function startServer() {
         recordRbacAuditLog({
           actor_user_id: rawUser.user_id,
           actor_name: rawUser.full_name,
+          actor_email: rawUser.email,
           actor_role: rawUser.role,
           target_label: rawUser.email,
           action: 'LOGIN_BLOCKED_STATUS',
@@ -1597,6 +1654,19 @@ async function startServer() {
       }
 
       if (strictPortal && expectedRole && hydrated.user.role !== expectedRole) {
+        recordRbacAuditLog({
+          actor_user_id: hydrated.user.user_id,
+          actor_name: hydrated.user.full_name,
+          actor_email: hydrated.user.email,
+          actor_role: hydrated.user.role,
+          target_label: hydrated.user.email,
+          action: 'LOGIN_BLOCKED_PORTAL_MISMATCH',
+          category: 'SECURITY',
+          previous_value: `Expected:${expectedRole}`,
+          new_value: `Actual:${hydrated.user.role}`,
+          details: `Blocked strict-portal sign-in for ${hydrated.user.email}: selected ${expectedRole}, account role is ${hydrated.user.role}.`,
+          severity: 'warning',
+        });
         res.status(403).json({
           status: 'error',
           message: `This account is registered as ${ROLE_LABELS[hydrated.user.role]}. Please go back and select ${ROLE_LABELS[hydrated.user.role]} to sign in.`,
@@ -1608,6 +1678,7 @@ async function startServer() {
       recordRbacAuditLog({
         actor_user_id: hydrated.user.user_id,
         actor_name: hydrated.user.full_name,
+        actor_email: hydrated.user.email,
         actor_role: hydrated.user.role,
         target_label: hydrated.user.email,
         action: 'LOGIN_SUCCESS',
@@ -1627,6 +1698,7 @@ async function startServer() {
       recordRbacAuditLog({
         actor_user_id: null,
         actor_name: fullNameInput || emailInput,
+        actor_email: emailInput,
         actor_role: expectedRole || 'UNKNOWN',
         target_label: emailInput,
         action: 'LOGIN_FAILED',
@@ -1814,6 +1886,17 @@ async function startServer() {
           store.user_role_overrides[normalizeUserKey(candidate.email, candidate.user_id)],
         );
         if (candidate.role === 'ADMIN' && !isSingleAdminUser(candidate) && !resolvedViaOverride) {
+          recordRbacAuditLog({
+            actor_user_id: candidate.user_id,
+            actor_name: candidate.full_name,
+            actor_email: candidate.email,
+            actor_role: candidate.role,
+            target_label: candidate.email,
+            action: 'LOGIN_BLOCKED_ADMIN_RESTRICTION',
+            category: 'SECURITY',
+            details: `Blocked unrecognized ORDS ADMIN account (${candidate.email}).`,
+            severity: 'warning',
+          });
           res.status(403).json({
             status: 'error',
             message: `Unrecognized Administrator account. Only authorized Hospital Admins may sign in.`,
@@ -2028,6 +2111,17 @@ async function startServer() {
     };
 
     if (user.role === 'ADMIN' && !isSingleAdminUser(user)) {
+      recordRbacAuditLog({
+        actor_user_id: user.user_id,
+        actor_name: user.full_name,
+        actor_email: user.email,
+        actor_role: user.role,
+        target_label: user.email,
+        action: 'LOGIN_BLOCKED_ADMIN_RESTRICTION',
+        category: 'SECURITY',
+        details: `Blocked unrecognized bridge ADMIN account (${user.email}).`,
+        severity: 'warning',
+      });
       res.status(403).json({
         status: 'error',
         message: `Unrecognized Administrator account. Only authorized Hospital Admins may sign in.`,
@@ -2041,6 +2135,18 @@ async function startServer() {
   app.post('/api/auth/register', async (req, res) => {
     const store = readRbacStore();
     if (!store.security_settings.allow_patient_registration) {
+      const regEmail = String(req.body?.email || '').trim().toLowerCase() || 'anonymous';
+      recordRbacAuditLog({
+        actor_user_id: null,
+        actor_name: regEmail,
+        actor_email: regEmail,
+        actor_role: 'PATIENT',
+        target_label: regEmail,
+        action: 'USER_REGISTRATION_BLOCKED',
+        category: 'SECURITY',
+        details: 'Blocked public patient registration while disabled in Security Settings.',
+        severity: 'warning',
+      });
       res.status(403).json({
         status: 'error',
         message: 'Public patient registration is currently disabled by Security Settings.',
@@ -2086,13 +2192,14 @@ async function startServer() {
       recordRbacAuditLog({
         actor_user_id: hydrated.user_id,
         actor_name: hydrated.full_name,
+        actor_email: hydrated.email,
         actor_role: 'PATIENT',
         target_user_id: hydrated.user_id,
         target_label: hydrated.email,
         action: 'USER_REGISTERED',
         category: 'AUTH',
-        new_value: 'PATIENT:ACTIVE',
-        details: `Self-registered patient account (${city}, ${locality}).`,
+        new_value: `PATIENT:ACTIVE${hydrated.patient_id ? ` (Patient #${hydrated.patient_id})` : ''}`,
+        details: `Self-registered patient account ${hydrated.full_name} (${city}, ${locality}).`,
         severity: 'info',
       });
       const token = signSession(hydrated);
@@ -2226,11 +2333,12 @@ async function startServer() {
       recordRbacAuditLog({
         actor_user_id: rawUser.user_id,
         actor_name: rawUser.full_name,
+        actor_email: rawUser.email,
         actor_role: rawUser.role,
         target_label: rawUser.email,
         action: 'LOGOUT',
         category: 'AUTH',
-        details: 'User signed out cleanly.',
+        details: `${rawUser.full_name} (${rawUser.role}) signed out cleanly.`,
         severity: 'info',
       });
     }
@@ -3106,6 +3214,19 @@ async function startServer() {
       store.shifts[String(user.doctor_id)] = savedShift;
       writeShiftStore(store);
 
+      recordRbacAuditLog({
+        actor_user_id: user.user_id,
+        actor_name: user.full_name,
+        actor_email: user.email,
+        actor_role: user.role,
+        target_label: `${doctorName} (Doctor #${user.doctor_id})`,
+        action: 'SHIFT_WINDOW_REGISTERED',
+        category: 'SHIFTS_LEAVES',
+        new_value: `${formatShiftSummary(sessions, durationMins)} · ${workingDaysRaw.join(',')}`,
+        details: `${user.full_name} registered initial shift window: ${formatShiftSummary(sessions, durationMins)} on ${workingDaysRaw.join(', ')}.`,
+        severity: 'info',
+      });
+
       res.json({
         status: 'success',
         message: 'Shift window registered successfully',
@@ -3190,6 +3311,20 @@ async function startServer() {
       const store = readShiftStore();
       store.change_requests.unshift(changeReq);
       writeShiftStore(store);
+
+      recordRbacAuditLog({
+        actor_user_id: user.user_id,
+        actor_name: user.full_name,
+        actor_email: user.email,
+        actor_role: user.role,
+        target_label: `${doctorName} (${changeReq.request_id})`,
+        action: 'SHIFT_CHANGE_REQUESTED',
+        category: 'SHIFTS_LEAVES',
+        previous_value: formatShiftSummary(currentShift.sessions, currentShift.slot_duration_mins),
+        new_value: formatShiftSummary(requestedSessions, requestedDuration),
+        details: `${doctorName} submitted shift change request ${changeReq.request_id} for ${formatShiftSummary(requestedSessions, requestedDuration)} (${requestedDays.join(', ')}). Reason: ${reason}`,
+        severity: 'info',
+      });
 
       res.status(201).json({
         status: 'success',
@@ -3288,6 +3423,20 @@ async function startServer() {
         store.change_requests.unshift(updatedReq);
       }
       writeShiftStore(store);
+
+      recordRbacAuditLog({
+        actor_user_id: user.user_id,
+        actor_name: user.full_name,
+        actor_email: user.email,
+        actor_role: user.role,
+        target_label: `${target.doctor_name} (${requestId})`,
+        action: typedDecision === 'APPROVED' ? 'SHIFT_CHANGE_APPROVED' : 'SHIFT_CHANGE_REJECTED',
+        category: 'SHIFTS_LEAVES',
+        previous_value: 'PENDING',
+        new_value: typedDecision,
+        details: `${user.full_name} (${user.role}) ${typedDecision.toLowerCase()} shift change request ${requestId} for ${target.doctor_name} (${formatShiftSummary(target.requested_sessions, target.requested_slot_duration_mins)})${comments ? ` · Notes: ${comments}` : ''}.`,
+        severity: typedDecision === 'REJECTED' ? 'warning' : 'info',
+      });
 
       res.json({
         status: 'success',
@@ -3440,6 +3589,24 @@ async function startServer() {
       store.opened_slot_keys = Array.from(openedSet);
       writeShiftStore(store);
 
+      const confirmedDates = Array.from(new Set(requestedSlots.map((s) => s.slot_date))).join(', ');
+      const confirmedRange = requestedSlots
+        .slice(0, 6)
+        .map((s) => `${s.start_time}-${s.end_time}`)
+        .join(', ');
+      recordRbacAuditLog({
+        actor_user_id: user.user_id,
+        actor_name: user.full_name,
+        actor_email: user.email,
+        actor_role: user.role,
+        target_label: `${user.full_name} · ${confirmedDates}`,
+        action: 'SLOTS_CONFIRMED',
+        category: 'SHIFTS_LEAVES',
+        new_value: `${createdCount} opened, ${skippedCount} already open`,
+        details: `${user.full_name} confirmed ${requestedSlots.length} slot(s) on ${confirmedDates} [${confirmedRange}${requestedSlots.length > 6 ? ', ...' : ''}] (${createdCount} newly opened).`,
+        severity: 'info',
+      });
+
       res.json({
         status: 'success',
         created_count: createdCount,
@@ -3568,6 +3735,19 @@ async function startServer() {
 
       store.opened_slot_keys = Array.from(openedSet);
       writeShiftStore(store);
+
+      recordRbacAuditLog({
+        actor_user_id: user.user_id,
+        actor_name: user.full_name,
+        actor_email: user.email,
+        actor_role: user.role,
+        target_label: `${user.full_name} · ${targetDate}`,
+        action: 'SLOTS_DAY_CONFIRMED',
+        category: 'SHIFTS_LEAVES',
+        new_value: `${createdCount} slots opened`,
+        details: `${user.full_name} confirmed daily shift slots for ${targetDate} (${createdCount} newly opened out of ${windows.length} shift window slots).`,
+        severity: 'info',
+      });
 
       res.json({
         status: 'success',
@@ -3732,13 +3912,14 @@ async function startServer() {
       recordRbacAuditLog({
         actor_user_id: user.user_id,
         actor_name: user.full_name,
+        actor_email: user.email,
         actor_role: user.role,
         target_label: targetAppt.appointment_ref,
         action: 'APPOINTMENT_PAID_AND_CONFIRMED',
         category: 'BILLING',
         previous_value: targetAppt.status,
-        new_value: 'CONFIRMED',
-        details: `${user.full_name} paid ₹${doctorFee.toFixed(2)} via ${paymentMethod} (${paymentRef}) and confirmed appointment ${targetAppt.appointment_ref}.`,
+        new_value: `CONFIRMED (${paymentRef})`,
+        details: `${user.full_name} (${user.role}) paid ₹${doctorFee.toFixed(2)} via ${paymentMethod} (${paymentRef}) and confirmed ${targetAppt.appointment_ref} for ${targetAppt.patient_name} with ${targetAppt.doctor_name || `Doctor #${targetAppt.doctor_id ?? ''}`} on ${getIsoDatePart(targetAppt.slot_date) || ''} ${targetAppt.start_time || ''} [${targetAppt.consultation_mode || 'FACE_TO_FACE'}].`,
         severity: 'info',
       });
 
@@ -4499,7 +4680,7 @@ async function startServer() {
     ) {
       return;
     }
-    const logs = readRbacAuditLogs(500);
+    const logs = readRbacAuditLogs(1000);
     res.json({ status: 'success', logs });
   });
 
@@ -5792,6 +5973,11 @@ async function startServer() {
     let pendingBookingInfo: {
       patient_id: number;
       slot_id: number;
+      doctor_id?: number | null;
+      slot_date?: string | null;
+      start_time?: string | null;
+      end_time?: string | null;
+      booking_source: string;
       consultation_mode: ConsultationMode;
       rescheduled_from_id: number | null;
     } | null = null;
@@ -5821,7 +6007,7 @@ async function startServer() {
         return;
       }
 
-      await ensureOverdueHoldsExpired();
+      await ensureOverdueHoldsExpired({ triggerActor: user });
       const [slotsList, templatesList, existingAppts] = await Promise.all([
         fetchOrdsItems<Slot>('slots'),
         fetchSlotTemplatesSafe(),
@@ -5898,9 +6084,16 @@ async function startServer() {
         return;
       }
 
+      const resolvedBookingSource =
+        user.role === 'PATIENT' ? 'ONLINE' : String(outgoingBody.booking_source || 'WALK_IN');
       pendingBookingInfo = {
         patient_id: targetPatientId,
         slot_id: targetSlotId,
+        doctor_id: targetSlot.doctor_id ?? null,
+        slot_date: targetSlotDate || null,
+        start_time: targetSlot.start_time ?? null,
+        end_time: targetSlot.end_time ?? null,
+        booking_source: resolvedBookingSource,
         consultation_mode: consultationMode,
         rescheduled_from_id: rescheduledFromId,
       };
@@ -5909,14 +6102,22 @@ async function startServer() {
         ...outgoingBody,
         patient_id: targetPatientId,
         slot_id: targetSlotId,
-        booking_source: user.role === 'PATIENT' ? 'ONLINE' : outgoingBody.booking_source || 'WALK_IN',
+        booking_source: resolvedBookingSource,
         consultation_mode: consultationMode,
       };
     }
 
+    let pendingConfirmContext: {
+      appointment: Appointment;
+      doctor_name: string | null;
+      slot_date: string | null;
+      start_time: string | null;
+    } | null = null;
+
     let pendingCancelContext: {
       appointment: Appointment;
       slot: Slot | null;
+      doctor_name: string | null;
       paid_amount: number;
       payment_ref: string | null;
       payment_method: string | null;
@@ -5928,11 +6129,12 @@ async function startServer() {
       const isCancelAction = subPath.endsWith('/cancel');
       const apptId = Number(subPath.split('/')[1]);
       if (user.role === 'PATIENT' || isConfirmAction || isCancelAction) {
-        const [appts, rawSlots, templates, payments, rules] = await Promise.all([
+        const [appts, rawSlots, templates, doctors, payments, rules] = await Promise.all([
           fetchOrdsItems<Appointment>('appointments'),
-          isCancelAction ? fetchOrdsItems<Slot>('slots').catch(() => [] as Slot[]) : Promise.resolve([] as Slot[]),
-          isCancelAction ? fetchOrdsItems<SlotTemplate>('slot_templates').catch(() => [] as SlotTemplate[]) : Promise.resolve([] as SlotTemplate[]),
-          isCancelAction ? fetchOrdsItems<Payment>('payments').catch(() => [] as Payment[]) : Promise.resolve([] as Payment[]),
+          fetchOrdsItems<Slot>('slots').catch(() => [] as Slot[]),
+          fetchSlotTemplatesSafe(),
+          fetchOrdsItems<Doctor>('doctors').catch(() => [] as Doctor[]),
+          fetchOrdsItems<Payment>('payments').catch(() => [] as Payment[]),
           isCancelAction ? fetchOrdsItems<CancellationRule>('cancellation-rules').catch(() => [] as CancellationRule[]) : Promise.resolve([] as CancellationRule[]),
         ]);
         const target = attachConsultationMode(appts, payments).find((a) => a.appointment_id === apptId);
@@ -5941,7 +6143,7 @@ async function startServer() {
           return;
         }
         if (isConfirmAction && target && isAppointmentHoldExpired(target)) {
-          await ensureOverdueHoldsExpired({ force: true });
+          await ensureOverdueHoldsExpired({ force: true, triggerActor: user });
           res.status(409).json({
             status: 'error',
             code: 'HOLD_EXPIRED',
@@ -5949,10 +6151,31 @@ async function startServer() {
           });
           return;
         }
+        const shiftStore = readShiftStore();
+        const slotsWithDoc = attachDoctorIdsToSlots(rawSlots, templates, shiftStore);
+        const matchedSlot = target
+          ? slotsWithDoc.find((s) => s.slot_id === target.slot_id) || null
+          : null;
+        const matchedDoctor =
+          matchedSlot?.doctor_id
+            ? doctors.find((d) => d.doctor_id === matchedSlot.doctor_id)
+            : target?.doctor_id
+              ? doctors.find((d) => d.doctor_id === target.doctor_id)
+              : undefined;
+        const resolvedDoctorName = matchedDoctor
+          ? `Dr. ${matchedDoctor.first_name} ${matchedDoctor.last_name}`
+          : target?.doctor_name || null;
+
+        if (isConfirmAction && target) {
+          pendingConfirmContext = {
+            appointment: target,
+            doctor_name: resolvedDoctorName,
+            slot_date: getIsoDatePart(matchedSlot?.slot_date || target.slot_date) || null,
+            start_time: matchedSlot?.start_time || target.start_time || null,
+          };
+        }
+
         if (isCancelAction && target) {
-          const shiftStore = readShiftStore();
-          const slotsWithDoc = attachDoctorIdsToSlots(rawSlots, templates, shiftStore);
-          const matchedSlot = slotsWithDoc.find((s) => s.slot_id === target.slot_id) || null;
           const successPay = payments.find(
             (p) => p.appointment_id === apptId && p.status === 'SUCCESS',
           );
@@ -5962,6 +6185,7 @@ async function startServer() {
           pendingCancelContext = {
             appointment: target,
             slot: matchedSlot,
+            doctor_name: resolvedDoctorName,
             paid_amount: paidAmount,
             payment_ref: target.payment_ref ?? successPay?.payment_ref ?? null,
             payment_method: target.payment_method ?? successPay?.payment_method ?? null,
@@ -5969,6 +6193,14 @@ async function startServer() {
           };
         }
       }
+    }
+
+    let pendingExpireHoldsBefore: Appointment[] = [];
+    if (subPath === 'appointments/expire-holds' && method === 'POST') {
+      const currentAppts = await fetchOrdsItems<Appointment>('appointments').catch(
+        () => [] as Appointment[],
+      );
+      pendingExpireHoldsBefore = currentAppts.filter((a) => isAppointmentHoldExpired(a));
     }
 
     let pendingOutcomeVerification: {
@@ -6052,7 +6284,22 @@ async function startServer() {
       };
     }
 
+    let pendingLeaveDecisionContext: {
+      leave_id: number;
+      leave: DoctorLeave | null;
+      decision: string;
+      comments: string | null;
+    } | null = null;
     if (/^leaves\/\d+\/decide$/.test(subPath) && method === 'POST') {
+      const leaveId = Number(subPath.split('/')[1]);
+      const leavesList = await fetchOrdsItems<DoctorLeave>('leaves').catch(() => [] as DoctorLeave[]);
+      const matchedLeave = leavesList.find((l) => l.leave_id === leaveId) || null;
+      pendingLeaveDecisionContext = {
+        leave_id: leaveId,
+        leave: matchedLeave,
+        decision: String(outgoingBody?.decision || '').trim().toUpperCase(),
+        comments: String(outgoingBody?.comments || '').trim() || null,
+      };
       outgoingBody = {
         ...outgoingBody,
         admin_user_id: user.user_id || 1,
@@ -6097,6 +6344,7 @@ async function startServer() {
           recordRbacAuditLog({
             actor_user_id: user.user_id,
             actor_name: user.full_name,
+            actor_email: user.email,
             actor_role: user.role,
             target_label: pendingOutcomeVerification.appointment.appointment_ref,
             action: `APPOINTMENT_${pendingOutcomeVerification.outcome}`,
@@ -6115,6 +6363,7 @@ async function startServer() {
           recordRbacAuditLog({
             actor_user_id: user.user_id,
             actor_name: user.full_name,
+            actor_email: user.email,
             actor_role: user.role,
             target_label: pendingOutcomeVerification.appointment.appointment_ref,
             action: `APPOINTMENT_${pendingOutcomeVerification.outcome}`,
@@ -6133,13 +6382,26 @@ async function startServer() {
         }
       }
 
+      let parsedMutationBody: Record<string, unknown> | null = null;
+      if (upstream.ok && method !== 'GET' && method !== 'HEAD') {
+        try {
+          parsedMutationBody = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+        } catch {
+          parsedMutationBody = null;
+        }
+      }
+      const mutationSucceeded =
+        upstream.ok && (!parsedMutationBody || parsedMutationBody.status !== 'error');
+
       if (upstream.ok && pendingBookingInfo) {
         try {
-          const parsedBody = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+          const parsedBody = parsedMutationBody || {};
           if (parsedBody?.status !== 'error') {
-            const latestAppts = await fetchOrdsItems<Appointment>('appointments').catch(
-              () => [] as Appointment[],
-            );
+            const [latestAppts, doctorsList, patientsList] = await Promise.all([
+              fetchOrdsItems<Appointment>('appointments').catch(() => [] as Appointment[]),
+              fetchOrdsItems<Doctor>('doctors').catch(() => [] as Doctor[]),
+              fetchOrdsItems<Patient>('patients').catch(() => [] as Patient[]),
+            ]);
             const refFromRes =
               typeof parsedBody?.appointment_ref === 'string' ? parsedBody.appointment_ref : null;
             const matchedCreated =
@@ -6155,6 +6417,23 @@ async function startServer() {
                 )
                 .sort((a, b) => b.appointment_id - a.appointment_id)[0];
 
+            const resolvedRef =
+              refFromRes || matchedCreated?.appointment_ref || `SLOT-${pendingBookingInfo.slot_id}`;
+            const matchedPat = patientsList.find(
+              (p) => p.patient_id === pendingBookingInfo!.patient_id,
+            );
+            const resolvedPatName =
+              matchedCreated?.patient_name ||
+              (matchedPat ? `${matchedPat.first_name} ${matchedPat.last_name}` : null) ||
+              `Patient #${pendingBookingInfo.patient_id}`;
+            const matchedDoc = pendingBookingInfo.doctor_id
+              ? doctorsList.find((d) => d.doctor_id === pendingBookingInfo!.doctor_id)
+              : undefined;
+            const resolvedDocName = matchedDoc
+              ? `Dr. ${matchedDoc.first_name} ${matchedDoc.last_name}`
+              : null;
+            const initialStatus = matchedCreated?.status || 'HELD';
+
             saveAppointmentMetadata({
               consultation_mode: pendingBookingInfo.consultation_mode,
               rescheduled_from_id: pendingBookingInfo.rescheduled_from_id,
@@ -6165,6 +6444,37 @@ async function startServer() {
               updated_at: new Date().toISOString(),
             });
             trackNextHoldExpiry(latestAppts);
+
+            recordRbacAuditLog({
+              actor_user_id: user.user_id,
+              actor_name: user.full_name,
+              actor_email: user.email,
+              actor_role: user.role,
+              target_label: resolvedRef,
+              action: pendingBookingInfo.rescheduled_from_id
+                ? 'APPOINTMENT_RESCHEDULED'
+                : 'APPOINTMENT_BOOKED',
+              category: 'APPOINTMENTS',
+              previous_value: pendingBookingInfo.rescheduled_from_id
+                ? `Appt #${pendingBookingInfo.rescheduled_from_id}`
+                : null,
+              new_value: `${initialStatus} (${pendingBookingInfo.consultation_mode})`,
+              details: describeBookingAuditDetails({
+                actorName: user.full_name,
+                actorRole: user.role,
+                appointmentRef: resolvedRef,
+                patientName: resolvedPatName,
+                doctorName: resolvedDocName,
+                slotDate: pendingBookingInfo.slot_date,
+                startTime: pendingBookingInfo.start_time,
+                endTime: pendingBookingInfo.end_time,
+                bookingSource: pendingBookingInfo.booking_source,
+                consultationMode: pendingBookingInfo.consultation_mode,
+                initialStatus,
+                rescheduledFromId: pendingBookingInfo.rescheduled_from_id,
+              }),
+              severity: 'info',
+            });
 
             res.status(upstream.status).json({
               ...parsedBody,
@@ -6180,9 +6490,63 @@ async function startServer() {
         }
       }
 
+      if (mutationSucceeded && pendingConfirmContext) {
+        const appt = pendingConfirmContext.appointment;
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: appt.appointment_ref,
+          action: 'APPOINTMENT_CONFIRMED',
+          category: 'APPOINTMENTS',
+          previous_value: appt.status,
+          new_value: 'CONFIRMED',
+          details: `${user.full_name} (${user.role}) confirmed appointment ${appt.appointment_ref} for ${appt.patient_name}${pendingConfirmContext.doctor_name ? ` with ${pendingConfirmContext.doctor_name}` : ''}${pendingConfirmContext.slot_date ? ` (${pendingConfirmContext.slot_date} ${pendingConfirmContext.start_time || ''})` : ''}.`,
+          severity: 'info',
+        });
+      }
+
+      if (mutationSucceeded && subPath === 'appointments/expire-holds' && method === 'POST') {
+        const expiredCount = Number(parsedMutationBody?.expired_count || 0);
+        if (expiredCount > 0 || pendingExpireHoldsBefore.length > 0) {
+          if (pendingExpireHoldsBefore.length > 0) {
+            for (const expAppt of pendingExpireHoldsBefore) {
+              recordRbacAuditLog({
+                actor_user_id: user.user_id,
+                actor_name: user.full_name,
+                actor_email: user.email,
+                actor_role: user.role,
+                target_label: expAppt.appointment_ref,
+                action: 'APPOINTMENT_HOLD_EXPIRED',
+                category: 'APPOINTMENTS',
+                previous_value: 'HELD',
+                new_value: 'CANCELLED (HOLD_EXPIRED)',
+                details: `Expired overdue 10-minute hold for ${expAppt.appointment_ref} (${expAppt.patient_name}); slot #${expAppt.slot_id} released.`,
+                severity: 'info',
+              });
+            }
+          } else {
+            recordRbacAuditLog({
+              actor_user_id: user.user_id,
+              actor_name: user.full_name,
+              actor_email: user.email,
+              actor_role: user.role,
+              target_label: 'Overdue Slot Holds',
+              action: 'APPOINTMENT_HOLD_EXPIRED',
+              category: 'APPOINTMENTS',
+              previous_value: 'HELD',
+              new_value: `${expiredCount} expired`,
+              details: `${user.full_name} (${user.role}) ran hold expiry cleanup: ${expiredCount} overdue hold(s) expired and released.`,
+              severity: 'info',
+            });
+          }
+        }
+      }
+
       if (upstream.ok && pendingCancelContext) {
         try {
-          const parsedBody = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+          const parsedBody = parsedMutationBody || {};
           if (parsedBody?.status !== 'error') {
             // 1. Ensure cancelled slot remains in opened_slot_keys so other patients can re-book it until end_time
             const cancelledSlot = pendingCancelContext.slot;
@@ -6211,8 +6575,9 @@ async function startServer() {
 
             // 2. Evaluate cancellation rule refund & 2-hour refund window if payment existed
             let refundPayload: Record<string, unknown> | null = null;
+            let refundEval: ReturnType<typeof evaluateCancellationRefund> | null = null;
             if (pendingCancelContext.paid_amount > 0) {
-              const refundEval = evaluateCancellationRefund({
+              refundEval = evaluateCancellationRefund({
                 rules: pendingCancelContext.cancellation_rules,
                 slotDate: cancelledSlot?.slot_date ?? pendingCancelContext.appointment.slot_date,
                 startTime: cancelledSlot?.start_time ?? pendingCancelContext.appointment.start_time,
@@ -6245,6 +6610,7 @@ async function startServer() {
               recordRbacAuditLog({
                 actor_user_id: user.user_id,
                 actor_name: user.full_name,
+                actor_email: user.email,
                 actor_role: user.role,
                 target_label: pendingCancelContext.appointment.appointment_ref,
                 action: 'APPOINTMENT_CANCELLED_REFUND',
@@ -6253,8 +6619,8 @@ async function startServer() {
                 new_value: refundEval.refund_status || 'CANCELLED',
                 details:
                   refundEval.refund_status === 'REFUND_PENDING'
-                    ? `${user.full_name} cancelled ${pendingCancelContext.appointment.appointment_ref}; ₹${refundEval.refund_amount.toFixed(2)} (${refundEval.refund_percentage}% via ${refundEval.rule_name}) scheduled to refund within 2 hours.`
-                    : `${user.full_name} cancelled ${pendingCancelContext.appointment.appointment_ref}; 0% refund per ${refundEval.rule_name}.`,
+                    ? `Cancelled by ${user.full_name} (${user.role}): ${pendingCancelContext.appointment.appointment_ref}; ₹${refundEval.refund_amount.toFixed(2)} (${refundEval.refund_percentage}% via ${refundEval.rule_name}) scheduled to refund within 2 hours.`
+                    : `Cancelled by ${user.full_name} (${user.role}): ${pendingCancelContext.appointment.appointment_ref}; 0% refund per ${refundEval.rule_name}.`,
                 severity: 'info',
               });
               refundPayload = {
@@ -6267,6 +6633,37 @@ async function startServer() {
               };
             }
 
+            // Always record exact cancellation actor for BOTH paid and unpaid cancellations
+            recordRbacAuditLog({
+              actor_user_id: user.user_id,
+              actor_name: user.full_name,
+              actor_email: user.email,
+              actor_role: user.role,
+              target_label: pendingCancelContext.appointment.appointment_ref,
+              action: 'APPOINTMENT_CANCELLED',
+              category: 'APPOINTMENTS',
+              previous_value: pendingCancelContext.appointment.status,
+              new_value: refundEval ? `CANCELLED (${refundEval.refund_status})` : 'CANCELLED',
+              details: describeCancellationAuditDetails({
+                actorName: user.full_name,
+                actorRole: user.role,
+                appointmentRef: pendingCancelContext.appointment.appointment_ref,
+                patientName: pendingCancelContext.appointment.patient_name,
+                doctorName: pendingCancelContext.doctor_name,
+                slotDate:
+                  getIsoDatePart(cancelledSlot?.slot_date ?? pendingCancelContext.appointment.slot_date) ||
+                  null,
+                startTime: cancelledSlot?.start_time ?? pendingCancelContext.appointment.start_time,
+                previousStatus: pendingCancelContext.appointment.status,
+                paidAmount: pendingCancelContext.paid_amount,
+                refundStatus: refundEval?.refund_status ?? null,
+                refundAmount: refundEval?.refund_amount ?? 0,
+                refundPercentage: refundEval?.refund_percentage ?? 0,
+                ruleName: refundEval?.rule_name ?? null,
+              }),
+              severity: 'warning',
+            });
+
             res.status(upstream.status).json({
               ...parsedBody,
               ...(refundPayload ? { refund: refundPayload } : {}),
@@ -6278,18 +6675,20 @@ async function startServer() {
         }
       }
 
-      if (upstream.ok && subPath === 'payments' && method === 'POST') {
+      if (mutationSucceeded && subPath === 'payments' && method === 'POST') {
         try {
-          const parsedBody = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+          const parsedBody = parsedMutationBody || {};
           const reqPayStatus = String(outgoingBody?.status || 'SUCCESS').trim().toUpperCase();
           const payApptId = Number(outgoingBody?.appointment_id);
           const payAmt = Number(outgoingBody?.amount || 0);
           const payMethod = String(outgoingBody?.payment_method || 'UPI').trim().toUpperCase();
-          if (parsedBody?.status !== 'error' && payApptId > 0 && reqPayStatus === 'SUCCESS') {
-            const appts = await fetchOrdsItems<Appointment>('appointments').catch(
-              () => [] as Appointment[],
-            );
-            const matched = appts.find((a) => a.appointment_id === payApptId);
+          const paymentRef =
+            typeof parsedBody?.payment_ref === 'string' ? parsedBody.payment_ref : null;
+          const appts = await fetchOrdsItems<Appointment>('appointments').catch(
+            () => [] as Appointment[],
+          );
+          const matched = appts.find((a) => a.appointment_id === payApptId);
+          if (payApptId > 0 && reqPayStatus === 'SUCCESS') {
             saveAppointmentMetadata({
               consultation_mode:
                 normalizeConsultationModeInput(matched?.consultation_mode) || 'FACE_TO_FACE',
@@ -6300,16 +6699,196 @@ async function startServer() {
               slot_id: matched?.slot_id,
               payment_status: 'SUCCESS',
               paid_amount: payAmt,
-              payment_ref:
-                typeof parsedBody?.payment_ref === 'string' ? parsedBody.payment_ref : null,
+              payment_ref: paymentRef,
               payment_method: payMethod,
               paid_at: new Date().toISOString(),
               updated_at: new Date().toISOString(),
             });
           }
+          recordRbacAuditLog({
+            actor_user_id: user.user_id,
+            actor_name: user.full_name,
+            actor_email: user.email,
+            actor_role: user.role,
+            target_label: matched?.appointment_ref || `Appointment #${payApptId}`,
+            action: reqPayStatus === 'FAILED' ? 'PAYMENT_FAILED' : 'PAYMENT_RECORDED',
+            category: 'BILLING',
+            new_value: `${reqPayStatus} · ₹${payAmt.toFixed(2)}`,
+            details: `${user.full_name} (${user.role}) recorded ${reqPayStatus} payment of ₹${payAmt.toFixed(2)} via ${payMethod}${paymentRef ? ` (${paymentRef})` : ''} for ${matched?.appointment_ref || `Appointment #${payApptId}`}${matched?.patient_name ? ` (${matched.patient_name})` : ''}.`,
+            severity: reqPayStatus === 'FAILED' ? 'warning' : 'info',
+          });
         } catch {
-          // Non-fatal metadata sync
+          // Non-fatal metadata/audit sync
         }
+      }
+
+      if (mutationSucceeded && subPath === 'leaves' && method === 'POST') {
+        const leaveId = parsedMutationBody?.leave_id;
+        const startDate = String(outgoingBody?.start_date || '').slice(0, 10);
+        const endDate = String(outgoingBody?.end_date || '').slice(0, 10);
+        const leaveReason = String(outgoingBody?.leave_reason || '').trim();
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: `${user.full_name} · ${startDate} to ${endDate}${leaveId ? ` (#${leaveId})` : ''}`,
+          action: 'LEAVE_REQUEST_SUBMITTED',
+          category: 'SHIFTS_LEAVES',
+          new_value: 'PENDING',
+          details: `${user.full_name} (${user.role}) submitted doctor leave request for ${startDate} to ${endDate}${leaveReason ? `. Reason: ${leaveReason}` : ''}.`,
+          severity: 'info',
+        });
+      }
+
+      if (mutationSucceeded && pendingLeaveDecisionContext) {
+        const lv = pendingLeaveDecisionContext.leave;
+        const docLabel = lv?.doctor_name || (lv?.doctor_id ? `Doctor #${lv.doctor_id}` : `Leave #${pendingLeaveDecisionContext.leave_id}`);
+        const rangeLabel = lv ? `${getIsoDatePart(lv.start_date)} to ${getIsoDatePart(lv.end_date)}` : `Leave #${pendingLeaveDecisionContext.leave_id}`;
+        const decision = pendingLeaveDecisionContext.decision === 'APPROVED' ? 'APPROVED' : 'REJECTED';
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: `${docLabel} · ${rangeLabel} (#${pendingLeaveDecisionContext.leave_id})`,
+          action: decision === 'APPROVED' ? 'LEAVE_REQUEST_APPROVED' : 'LEAVE_REQUEST_REJECTED',
+          category: 'SHIFTS_LEAVES',
+          previous_value: lv?.leave_status || 'PENDING',
+          new_value: decision,
+          details: `${user.full_name} (${user.role}) ${decision.toLowerCase()} leave request #${pendingLeaveDecisionContext.leave_id} for ${docLabel} (${rangeLabel})${pendingLeaveDecisionContext.comments ? ` · Notes: ${pendingLeaveDecisionContext.comments}` : ''}.`,
+          severity: decision === 'REJECTED' ? 'warning' : 'info',
+        });
+      }
+
+      if (mutationSucceeded && subPath.startsWith('slots') && method !== 'GET') {
+        const slotAction =
+          method === 'POST' ? 'SLOT_CREATED' : method === 'DELETE' ? 'SLOT_CANCELLED' : 'SLOT_UPDATED';
+        const slotDesc = subPath === 'slots'
+          ? `${String(outgoingBody?.slot_date || '').slice(0, 10)} ${outgoingBody?.start_time || ''}-${outgoingBody?.end_time || ''}`.trim()
+          : subPath;
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: slotDesc || subPath,
+          action: slotAction,
+          category: 'SHIFTS_LEAVES',
+          new_value: method === 'DELETE' ? 'CANCELLED' : String(outgoingBody?.status || 'AVAILABLE'),
+          details: `${user.full_name} (${user.role}) performed ${slotAction} (${slotDesc || subPath}).`,
+          severity: method === 'DELETE' ? 'warning' : 'info',
+        });
+      }
+
+      if (mutationSucceeded && subPath.startsWith('token_queue') && method !== 'GET') {
+        const isIssue = method === 'POST';
+        const nextTokenStatus = String(outgoingBody?.status || (isIssue ? 'WAITING' : 'UPDATED')).toUpperCase();
+        const targetId = isIssue
+          ? `Appt #${outgoingBody?.appointment_id || ''}`
+          : subPath;
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: targetId,
+          action: isIssue ? 'TOKEN_ISSUED' : 'TOKEN_STATUS_UPDATED',
+          category: 'OPERATIONS',
+          new_value: nextTokenStatus,
+          details: `${user.full_name} (${user.role}) ${isIssue ? `checked in and issued token (${parsedMutationBody?.token_number ? `#${parsedMutationBody.token_number} ` : ''}for ${targetId})` : `updated queue entry ${subPath} to ${nextTokenStatus}`}.`,
+          severity: 'info',
+        });
+      }
+
+      if (mutationSucceeded && /^patients\/\d+$/.test(subPath) && method === 'PUT') {
+        const patId = Number(subPath.split('/')[1]);
+        const patLabel = [outgoingBody?.first_name, outgoingBody?.last_name].filter(Boolean).join(' ') || `Patient #${patId}`;
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: `${patLabel} (#${patId})`,
+          action: 'PATIENT_UPDATED',
+          category: 'OPERATIONS',
+          details: `${user.full_name} (${user.role}) updated patient profile #${patId}${pendingPatientRegion ? ` (${pendingPatientRegion.city}, ${pendingPatientRegion.locality})` : ''}.`,
+          severity: 'info',
+        });
+      }
+
+      if (mutationSucceeded && subPath.startsWith('doctors/') && (method === 'PUT' || method === 'DELETE')) {
+        const docName = [outgoingBody?.first_name, outgoingBody?.last_name].filter(Boolean).join(' ');
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: docName ? `Dr. ${docName} (${subPath})` : subPath,
+          action: method === 'DELETE' ? 'DOCTOR_DEACTIVATED' : 'DOCTOR_UPDATED',
+          category: 'OPERATIONS',
+          details: `${user.full_name} (${user.role}) ${method === 'DELETE' ? 'deactivated' : 'updated'} doctor record (${subPath}).`,
+          severity: method === 'DELETE' ? 'warning' : 'info',
+        });
+      }
+
+      if (mutationSucceeded && subPath.startsWith('departments') && method !== 'GET') {
+        const deptName = String(outgoingBody?.department_name || subPath).trim();
+        const deptAction =
+          method === 'POST' ? 'DEPARTMENT_CREATED' : method === 'DELETE' ? 'DEPARTMENT_DEACTIVATED' : 'DEPARTMENT_UPDATED';
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: deptName,
+          action: deptAction,
+          category: 'OPERATIONS',
+          details: `${user.full_name} (${user.role}) ${deptAction.toLowerCase().replace('department_', '')} department (${deptName}).`,
+          severity: method === 'DELETE' ? 'warning' : 'info',
+        });
+      }
+
+      if (mutationSucceeded && subPath.startsWith('consultation-types') && method !== 'GET') {
+        const ctName = String(outgoingBody?.consultation_type_name || subPath).trim();
+        const ctAction =
+          method === 'POST'
+            ? 'CONSULTATION_TYPE_CREATED'
+            : method === 'DELETE'
+              ? 'CONSULTATION_TYPE_DEACTIVATED'
+              : 'CONSULTATION_TYPE_UPDATED';
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: ctName,
+          action: ctAction,
+          category: 'OPERATIONS',
+          details: `${user.full_name} (${user.role}) ${ctAction.toLowerCase().replace('consultation_type_', '')} consultation type (${ctName}).`,
+          severity: method === 'DELETE' ? 'warning' : 'info',
+        });
+      }
+
+      if (mutationSucceeded && subPath.startsWith('cancellation-rules') && method !== 'GET') {
+        const ruleLabel = String(outgoingBody?.rule_name || subPath).trim();
+        const ruleAction =
+          method === 'POST'
+            ? 'CANCELLATION_RULE_CREATED'
+            : method === 'DELETE'
+              ? 'CANCELLATION_RULE_DELETED'
+              : 'CANCELLATION_RULE_UPDATED';
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: ruleLabel,
+          action: ruleAction,
+          category: 'BILLING',
+          details: `${user.full_name} (${user.role}) ${ruleAction.toLowerCase().replace('cancellation_rule_', '')} cancellation refund rule (${ruleLabel}).`,
+          severity: method === 'DELETE' ? 'warning' : 'info',
+        });
       }
 
       // Persist patient city & locality and auto-provision GIRISH_USERS portal login
@@ -6374,6 +6953,22 @@ async function startServer() {
                 }),
               }).catch(() => null);
             }
+
+            recordRbacAuditLog({
+              actor_user_id: user.user_id,
+              actor_name: user.full_name,
+              actor_email: user.email,
+              actor_role: user.role,
+              target_user_id: createdPat?.patient_id ?? null,
+              target_label: `${fn} ${ln}${patEmail ? ` (${patEmail})` : ''}${createdPat ? ` #${createdPat.patient_id}` : ''}`,
+              action: 'PATIENT_REGISTERED',
+              category: 'OPERATIONS',
+              new_value: pendingPatientRegion
+                ? `${pendingPatientRegion.city}, ${pendingPatientRegion.locality}`
+                : 'PATIENT:ACTIVE',
+              details: `${user.full_name} (${user.role}) registered patient ${fn} ${ln}${createdPat ? ` (ID #${createdPat.patient_id})` : ''}${pendingPatientRegion ? ` in ${pendingPatientRegion.city}, ${pendingPatientRegion.locality}` : ''}.`,
+              severity: 'info',
+            });
           }
         } catch {
           // Non-fatal: fallback login still matches GIRISH_PATIENTS
@@ -6419,6 +7014,20 @@ async function startServer() {
                   doctor_id: createdDoc.doctor_id,
                 }),
               }).catch(() => null);
+
+              recordRbacAuditLog({
+                actor_user_id: user.user_id,
+                actor_name: user.full_name,
+                actor_email: user.email,
+                actor_role: user.role,
+                target_label: `Dr. ${createdDoc.first_name} ${createdDoc.last_name} (${candidateEmail})`,
+                action: 'DOCTOR_CREATED',
+                category: 'OPERATIONS',
+                new_value: `Doctor #${createdDoc.doctor_id}`,
+                details: `${user.full_name} (${user.role}) registered Dr. ${createdDoc.first_name} ${createdDoc.last_name} (#${createdDoc.doctor_id}) with portal email ${candidateEmail}.`,
+                severity: 'info',
+              });
+
               res.status(upstream.status).json({
                 ...parsedBody,
                 doctor_id: createdDoc.doctor_id,

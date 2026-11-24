@@ -120,6 +120,7 @@ test('Patient and Receptionist access scopes align with defaults and respect rev
   assert.equal(canAccessRoute(patient, 'prescriptions'), true);
   assert.equal(canAccessRoute(patient, 'register-patient'), false);
   assert.equal(canAccessRoute(patient, 'analytics'), false);
+  assert.equal(hasModulePermission(patient, 'APPOINTMENTS', 'UPDATE'), true);
 
   const receptionist = makeUser('RECEPTIONIST');
   assert.equal(canAccessRoute(receptionist, 'register-patient'), true);

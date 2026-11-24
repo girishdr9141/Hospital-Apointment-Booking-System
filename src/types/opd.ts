@@ -142,6 +142,7 @@ export interface Appointment {
   slot_id: number;
   status: 'HELD' | 'CONFIRMED' | 'CANCELLED' | 'NO_SHOW' | 'COMPLETED';
   hold_expires_at?: string | null;
+  hold_expired?: boolean;
   created_on?: string;
   booking_source?: 'ONLINE' | 'WALK_IN';
   consultation_mode?: ConsultationMode;
@@ -307,15 +308,28 @@ export interface SecuritySettings {
   enforce_strict_role_portal: boolean;
 }
 
+export type AuditLogCategory =
+  | 'USER'
+  | 'ROLE'
+  | 'PERMISSION'
+  | 'AUTH'
+  | 'SECURITY'
+  | 'APPOINTMENTS'
+  | 'SHIFTS_LEAVES'
+  | 'BILLING'
+  | 'CLINICAL'
+  | 'OPERATIONS';
+
 export interface RbacAuditLogEntry {
   id: string;
   actor_user_id: number | null;
   actor_name: string;
+  actor_email?: string | null;
   actor_role: string;
   target_user_id?: number | null;
   target_label?: string | null;
   action: string;
-  category: 'USER' | 'ROLE' | 'PERMISSION' | 'AUTH' | 'SECURITY' | 'CLINICAL' | 'BILLING';
+  category: AuditLogCategory;
   previous_value?: string | null;
   new_value?: string | null;
   details: string;

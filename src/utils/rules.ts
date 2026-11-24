@@ -55,14 +55,42 @@ export function formatHoldRemaining(holdExpiresAt?: string | null, nowMs = Date.
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
+export function isHoldExpired(holdExpiresAt?: string | null, nowMs = Date.now()): boolean {
+  if (!holdExpiresAt) return false;
+  const expiryMs = new Date(holdExpiresAt).getTime();
+  if (Number.isNaN(expiryMs)) return false;
+  return expiryMs <= nowMs;
+}
+
 export function isAppointmentHoldExpired(
-  appointment: Pick<Appointment, 'status' | 'hold_expires_at'>,
+  appointment: { status?: string | null; hold_expires_at?: string | null },
   nowMs = Date.now(),
 ): boolean {
   if (appointment.status !== 'HELD' || !appointment.hold_expires_at) return false;
-  const expiryMs = new Date(appointment.hold_expires_at).getTime();
-  if (Number.isNaN(expiryMs)) return false;
-  return expiryMs <= nowMs;
+  return isHoldExpired(appointment.hold_expires_at, nowMs);
+}
+
+export function wasAppointmentHoldExpired(
+  appointment: { status?: string | null; hold_expires_at?: string | null },
+  nowMs = Date.now(),
+): boolean {
+  return appointment.status === 'EXPIRED' || isAppointmentHoldExpired(appointment, nowMs);
+}
+
+export function canConfirmHeldAppointment(
+  appointment: { status?: string | null; hold_expires_at?: string | null },
+  nowMs = Date.now(),
+): boolean {
+  return appointment.status === 'HELD' && !isHoldExpired(appointment.hold_expires_at, nowMs);
+}
+
+export function canCancelAppointment(
+  appointment: { status?: string | null; hold_expires_at?: string | null },
+  nowMs = Date.now(),
+): boolean {
+  if (appointment.status === 'CONFIRMED') return true;
+  if (appointment.status === 'HELD') return !isHoldExpired(appointment.hold_expires_at, nowMs);
+  return false;
 }
 
 export function getNextHoldExpiryMs(

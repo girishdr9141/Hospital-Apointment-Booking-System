@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from 'react';
 import {
   Bell,
   Building2,
@@ -5,18 +6,32 @@ import {
   CalendarPlus,
   Check,
   CheckCheck,
+  Clock,
   CreditCard,
   ListOrdered,
   RefreshCw,
+  XCircle,
 } from 'lucide-react';
 import type {
+  Appointment,
   AuthUser,
   DashboardSummaryResponse,
   PortalNotification,
   RouteKey,
 } from '../../types/opd';
+import { apiClient } from '../../services/apiClient';
+import { useToast } from '../../context/ToastContext';
 import { canAccessRoute, hasModulePermission } from '../../utils/permissions';
-import { formatCurrencyInr, formatDisplayDate, formatDisplayDateTime } from '../../utils/rules';
+import {
+  canCancelAppointment,
+  canConfirmHeldAppointment,
+  formatCurrencyInr,
+  formatDisplayDate,
+  formatDisplayDateTime,
+  formatHoldRemaining,
+  isHoldExpired,
+  wasAppointmentHoldExpired,
+} from '../../utils/rules';
 import { ConsultationModeBadge, StatusIndicator } from '../../components/layout/StatusIndicator';
 
 interface PatientDashboardProps {
@@ -40,12 +55,56 @@ export function PatientDashboard({
   onMarkNotificationRead,
   onMarkAllNotificationsRead,
 }: PatientDashboardProps) {
+  const { notify } = useToast();
   const { metrics, patient_profile } = data;
   const canBook = canAccessRoute(user, 'book-appointment');
   const showAppointments = canAccessRoute(user, 'appointments');
+  const canConfirm = hasModulePermission(user, 'APPOINTMENTS', 'UPDATE');
+  const canCancel = hasModulePermission(user, 'APPOINTMENTS', 'DELETE');
   const showPayments = hasModulePermission(user, 'PAYMENTS', 'VIEW');
   const showPrescriptions = canAccessRoute(user, 'prescriptions');
   const unreadNotifications = notifications.filter((n) => !n.read);
+
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [busyApptId, setBusyApptId] = useState<number | null>(null);
+  const autoSweptRef = useRef<Set<number>>(new Set());
+
+  useEffect(() => {
+    if (!data.recent_appointments.some((a) => a.status === 'HELD')) return;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [data.recent_appointments]);
+
+  useEffect(() => {
+    const newlyExpired = data.recent_appointments.filter(
+      (a) =>
+        a.status === 'HELD' &&
+        isHoldExpired(a.hold_expires_at, nowMs) &&
+        !autoSweptRef.current.has(a.appointment_id),
+    );
+    if (newlyExpired.length === 0) return;
+    for (const a of newlyExpired) autoSweptRef.current.add(a.appointment_id);
+    onRefresh();
+  }, [data.recent_appointments, nowMs, onRefresh]);
+
+  const handleQuickHoldAction = async (appt: Appointment, action: 'confirm' | 'cancel') => {
+    setBusyApptId(appt.appointment_id);
+    try {
+      if (action === 'confirm') {
+        await apiClient.confirmAppointment(appt.appointment_id);
+        notify(`Appointment ${appt.appointment_ref} confirmed`, 'success');
+      } else {
+        await apiClient.cancelAppointment(appt.appointment_id);
+        notify(`Appointment ${appt.appointment_ref} cancelled and slot released`, 'success');
+      }
+      onRefresh();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : `Unable to ${action} appointment`, 'error');
+      onRefresh();
+    } finally {
+      setBusyApptId(null);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -275,30 +334,83 @@ export function PatientDashboard({
                     <th className="px-4 py-2.5">Date &amp; Time</th>
                     <th className="px-4 py-2.5">Mode</th>
                     <th className="px-4 py-2.5">Status</th>
+                    {(canConfirm || canCancel) && <th className="px-4 py-2.5 text-right">Action</th>}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {data.recent_appointments.map((appt) => (
-                    <tr key={appt.appointment_id} className="hover:bg-slate-50">
-                      <td className="px-4 py-2.5 font-mono text-xs text-slate-700 tabular-nums">
-                        {appt.appointment_ref}
-                      </td>
-                      <td className="px-4 py-2.5 text-slate-900">
-                        {appt.doctor_name || `Slot #${appt.slot_id}`}
-                      </td>
-                      <td className="px-4 py-2.5 font-mono text-xs text-slate-600 tabular-nums">
-                        {appt.slot_date
-                          ? `${formatDisplayDate(appt.slot_date)} ${appt.start_time || ''}`
-                          : formatDisplayDate(appt.created_on)}
-                      </td>
-                      <td className="px-4 py-2.5">
-                        <ConsultationModeBadge mode={appt.consultation_mode} />
-                      </td>
-                      <td className="px-4 py-2.5">
-                        <StatusIndicator status={appt.status} />
-                      </td>
-                    </tr>
-                  ))}
+                  {data.recent_appointments.map((appt) => {
+                    const expired = wasAppointmentHoldExpired(appt, nowMs);
+                    const confirmAllowed = canConfirm && canConfirmHeldAppointment(appt, nowMs);
+                    const cancelAllowed =
+                      appt.status === 'HELD' && canCancel && canCancelAppointment(appt, nowMs);
+                    const isBusy = busyApptId === appt.appointment_id;
+                    return (
+                      <tr key={appt.appointment_id} className="hover:bg-slate-50">
+                        <td className="px-4 py-2.5">
+                          <div className="font-mono text-xs text-slate-700 tabular-nums">
+                            {appt.appointment_ref}
+                          </div>
+                          {appt.status === 'HELD' && appt.hold_expires_at && (
+                            <div
+                              className={`mt-0.5 inline-flex items-center gap-1 font-mono text-[11px] tabular-nums ${
+                                expired ? 'text-red-700' : 'text-amber-700'
+                              }`}
+                            >
+                              <Clock className="h-3 w-3 shrink-0" aria-hidden="true" />
+                              <span>Hold: {formatHoldRemaining(appt.hold_expires_at, nowMs)}</span>
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-4 py-2.5 text-slate-900">
+                          {appt.doctor_name || `Slot #${appt.slot_id}`}
+                        </td>
+                        <td className="px-4 py-2.5 font-mono text-xs text-slate-600 tabular-nums">
+                          {appt.slot_date
+                            ? `${formatDisplayDate(appt.slot_date)} ${appt.start_time || ''}`
+                            : formatDisplayDate(appt.created_on)}
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <ConsultationModeBadge mode={appt.consultation_mode} />
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <StatusIndicator
+                            status={expired ? 'EXPIRED' : appt.status}
+                            label={expired ? 'HOLD EXPIRED' : undefined}
+                          />
+                        </td>
+                        {(canConfirm || canCancel) && (
+                          <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                            {(confirmAllowed || cancelAllowed) ? (
+                              <div className="inline-flex items-center gap-1.5">
+                                {confirmAllowed && (
+                                  <button
+                                    type="button"
+                                    disabled={isBusy}
+                                    onClick={() => void handleQuickHoldAction(appt, 'confirm')}
+                                    className="inline-flex items-center gap-1 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-800 hover:bg-emerald-100 disabled:opacity-50"
+                                  >
+                                    <Check className="h-3 w-3" aria-hidden="true" />
+                                    <span>Confirm</span>
+                                  </button>
+                                )}
+                                {cancelAllowed && (
+                                  <button
+                                    type="button"
+                                    disabled={isBusy}
+                                    onClick={() => void handleQuickHoldAction(appt, 'cancel')}
+                                    className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
+                                  >
+                                    <XCircle className="h-3 w-3" aria-hidden="true" />
+                                    <span>Cancel</span>
+                                  </button>
+                                )}
+                              </div>
+                            ) : null}
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

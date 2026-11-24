@@ -31,10 +31,8 @@ import {
   X,
 } from 'lucide-react';
 import type { AuthUser, NavItem, PortalNotification, RouteKey } from '../../types/opd';
-import type { BackendMode } from '../../utils/backendRouter';
 import { getNavForUser, getRouteLabel, ROLE_LABELS } from '../../utils/permissions';
 import { formatDisplayDateTime } from '../../utils/rules';
-import { BackendToggle } from '../common/BackendToggle';
 import { ConfirmDialog } from './ConfirmDialog';
 
 const ROUTE_ICONS: Record<RouteKey, React.ComponentType<{ className?: string }>> = {
@@ -81,7 +79,6 @@ interface AppShellProps {
   onNotificationClick?: (notification: PortalNotification) => void;
   onMarkNotificationRead?: (ids: string[]) => void;
   onDismissAllNotifications?: () => void;
-  onBackendChanged?: (mode: BackendMode) => void;
   children: React.ReactNode;
 }
 
@@ -94,7 +91,6 @@ export function AppShell({
   onNotificationClick,
   onMarkNotificationRead,
   onDismissAllNotifications,
-  onBackendChanged,
   children,
 }: AppShellProps) {
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -262,9 +258,6 @@ export function AppShell({
             </div>
 
             <div className="flex items-center gap-3 sm:gap-4 shrink-0">
-              {(user.role === 'ADMIN' || user.role === 'SUPER_ADMIN') && (
-                <BackendToggle compact onChanged={onBackendChanged} />
-              )}
               {showBell && (
                 <div className="relative">
                   <button

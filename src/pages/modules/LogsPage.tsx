@@ -5,6 +5,12 @@ import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient'
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
 import { buildCsvString, downloadCsvFile } from '../../utils/csv';
+import {
+  ALL_AUDIT_CATEGORIES,
+  filterAuditLogs,
+  getAuditCategoryLabel,
+  type AuditLogCategoryFilter,
+} from '../../utils/auditLogs';
 import { hasModulePermission } from '../../utils/permissions';
 import { formatDisplayDateTime } from '../../utils/rules';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
@@ -14,17 +20,6 @@ import { MissingEndpointBanner } from '../../components/common/MissingEndpointBa
 interface LogsPageProps {
   mode: 'audit' | 'error';
 }
-
-const AUDIT_CATEGORIES: Array<'ALL' | RbacAuditLogEntry['category']> = [
-  'ALL',
-  'AUTH',
-  'USER',
-  'ROLE',
-  'PERMISSION',
-  'SECURITY',
-  'CLINICAL',
-  'BILLING',
-];
 
 export function LogsPage({ mode }: LogsPageProps) {
   const { user } = useAuth();
@@ -38,7 +33,7 @@ export function LogsPage({ mode }: LogsPageProps) {
   const [missingOracleEndpoint, setMissingOracleEndpoint] = useState(false);
 
   const [search, setSearch] = useState('');
-  const [categoryFilter, setCategoryFilter] = useState<'ALL' | RbacAuditLogEntry['category']>('ALL');
+  const [categoryFilter, setCategoryFilter] = useState<AuditLogCategoryFilter>('ALL');
   const [selectedError, setSelectedError] = useState<ErrorLogRecord | null>(null);
 
   const canExportAudit = hasModulePermission(user, 'SYSTEM_SETTINGS', 'VIEW');
@@ -88,19 +83,10 @@ export function LogsPage({ mode }: LogsPageProps) {
     void loadData();
   }, [loadData]);
 
-  const filteredRbacLogs = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return rbacLogs.filter((l) => {
-      if (categoryFilter !== 'ALL' && l.category !== categoryFilter) return false;
-      if (!q) return true;
-      return (
-        l.action.toLowerCase().includes(q) ||
-        l.actor_name.toLowerCase().includes(q) ||
-        (l.target_label || '').toLowerCase().includes(q) ||
-        l.details.toLowerCase().includes(q)
-      );
-    });
-  }, [rbacLogs, categoryFilter, search]);
+  const filteredRbacLogs = useMemo(
+    () => filterAuditLogs(rbacLogs, categoryFilter, search),
+    [rbacLogs, categoryFilter, search],
+  );
 
   const filteredAudit = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -137,6 +123,7 @@ export function LogsPage({ mode }: LogsPageProps) {
       'Category',
       'Severity',
       'Actor',
+      'Actor Email',
       'Actor Role',
       'Target',
       'Previous Value',
@@ -149,13 +136,14 @@ export function LogsPage({ mode }: LogsPageProps) {
       l.category,
       l.severity,
       l.actor_name,
+      l.actor_email || '',
       l.actor_role,
       l.target_label || '',
       l.previous_value || '',
       l.new_value || '',
       l.details,
     ]);
-    downloadCsvFile('carepulse-rbac-security-audit.csv', buildCsvString(headers, rows));
+    downloadCsvFile('carepulse-activity-audit-logs.csv', buildCsvString(headers, rows));
     notify(`Exported ${filteredRbacLogs.length} audit log entry(ies)`, 'success');
   };
 
@@ -197,7 +185,10 @@ export function LogsPage({ mode }: LogsPageProps) {
       render: (row) => (
         <div className="text-xs">
           <p className="font-medium text-slate-900">{row.actor_name}</p>
-          <p className="font-mono text-[11px] text-slate-500">{row.actor_role}</p>
+          <p className="font-mono text-[11px] text-slate-500">
+            {row.actor_role}
+            {row.actor_email ? ` · ${row.actor_email}` : ''}
+          </p>
         </div>
       ),
     },
@@ -344,7 +335,7 @@ export function LogsPage({ mode }: LogsPageProps) {
           </h2>
           <p className="mt-0.5 text-sm text-slate-600">
             {mode === 'audit'
-              ? 'Read-only governance trail tracking authentication, role/permission mutations, unauthorized access attempts, and clinical writes.'
+              ? 'Complete immutable audit trail recording logins, logouts, registrations, shifts, leaves, bookings, payments, cancellations, clinical writes, and RBAC changes.'
               : 'Diagnostic exception entries captured by PL/SQL procedures in GIRISH_ERROR_LOG.'}
           </p>
         </div>
@@ -375,7 +366,7 @@ export function LogsPage({ mode }: LogsPageProps) {
                   : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              RBAC &amp; Security Trail
+              All Activity &amp; Security Trail
             </button>
             <button
               type="button"
@@ -419,25 +410,23 @@ export function LogsPage({ mode }: LogsPageProps) {
             loading={loading}
             searchValue={search}
             onSearchChange={setSearch}
-            searchPlaceholder="Search action, actor, target, or details..."
+            searchPlaceholder="Search action, actor, email, target, or details..."
             filters={
               <select
                 aria-label="Filter audit logs by category"
                 value={categoryFilter}
-                onChange={(e) =>
-                  setCategoryFilter(e.target.value as 'ALL' | RbacAuditLogEntry['category'])
-                }
+                onChange={(e) => setCategoryFilter(e.target.value as AuditLogCategoryFilter)}
                 className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 focus:border-teal-700 focus:outline-none"
               >
-                {AUDIT_CATEGORIES.map((cat) => (
+                {ALL_AUDIT_CATEGORIES.map((cat) => (
                   <option key={cat} value={cat}>
-                    {cat === 'ALL' ? 'All Categories' : cat}
+                    {getAuditCategoryLabel(cat)}
                   </option>
                 ))}
               </select>
             }
-            emptyTitle="No security or RBAC events recorded yet"
-            emptyDescription="Sign-ins, permission changes, role updates, and blocked 403 attempts appear here automatically."
+            emptyTitle="No activity events matching this filter"
+            emptyDescription="Sign-ins, sign-outs, registrations, bookings, payments, cancellations, shift/leave actions, clinical writes, and RBAC events appear here automatically."
           />
         ) : (
           <DataTable
