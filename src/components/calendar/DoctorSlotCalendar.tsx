@@ -224,7 +224,6 @@ export function DoctorSlotCalendar({
             slot_date: targetDate,
             start_time: confirmTarget.start_time,
             end_time: confirmEndTime,
-            template_id: confirmTarget.template_id,
             max_patients_per_slot: 1,
           },
         ],
@@ -254,7 +253,6 @@ export function DoctorSlotCalendar({
           slot_date: t.slot_date || selectedDate,
           start_time: t.start_time,
           end_time: t.end_time,
-          template_id: t.template_id,
           max_patients_per_slot: 1,
         })),
       });
@@ -283,7 +281,6 @@ export function DoctorSlotCalendar({
           slot_date: t.slot_date || selectedDate,
           start_time: t.start_time,
           end_time: t.end_time,
-          template_id: t.template_id,
           max_patients_per_slot: 1,
         })),
       });

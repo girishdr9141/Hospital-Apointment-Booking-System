@@ -119,14 +119,14 @@ export interface SlotTemplate {
 
 export interface Slot {
   slot_id: number;
-  template_id: number;
+  doctor_id?: number | null;
+  template_id?: number | null;
   slot_date: string;
   start_time: string;
   end_time: string;
   max_patients_per_slot: number;
   booked_patients: number;
   status: 'AVAILABLE' | 'SOLD_OUT' | 'CANCELLED';
-  doctor_id?: number;
   doctor_name?: string;
   department_id?: number;
   department_name?: string;

@@ -123,15 +123,15 @@ export const OIC_PHASE_SPECS: OicPhaseSpec[] = [
     id: 'phase3',
     order: 3,
     title: 'Phase 3 · Schedules & Slot Inventory',
-    subtitle: 'Doctor weekly templates and daily appointment slots.',
+    subtitle: 'Doctor shift windows, shift change approvals, and doctor-owned appointment slots.',
     effortHint: 'Required before appointment booking',
     endpoints: [
       {
         id: 'p3-templates',
         method: 'GET',
         oicPath: '/slot_templates',
-        ordsTarget: 'GET/POST /slot_templates · DELETE /slot_templates/{id}',
-        summary: 'Doctor shift & schedule templates',
+        ordsTarget: 'GET/POST /slot_templates (optional legacy)',
+        summary: 'Legacy slot templates (optional fallback; slots now link directly to doctor_id)',
         contractHint: 'Returns { items: SlotTemplate[] }',
         probePath: 'slot_templates?limit=50',
       },
@@ -140,17 +140,35 @@ export const OIC_PHASE_SPECS: OicPhaseSpec[] = [
         method: 'GET',
         oicPath: '/slots',
         ordsTarget: 'GET/POST /slots · PUT/DELETE /slots/{id}',
-        summary: 'Published consultation slots for patient booking',
-        contractHint: 'Returns { items: Slot[] }',
+        summary: 'Doctor-owned consultation slots (keyed by doctor_id FK) for patient booking',
+        contractHint: 'Returns { items: Slot[] } with doctor_id',
         probePath: 'slots?limit=50',
+      },
+      {
+        id: 'p3-doctor-shifts',
+        method: 'GET',
+        oicPath: '/doctor-shifts',
+        ordsTarget: 'GET/POST /doctor-shifts (GIRISH_DOCTOR_SHIFT_WINDOWS)',
+        summary: 'Doctor shift windows, durations, and working days',
+        contractHint: 'Returns { items: DoctorShiftConfig[] }',
+        probePath: 'doctor-shifts?limit=50',
+      },
+      {
+        id: 'p3-shift-requests',
+        method: 'GET',
+        oicPath: '/shift-change-requests',
+        ordsTarget: 'GET/POST /shift-change-requests · POST /shift-change-requests/{id}/decide',
+        summary: 'Doctor shift change requests and admin approval decisions',
+        contractHint: 'Returns { items: ShiftChangeRequest[] }',
+        probePath: 'shift-change-requests?limit=50',
       },
     ],
   },
   {
     id: 'phase4',
     order: 4,
-    title: 'Phase 4 · Appointments, Leaves, Queue & Payments',
-    subtitle: 'Core transactional PL/SQL workflows (holds, outcomes, leaves, queue, billing).',
+    title: 'Phase 4 · Appointments, Clinical, Leaves, Queue & Payments',
+    subtitle: 'Core transactional PL/SQL workflows (holds, outcomes, clinical records, prescriptions, leaves, queue, billing).',
     effortHint: 'Highest business value — test each action carefully',
     endpoints: [
       {
@@ -229,6 +247,24 @@ export const OIC_PHASE_SPECS: OicPhaseSpec[] = [
         contractHint: 'Returns { items: TokenQueueItem[] }',
         probePath: 'token_queue?limit=50',
       },
+      {
+        id: 'p4-medical-records',
+        method: 'GET',
+        oicPath: '/medical-records',
+        ordsTarget: 'GET/POST /medical-records · PUT/DELETE /medical-records/{id}',
+        summary: 'Doctor-prescribed patient medical records (GIRISH_MEDICAL_RECORDS)',
+        contractHint: 'Returns { items: MedicalRecordEntry[] }',
+        probePath: 'medical-records?limit=50',
+      },
+      {
+        id: 'p4-prescriptions',
+        method: 'GET',
+        oicPath: '/prescriptions',
+        ordsTarget: 'GET/POST /prescriptions · PUT/DELETE /prescriptions/{id}',
+        summary: 'Patient prescriptions & medication plans (GIRISH_PRESCRIPTIONS)',
+        contractHint: 'Returns { items: PrescriptionEntry[] }',
+        probePath: 'prescriptions?limit=50',
+      },
     ],
   },
   {
@@ -301,14 +337,21 @@ export function classifyEndpointPhase(endpoint: string): OicPhaseId {
   ) {
     return 'phase2';
   }
-  if (path.startsWith('slot_templates') || path.startsWith('slots')) {
+  if (
+    path.startsWith('slot_templates') ||
+    path.startsWith('slots') ||
+    path.startsWith('doctor-shifts') ||
+    path.startsWith('shift-change-requests')
+  ) {
     return 'phase3';
   }
   if (
     path.startsWith('appointments') ||
     path.startsWith('leaves') ||
     path.startsWith('payments') ||
-    path.startsWith('token_queue')
+    path.startsWith('token_queue') ||
+    path.startsWith('medical-records') ||
+    path.startsWith('prescriptions')
   ) {
     return 'phase4';
   }
@@ -361,10 +404,15 @@ const KNOWN_COLLECTION_KEYS = [
   'patients',
   'slot_templates',
   'slots',
+  'doctor_shifts',
+  'shift_change_requests',
+  'requests',
   'appointments',
   'leaves',
   'payments',
   'token_queue',
+  'medical_records',
+  'prescriptions',
   'users',
   'roles',
   'permissions',

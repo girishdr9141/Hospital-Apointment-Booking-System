@@ -503,10 +503,12 @@ END;');
       p_comments       => 'Generate slots up to 7 days only (never whole month for all doctors)',
       p_source         => '
 DECLARE
+    v_body CLOB;
     v_days NUMBER := 1;
 BEGIN
-    IF :body_text IS NOT NULL THEN
-        APEX_JSON.PARSE(:body_text);
+    v_body := :body_text;
+    IF v_body IS NOT NULL AND DBMS_LOB.GETLENGTH(v_body) > 0 THEN
+        APEX_JSON.PARSE(v_body);
         v_days := NVL(APEX_JSON.GET_NUMBER(''days''), 1);
     END IF;
     IF v_days < 1 OR v_days > 7 THEN

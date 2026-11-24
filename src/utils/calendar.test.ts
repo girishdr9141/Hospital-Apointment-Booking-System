@@ -308,4 +308,27 @@ test('13:00-13:20 slot remains bookable and re-bookable until 13:20 IST and expi
   assert.deepEqual(filterBookableSlots([middaySlot], at1320IST, 'Asia/Kolkata'), []);
 });
 
+test('mergeDayWorkingSlots matches doctor_id slots when template_id is null and templates array is empty', () => {
+  const shift = makeShift([{ start_time: '09:00', end_time: '11:00' }], 30);
+  const windows = buildWorkingHourWindows('2026-11-25', [], { shiftConfig: shift });
+  const existing: Slot[] = [
+    {
+      slot_id: 501,
+      doctor_id: 7,
+      template_id: null,
+      slot_date: '2026-11-25',
+      start_time: '09:30',
+      end_time: '10:00',
+      max_patients_per_slot: 1,
+      booked_patients: 0,
+      status: 'AVAILABLE',
+    },
+  ];
+  const merged = mergeDayWorkingSlots('2026-11-25', windows, existing);
+  assert.equal(merged.length, 4);
+  assert.equal(merged[0].status, 'UNCONFIRMED');
+  assert.equal(merged[1].status, 'AVAILABLE');
+  assert.equal(merged[1].existingSlot?.doctor_id, 7);
+});
+
 

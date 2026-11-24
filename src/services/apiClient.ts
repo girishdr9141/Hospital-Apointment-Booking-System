@@ -418,8 +418,9 @@ export const apiClient = {
       body: JSON.stringify(payload),
     }),
 
-  // Doctor Shift Windows & Single-Day Slots (No bulk 1-week generation, no UI slot template management)
-  getSlotTemplates: () => fetchCollection<SlotTemplate>('slot_templates'),
+  // Doctor Shift Windows & Single-Day Slots (slots now link directly to doctor_id FK; slot_templates is optional legacy)
+  getSlotTemplates: () =>
+    fetchCollection<SlotTemplate>('slot_templates').catch(() => [] as SlotTemplate[]),
   getSlots: () => fetchCollection<Slot>('slots'),
   getDoctorShifts: () =>
     requestJson<{
@@ -475,7 +476,7 @@ export const apiClient = {
       slot_date: string;
       start_time: string;
       end_time: string;
-      template_id?: number;
+      template_id?: number | null;
       max_patients_per_slot?: number;
     }>;
   }) =>

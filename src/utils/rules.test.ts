@@ -232,3 +232,38 @@ test('enrichAppointments normalizes consultation_mode and rescheduled_from_id', 
   assert.equal(enriched[1].consultation_mode, 'FACE_TO_FACE');
   assert.equal(enriched[0].rescheduled_from_id, null);
 });
+
+test('enrichSlots resolves doctor and department directly from slot.doctor_id when template_id is null', () => {
+  const slots = enrichSlots(
+    [
+      {
+        slot_id: 22,
+        doctor_id: 5,
+        template_id: null,
+        slot_date: '2026-11-26',
+        start_time: '10:00',
+        end_time: '10:30',
+        max_patients_per_slot: 1,
+        booked_patients: 0,
+        status: 'AVAILABLE',
+      },
+    ],
+    [],
+    [
+      {
+        doctor_id: 5,
+        department_id: 3,
+        first_name: 'Priya',
+        last_name: 'Sharma',
+        consultation_fee: 600,
+        tele_consult_flag: 'Y',
+      },
+    ],
+    [{ department_id: 3, department_name: 'Cardiology' }],
+  );
+
+  assert.equal(slots[0].doctor_id, 5);
+  assert.equal(slots[0].doctor_name, 'Dr. Priya Sharma');
+  assert.equal(slots[0].department_id, 3);
+  assert.equal(slots[0].department_name, 'Cardiology');
+});

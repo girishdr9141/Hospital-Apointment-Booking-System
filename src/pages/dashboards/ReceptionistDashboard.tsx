@@ -164,7 +164,7 @@ export function ReceptionistDashboard({
                         {slot.start_time} – {slot.end_time}
                       </td>
                       <td className="px-4 py-2.5 font-medium text-slate-900">
-                        {slot.doctor_name || `Template #${slot.template_id}`}
+                        {slot.doctor_name || (slot.doctor_id ? `Doctor #${slot.doctor_id}` : 'Assigned Doctor')}
                       </td>
                       <td className="px-4 py-2.5 text-slate-600">{slot.department_name || '—'}</td>
                       <td className="px-4 py-2.5">

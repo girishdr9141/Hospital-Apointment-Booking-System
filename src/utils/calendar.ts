@@ -42,7 +42,7 @@ export interface WorkingHourWindow {
   dayOffset?: 0 | 1;
   start_time: string;
   end_time: string;
-  template_id?: number;
+  template_id?: number | null;
   source: 'template' | 'working_hours';
 }
 
@@ -52,7 +52,7 @@ export interface DayWorkingSlotItem {
   dayOffset: 0 | 1;
   start_time: string;
   end_time: string;
-  template_id?: number;
+  template_id?: number | null;
   source: 'template' | 'working_hours' | 'existing';
   existingSlot: Slot | null;
   status: 'UNCONFIRMED' | 'AVAILABLE' | 'BOOKED' | 'CANCELLED';

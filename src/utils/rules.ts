@@ -107,13 +107,13 @@ export function enrichSlots(
   const deptById = new Map(departments.map((d) => [d.department_id, d]));
 
   return slots.map((slot) => {
-    const tmpl = templateById.get(slot.template_id);
-    const resolvedDoctorId = tmpl?.doctor_id ?? slot.doctor_id;
+    const tmpl = slot.template_id != null ? templateById.get(slot.template_id) : undefined;
+    const resolvedDoctorId = slot.doctor_id ?? tmpl?.doctor_id ?? undefined;
     const doc = resolvedDoctorId ? doctorById.get(resolvedDoctorId) : undefined;
     const dept = doc ? deptById.get(doc.department_id) : undefined;
     return {
       ...slot,
-      doctor_id: doc?.doctor_id ?? resolvedDoctorId ?? slot.doctor_id,
+      doctor_id: doc?.doctor_id ?? resolvedDoctorId ?? slot.doctor_id ?? null,
       doctor_name: doc ? `Dr. ${doc.first_name} ${doc.last_name}` : slot.doctor_name,
       department_id: doc?.department_id ?? slot.department_id,
       department_name: dept?.department_name ?? slot.department_name,

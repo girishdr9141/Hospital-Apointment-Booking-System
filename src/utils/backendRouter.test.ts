@@ -22,12 +22,16 @@ test('classifyEndpointPhase assigns every OPD resource to phases 1 through 5', (
 
   assert.equal(classifyEndpointPhase('slot_templates'), 'phase3');
   assert.equal(classifyEndpointPhase('slots/25082'), 'phase3');
+  assert.equal(classifyEndpointPhase('doctor-shifts'), 'phase3');
+  assert.equal(classifyEndpointPhase('shift-change-requests/SCR-101/decide'), 'phase3');
 
   assert.equal(classifyEndpointPhase('appointments/181/outcome'), 'phase4');
   assert.equal(classifyEndpointPhase('appointments/expire-holds'), 'phase4');
   assert.equal(classifyEndpointPhase('leaves/12/decide'), 'phase4');
   assert.equal(classifyEndpointPhase('payments'), 'phase4');
   assert.equal(classifyEndpointPhase('token_queue/5'), 'phase4');
+  assert.equal(classifyEndpointPhase('medical-records/MR-1001'), 'phase4');
+  assert.equal(classifyEndpointPhase('prescriptions/RX-2001'), 'phase4');
 
   assert.equal(classifyEndpointPhase('users'), 'phase5');
   assert.equal(classifyEndpointPhase('roles'), 'phase5');

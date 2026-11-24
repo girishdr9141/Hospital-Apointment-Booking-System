@@ -654,10 +654,12 @@ END;');
       p_comments       => NULL,
       p_source         => '
 DECLARE
+    v_body CLOB;
     v_days NUMBER := 30;
 BEGIN
-    IF :body_text IS NOT NULL THEN
-        APEX_JSON.PARSE(:body_text);
+    v_body := :body_text;
+    IF v_body IS NOT NULL AND DBMS_LOB.GETLENGTH(v_body) > 0 THEN
+        APEX_JSON.PARSE(v_body);
         v_days := NVL(APEX_JSON.GET_NUMBER(''days''), 30);
     END IF;
     GIRISH_GENERATE_SLOTS(P_DAYS => v_days);

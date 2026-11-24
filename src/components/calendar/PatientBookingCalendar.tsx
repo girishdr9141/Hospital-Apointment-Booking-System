@@ -529,7 +529,7 @@ export function PatientBookingCalendar({
                         )}
                       </div>
                       <p className="mt-1.5 text-sm font-medium text-slate-900">
-                        {slot.doctor_name || `Template #${slot.template_id}`}
+                        {slot.doctor_name || (slot.doctor_id ? `Doctor #${slot.doctor_id}` : 'Assigned Doctor')}
                       </p>
                       <div className="mt-0.5 flex items-center gap-2 text-xs text-slate-500">
                         <span>{slot.department_name || 'Outpatient'}</span>

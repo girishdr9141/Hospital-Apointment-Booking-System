@@ -18,12 +18,14 @@ import type {
   Doctor,
   DoctorLeave,
   DoctorShiftConfig,
+  MedicalRecordEntry,
   ModuleKey,
   Patient,
   Payment,
   PendingOutcomeItem,
   PermissionAction,
   PortalNotification,
+  PrescriptionEntry,
   RoleName,
   ShiftChangeRequest,
   ShiftSession,
@@ -119,6 +121,18 @@ import {
   writeClinicalStore,
   type PatientNotificationRecord,
 } from './server/clinicalStore.ts';
+import {
+  mergeByIdWithOraclePriority,
+  mergeShiftMaps,
+  parseOracleDoctorShiftRow,
+  parseOracleMedicalRecordRow,
+  parseOraclePrescriptionRow,
+  parseOracleShiftChangeRequestRow,
+  serializeDoctorShiftForOracle,
+  serializeMedicalRecordForOracle,
+  serializePrescriptionForOracle,
+  serializeShiftChangeRequestForOracle,
+} from './src/utils/clinicalAndShifts.ts';
 
 const HOSPITAL_TIMEZONE = process.env.HOSPITAL_TIMEZONE || DEFAULT_HOSPITAL_TIMEZONE;
 function getServerTodayIso(): string {
@@ -1044,6 +1058,10 @@ function writeShiftStore(data: ShiftStoreData): void {
   );
 }
 
+async function fetchSlotTemplatesSafe(): Promise<SlotTemplate[]> {
+  return fetchOrdsItems<SlotTemplate>('slot_templates').catch(() => [] as SlotTemplate[]);
+}
+
 function buildTemplateDoctorMap(
   templates: SlotTemplate[],
   store = readShiftStore(),
@@ -1059,6 +1077,19 @@ function buildTemplateDoctorMap(
   return map;
 }
 
+function resolveSlotDoctorId(
+  s: Pick<Slot, 'doctor_id' | 'template_id'>,
+  tmplDoctorMap: Map<number, number>,
+): number | undefined {
+  if (s.doctor_id != null && Number(s.doctor_id) > 0) {
+    return Number(s.doctor_id);
+  }
+  if (s.template_id != null) {
+    return tmplDoctorMap.get(s.template_id);
+  }
+  return undefined;
+}
+
 function attachDoctorIdsToSlots(
   rawSlots: Slot[],
   templates: SlotTemplate[],
@@ -1066,7 +1097,7 @@ function attachDoctorIdsToSlots(
 ): Slot[] {
   const tmplDoctorMap = buildTemplateDoctorMap(templates, store);
   return rawSlots.map((s) => {
-    const resolvedDocId = s.doctor_id ?? tmplDoctorMap.get(s.template_id);
+    const resolvedDocId = resolveSlotDoctorId(s, tmplDoctorMap);
     return resolvedDocId ? { ...s, doctor_id: resolvedDocId } : s;
   });
 }
@@ -1085,12 +1116,12 @@ function filterConfirmedSlots(
       if (s.booked_patients > 0 || s.status === 'SOLD_OUT') return true;
       // Drop orphaned/cancelled bulk-seeded slots; only keep AVAILABLE slots explicitly opened by the doctor
       if (s.status !== 'AVAILABLE') return false;
-      const doctorId = s.doctor_id ?? tmplDoctorMap.get(s.template_id);
+      const doctorId = resolveSlotDoctorId(s, tmplDoctorMap);
       if (!doctorId) return false;
       return openedSet.has(makeSlotKey(doctorId, s.slot_date, s.start_time));
     })
     .map((s) => {
-      const doctorId = s.doctor_id ?? tmplDoctorMap.get(s.template_id);
+      const doctorId = resolveSlotDoctorId(s, tmplDoctorMap);
       return doctorId ? { ...s, doctor_id: doctorId } : s;
     });
 }
@@ -1163,44 +1194,48 @@ async function syncShiftToOracleTemplates(
   durationMins: number,
   workingDays: string[],
 ): Promise<void> {
-  const existingTemplates = await fetchOrdsItems<SlotTemplate>('slot_templates');
-  const activeDocTemplates = existingTemplates.filter(
-    (t) => t.doctor_id === doctorId && t.is_active === 'Y',
-  );
+  try {
+    const existingTemplates = await fetchSlotTemplatesSafe();
+    const activeDocTemplates = existingTemplates.filter(
+      (t) => t.doctor_id === doctorId && t.is_active === 'Y',
+    );
 
-  // Remember template -> doctor attribution before deactivating so booked historical slots keep doctor_id
-  if (activeDocTemplates.length > 0) {
-    const store = readShiftStore();
+    // Remember template -> doctor attribution before deactivating so booked historical slots keep doctor_id
+    if (activeDocTemplates.length > 0) {
+      const store = readShiftStore();
+      for (const tmpl of activeDocTemplates) {
+        store.template_doctor_map[String(tmpl.template_id)] = doctorId;
+      }
+      writeShiftStore(store);
+    }
+
+    // Deactivate old active templates for this doctor so Oracle templates match the new approved shift
     for (const tmpl of activeDocTemplates) {
-      store.template_doctor_map[String(tmpl.template_id)] = doctorId;
+      try {
+        await fetchOrdsJson(`slot_templates/${tmpl.template_id}`, { method: 'DELETE' });
+      } catch {
+        // Continue syncing remaining templates
+      }
     }
-    writeShiftStore(store);
-  }
 
-  // Deactivate old active templates for this doctor so Oracle templates match the new approved shift
-  for (const tmpl of activeDocTemplates) {
-    try {
-      await fetchOrdsJson(`slot_templates/${tmpl.template_id}`, { method: 'DELETE' });
-    } catch {
-      // Continue syncing remaining templates
+    const daysToSync = workingDays.length > 0 ? workingDays : DEFAULT_WORKING_DAYS;
+    for (const day of daysToSync) {
+      for (const sess of sessions) {
+        await fetchOrdsJson('slot_templates', {
+          method: 'POST',
+          body: JSON.stringify({
+            doctor_id: doctorId,
+            day_of_week: day.toUpperCase(),
+            start_time: sess.start_time,
+            end_time: sess.end_time,
+            slot_duration_mins: durationMins,
+            max_patients_per_slot: 1,
+          }),
+        });
+      }
     }
-  }
-
-  const daysToSync = workingDays.length > 0 ? workingDays : DEFAULT_WORKING_DAYS;
-  for (const day of daysToSync) {
-    for (const sess of sessions) {
-      await fetchOrdsJson('slot_templates', {
-        method: 'POST',
-        body: JSON.stringify({
-          doctor_id: doctorId,
-          day_of_week: day.toUpperCase(),
-          start_time: sess.start_time,
-          end_time: sess.end_time,
-          slot_duration_mins: durationMins,
-          max_patients_per_slot: 1,
-        }),
-      });
-    }
+  } catch {
+    // Legacy GIRISH_SLOT_TEMPLATES is optional once GIRISH_DOCTOR_SHIFT_WINDOWS + GIRISH_SLOTS.DOCTOR_ID are active
   }
 }
 
@@ -1208,17 +1243,149 @@ async function getBookedPatientIdsForDoctor(doctorId: number): Promise<Set<numbe
   const [appointments, slots, templates] = await Promise.all([
     fetchOrdsItems<Appointment>('appointments'),
     fetchOrdsItems<Slot>('slots'),
-    fetchOrdsItems<SlotTemplate>('slot_templates'),
+    fetchSlotTemplatesSafe(),
   ]);
   const tmplDoctorMap = buildTemplateDoctorMap(templates);
   const docSlotIds = new Set(
     slots
-      .filter((s) => (s.doctor_id ?? tmplDoctorMap.get(s.template_id)) === doctorId)
+      .filter((s) => resolveSlotDoctorId(s, tmplDoctorMap) === doctorId)
       .map((s) => s.slot_id),
   );
   return new Set(
     appointments.filter((a) => docSlotIds.has(a.slot_id)).map((a) => a.patient_id),
   );
+}
+
+function isMissingOracleEndpointError(err: unknown): boolean {
+  const statusCode = (err as { statusCode?: number } | null)?.statusCode;
+  if (statusCode === 404) return true;
+  const msg = err instanceof Error ? err.message : String(err || '');
+  return /\b404\b|not found/i.test(msg);
+}
+
+async function loadShiftStoreHydrated(): Promise<ShiftStoreData> {
+  const local = readShiftStore();
+  const [oracleShiftRows, oracleReqRows] = await Promise.all([
+    fetchOrdsItems<Record<string, unknown>>('doctor-shifts').catch((err) => {
+      if (!isMissingOracleEndpointError(err)) {
+        // Fallback safely to local cache on transient read errors
+      }
+      return null;
+    }),
+    fetchOrdsItems<Record<string, unknown>>('shift-change-requests').catch((err) => {
+      if (!isMissingOracleEndpointError(err)) {
+        // Fallback safely to local cache on transient read errors
+      }
+      return null;
+    }),
+  ]);
+
+  const parsedShifts = (oracleShiftRows || [])
+    .map(parseOracleDoctorShiftRow)
+    .filter((s): s is DoctorShiftConfig => Boolean(s));
+  const parsedReqs = (oracleReqRows || [])
+    .map(parseOracleShiftChangeRequestRow)
+    .filter((r): r is ShiftChangeRequest => Boolean(r));
+
+  return {
+    ...local,
+    shifts: parsedShifts.length > 0 ? mergeShiftMaps(parsedShifts, local.shifts) : local.shifts,
+    change_requests:
+      parsedReqs.length > 0
+        ? mergeByIdWithOraclePriority(
+            parsedReqs,
+            local.change_requests,
+            (r) => r.request_id,
+            (r) => r.requested_on,
+          )
+        : local.change_requests,
+  };
+}
+
+async function syncDoctorShiftToOracle(shift: DoctorShiftConfig): Promise<void> {
+  try {
+    const resp = await fetchOrdsJson<{ status?: string; message?: string }>('doctor-shifts', {
+      method: 'POST',
+      body: JSON.stringify(serializeDoctorShiftForOracle(shift)),
+    });
+    if (resp?.status === 'error') {
+      throw new Error(resp.message || 'Oracle rejected doctor shift update');
+    }
+  } catch (err) {
+    if (isMissingOracleEndpointError(err)) return;
+    throw err;
+  }
+}
+
+async function syncShiftChangeRequestToOracle(reqItem: ShiftChangeRequest): Promise<void> {
+  try {
+    const resp = await fetchOrdsJson<{ status?: string; message?: string }>('shift-change-requests', {
+      method: 'POST',
+      body: JSON.stringify(serializeShiftChangeRequestForOracle(reqItem)),
+    });
+    if (resp?.status === 'error') {
+      throw new Error(resp.message || 'Oracle rejected shift change request');
+    }
+  } catch (err) {
+    if (isMissingOracleEndpointError(err)) return;
+    throw err;
+  }
+}
+
+async function syncShiftChangeDecisionToOracle(
+  requestId: string,
+  decision: 'APPROVED' | 'REJECTED',
+  decidedBy: string,
+  comments: string | null,
+): Promise<void> {
+  try {
+    const resp = await fetchOrdsJson<{ status?: string; message?: string }>(
+      `shift-change-requests/${encodeURIComponent(requestId)}/decide`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          decision,
+          decided_by: decidedBy,
+          comments,
+        }),
+      },
+    );
+    if (resp?.status === 'error') {
+      if (/not found/i.test(resp.message || '')) return;
+      throw new Error(resp.message || 'Oracle rejected shift change decision');
+    }
+  } catch (err) {
+    if (isMissingOracleEndpointError(err)) return;
+    throw err;
+  }
+}
+
+async function loadMedicalRecordsHydrated(): Promise<MedicalRecordEntry[]> {
+  const local = readClinicalStore().medical_records;
+  try {
+    const rows = await fetchOrdsItems<Record<string, unknown>>('medical-records');
+    const parsed = rows
+      .map(parseOracleMedicalRecordRow)
+      .filter((r): r is MedicalRecordEntry => Boolean(r));
+    return parsed;
+  } catch (err) {
+    if (isMissingOracleEndpointError(err)) return local;
+    return local;
+  }
+}
+
+async function loadPrescriptionsHydrated(): Promise<PrescriptionEntry[]> {
+  const local = readClinicalStore().prescriptions;
+  try {
+    const rows = await fetchOrdsItems<Record<string, unknown>>('prescriptions');
+    const parsed = rows
+      .map(parseOraclePrescriptionRow)
+      .filter((p): p is PrescriptionEntry => Boolean(p));
+    return parsed;
+  } catch (err) {
+    if (isMissingOracleEndpointError(err)) return local;
+    return local;
+  }
 }
 
 async function startServer() {
@@ -2093,7 +2260,7 @@ async function startServer() {
         user.role === 'PATIENT' ? Promise.resolve([] as Patient[]) : fetchOrdsItems<Patient>('patients'),
         fetchOrdsItems<Appointment>('appointments'),
         fetchOrdsItems<Slot>('slots'),
-        fetchOrdsItems<SlotTemplate>('slot_templates'),
+        fetchSlotTemplatesSafe(),
         fetchOrdsItems<Payment>('payments'),
         fetchOrdsItems<TokenQueueItem>('token_queue'),
         user.role === 'PATIENT'
@@ -2126,7 +2293,7 @@ async function startServer() {
       ).filter((d): d is Department => Boolean(d));
       const departmentsForJoin = [...departments, ...extraDepts];
 
-      const shiftStore = readShiftStore();
+      const shiftStore = await loadShiftStoreHydrated();
       const paymentsWithRefunds = attachRefundsToPayments(payments);
       const confirmedRawSlots = filterConfirmedSlots(rawSlots, templates, shiftStore);
       const rawSlotsWithDoctors = attachDoctorIdsToSlots(rawSlots, templates, shiftStore);
@@ -2368,7 +2535,7 @@ async function startServer() {
           fetchOrdsItems<Patient>('patients'),
           fetchOrdsItems<Appointment>('appointments'),
           fetchOrdsItems<Slot>('slots'),
-          fetchOrdsItems<SlotTemplate>('slot_templates'),
+          fetchSlotTemplatesSafe(),
           fetchOrdsItems<Payment>('payments'),
         ]);
 
@@ -2535,7 +2702,7 @@ async function startServer() {
   });
 
   async function buildNotificationsForUser(user: AuthUser): Promise<PortalNotification[]> {
-    const shiftStore = readShiftStore();
+    const shiftStore = await loadShiftStoreHydrated();
     const ackKey = `${user.role}:${user.user_id}`;
     const dismissed = new Set(readNotificationAcks()[ackKey] || []);
     const list: PortalNotification[] = [];
@@ -2714,7 +2881,7 @@ async function startServer() {
   app.post('/api/notifications/dismiss', requireAuth, handleNotificationAck);
   app.post('/api/notifications/read', requireAuth, handleNotificationAck);
 
-  // Helper to resolve or create a weekday slot template for a doctor
+  // Helper to resolve or create a weekday slot template ONLY as a pre-migration legacy fallback
   async function ensureDoctorWeekdayTemplate(
     doctorId: number,
     weekday: string,
@@ -2743,7 +2910,7 @@ async function startServer() {
       }),
     });
 
-    const refreshed = await fetchOrdsItems<SlotTemplate>('slot_templates');
+    const refreshed = await fetchSlotTemplatesSafe();
     const created = refreshed.find(
       (t) =>
         t.doctor_id === doctorId &&
@@ -2757,15 +2924,82 @@ async function startServer() {
     return created.template_id;
   }
 
+  async function createOracleSlotForDoctor(params: {
+    doctorId: number;
+    slotDate: string;
+    startTime: string;
+    endTime: string;
+    maxPatientsPerSlot: number;
+    fallbackStart: string;
+    fallbackEnd: string;
+    fallbackDur: number;
+    cachedTemplates: SlotTemplate[];
+  }): Promise<{ slot_id?: number; template_id: number | null }> {
+    const directRes = await fetchOrdsJson<{
+      status?: string;
+      message?: string;
+      slot_id?: number;
+    }>('slots', {
+      method: 'POST',
+      body: JSON.stringify({
+        doctor_id: params.doctorId,
+        slot_date: params.slotDate,
+        start_time: params.startTime,
+        end_time: params.endTime,
+        max_patients_per_slot: params.maxPatientsPerSlot,
+      }),
+    });
+
+    if (directRes.status !== 'error') {
+      return { slot_id: directRes.slot_id, template_id: null };
+    }
+
+    const msg = directRes.message || 'Oracle rejected slot creation';
+    // Graceful compatibility if script 13 (DOCTOR_ID column + nullable TEMPLATE_ID) hasn't been executed in APEX yet
+    if (!/TEMPLATE_ID|ORA-01400|cannot insert NULL/i.test(msg)) {
+      throw new Error(msg);
+    }
+
+    const weekday = getWeekdayName(params.slotDate);
+    const tmplId = await ensureDoctorWeekdayTemplate(
+      params.doctorId,
+      weekday,
+      params.fallbackStart,
+      params.fallbackEnd,
+      params.fallbackDur,
+      params.cachedTemplates,
+    );
+
+    const legacyRes = await fetchOrdsJson<{
+      status?: string;
+      message?: string;
+      slot_id?: number;
+    }>('slots', {
+      method: 'POST',
+      body: JSON.stringify({
+        doctor_id: params.doctorId,
+        template_id: tmplId,
+        slot_date: params.slotDate,
+        start_time: params.startTime,
+        end_time: params.endTime,
+        max_patients_per_slot: params.maxPatientsPerSlot,
+      }),
+    });
+    if (legacyRes.status === 'error') {
+      throw new Error(legacyRes.message || 'Oracle rejected slot creation');
+    }
+    return { slot_id: legacyRes.slot_id, template_id: tmplId };
+  }
+
   // Doctor Shift Window & Shift Change Approval Endpoints
   app.get('/api/doctor/shifts', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
     try {
-      const [doctors, templates] = await Promise.all([
+      const [doctors, templates, store] = await Promise.all([
         fetchOrdsItems<Doctor>('doctors'),
-        fetchOrdsItems<SlotTemplate>('slot_templates'),
+        fetchSlotTemplatesSafe(),
+        loadShiftStoreHydrated(),
       ]);
-      const store = readShiftStore();
 
       if (user.role === 'DOCTOR') {
         if (!user.doctor_id) {
@@ -2836,12 +3070,12 @@ async function startServer() {
         return;
       }
 
-      const [doctors, templates] = await Promise.all([
+      const [doctors, templates, hydratedStore] = await Promise.all([
         fetchOrdsItems<Doctor>('doctors'),
-        fetchOrdsItems<SlotTemplate>('slot_templates'),
+        fetchSlotTemplatesSafe(),
+        loadShiftStoreHydrated(),
       ]);
-      const store = readShiftStore();
-      const existing = resolveDoctorShift(user.doctor_id, templates, user.full_name, store);
+      const existing = resolveDoctorShift(user.doctor_id, templates, user.full_name, hydratedStore);
       if (existing.is_registered) {
         res.status(400).json({
           status: 'error',
@@ -2866,6 +3100,9 @@ async function startServer() {
         registered_at: nowIso,
         updated_at: nowIso,
       };
+      await syncDoctorShiftToOracle(savedShift);
+
+      const store = readShiftStore();
       store.shifts[String(user.doctor_id)] = savedShift;
       writeShiftStore(store);
 
@@ -2910,12 +3147,12 @@ async function startServer() {
         return;
       }
 
-      const [doctors, templates] = await Promise.all([
+      const [doctors, templates, hydratedStore] = await Promise.all([
         fetchOrdsItems<Doctor>('doctors'),
-        fetchOrdsItems<SlotTemplate>('slot_templates'),
+        fetchSlotTemplatesSafe(),
+        loadShiftStoreHydrated(),
       ]);
-      const store = readShiftStore();
-      const alreadyPending = store.change_requests.find(
+      const alreadyPending = hydratedStore.change_requests.find(
         (r) => r.doctor_id === user.doctor_id && r.status === 'PENDING',
       );
       if (alreadyPending) {
@@ -2928,7 +3165,7 @@ async function startServer() {
 
       const doc = doctors.find((d) => d.doctor_id === user.doctor_id);
       const doctorName = doc ? `Dr. ${doc.first_name} ${doc.last_name}` : user.full_name;
-      const currentShift = resolveDoctorShift(user.doctor_id, templates, doctorName, store);
+      const currentShift = resolveDoctorShift(user.doctor_id, templates, doctorName, hydratedStore);
 
       const changeReq: ShiftChangeRequest = {
         request_id: `SCR-${Date.now()}`,
@@ -2948,6 +3185,9 @@ async function startServer() {
         decision_comments: null,
       };
 
+      await syncShiftChangeRequestToOracle(changeReq);
+
+      const store = readShiftStore();
       store.change_requests.unshift(changeReq);
       writeShiftStore(store);
 
@@ -2964,10 +3204,10 @@ async function startServer() {
     }
   });
 
-  app.get('/api/admin/shift-change-requests', requireAuth, (req, res) => {
+  app.get('/api/admin/shift-change-requests', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
     if (!requirePermission(user, res, 'SLOTS:UPDATE', 'Shift Change Requests')) return;
-    const store = readShiftStore();
+    const store = await loadShiftStoreHydrated();
     res.json({ status: 'success', requests: store.change_requests });
   });
 
@@ -2991,8 +3231,8 @@ async function startServer() {
       return;
     }
 
-    const store = readShiftStore();
-    const target = store.change_requests.find((r) => r.request_id === requestId);
+    const hydratedStore = await loadShiftStoreHydrated();
+    const target = hydratedStore.change_requests.find((r) => r.request_id === requestId);
     if (!target) {
       res.status(404).json({ status: 'error', message: 'Shift change request not found' });
       return;
@@ -3004,15 +3244,23 @@ async function startServer() {
 
     try {
       const nowIso = new Date().toISOString();
-      if (decision === 'APPROVED') {
+      const typedDecision = decision as 'APPROVED' | 'REJECTED';
+
+      if (typedDecision === 'APPROVED') {
         await syncShiftToOracleTemplates(
           target.doctor_id,
           target.requested_sessions,
           target.requested_slot_duration_mins,
           target.requested_working_days,
         );
+      }
+
+      await syncShiftChangeDecisionToOracle(requestId, typedDecision, user.full_name, comments);
+
+      const store = readShiftStore();
+      if (typedDecision === 'APPROVED') {
         const existingShift = store.shifts[String(target.doctor_id)];
-        store.shifts[String(target.doctor_id)] = {
+        const updatedShift: DoctorShiftConfig = {
           doctor_id: target.doctor_id,
           doctor_name: target.doctor_name,
           sessions: target.requested_sessions,
@@ -3022,21 +3270,32 @@ async function startServer() {
           registered_at: existingShift?.registered_at || nowIso,
           updated_at: nowIso,
         };
+        store.shifts[String(target.doctor_id)] = updatedShift;
+        await syncDoctorShiftToOracle(updatedShift);
       }
 
-      target.status = decision as 'APPROVED' | 'REJECTED';
-      target.decided_on = nowIso;
-      target.decided_by = user.full_name;
-      target.decision_comments = comments;
+      const localIdx = store.change_requests.findIndex((r) => r.request_id === requestId);
+      const updatedReq: ShiftChangeRequest = {
+        ...target,
+        status: typedDecision,
+        decided_on: nowIso,
+        decided_by: user.full_name,
+        decision_comments: comments,
+      };
+      if (localIdx >= 0) {
+        store.change_requests[localIdx] = updatedReq;
+      } else {
+        store.change_requests.unshift(updatedReq);
+      }
       writeShiftStore(store);
 
       res.json({
         status: 'success',
         message:
-          decision === 'APPROVED'
+          typedDecision === 'APPROVED'
             ? `Shift change approved for ${target.doctor_name} (${formatShiftSummary(target.requested_sessions, target.requested_slot_duration_mins)})`
             : `Shift change request rejected for ${target.doctor_name}`,
-        request: target,
+        request: updatedReq,
       });
     } catch (err) {
       res.status(502).json({
@@ -3104,23 +3363,23 @@ async function startServer() {
 
     try {
       const [templates, existingSlots, leaves] = await Promise.all([
-        fetchOrdsItems<SlotTemplate>('slot_templates'),
+        fetchSlotTemplatesSafe(),
         fetchOrdsItems<Slot>('slots'),
         fetchOrdsItems<DoctorLeave>('leaves').catch(() => [] as DoctorLeave[]),
       ]);
 
-      const store = readShiftStore();
+      const [store, hydratedShiftStore] = [readShiftStore(), await loadShiftStoreHydrated()];
       const openedSet = new Set(store.opened_slot_keys);
 
-      const shift = resolveDoctorShift(targetDoctorId, templates, user.full_name, store);
+      const shift = resolveDoctorShift(targetDoctorId, templates, user.full_name, hydratedShiftStore);
       const fallbackStart = shift.sessions[0]?.start_time || '09:00';
       const fallbackEnd = shift.sessions[0]?.end_time || '17:00';
       const fallbackDur = shift.slot_duration_mins || 30;
 
-      const docTemplateIds = new Set(
-        templates.filter((t) => t.doctor_id === targetDoctorId).map((t) => t.template_id),
+      const tmplDoctorMap = buildTemplateDoctorMap(templates, hydratedShiftStore);
+      const docExistingSlots = existingSlots.filter(
+        (s) => resolveSlotDoctorId(s, tmplDoctorMap) === targetDoctorId,
       );
-      const docExistingSlots = existingSlots.filter((s) => docTemplateIds.has(s.template_id));
 
       let createdCount = 0;
       let skippedCount = 0;
@@ -3151,40 +3410,22 @@ async function startServer() {
           continue;
         }
 
-        let tmplId =
-          reqSlot.template_id && docTemplateIds.has(reqSlot.template_id)
-            ? reqSlot.template_id
-            : undefined;
-        if (!tmplId) {
-          const weekday = getWeekdayName(reqSlot.slot_date);
-          tmplId = await ensureDoctorWeekdayTemplate(
-            targetDoctorId,
-            weekday,
-            fallbackStart,
-            fallbackEnd,
-            fallbackDur,
-            templates,
-          );
-          docTemplateIds.add(tmplId);
-        }
-
-        const createdRes = await fetchOrdsJson<{ status?: string; message?: string }>('slots', {
-          method: 'POST',
-          body: JSON.stringify({
-            template_id: tmplId,
-            slot_date: reqSlot.slot_date,
-            start_time: reqSlot.start_time,
-            end_time: reqSlot.end_time,
-            max_patients_per_slot: reqSlot.max_patients_per_slot || 1,
-          }),
+        const created = await createOracleSlotForDoctor({
+          doctorId: targetDoctorId,
+          slotDate: reqSlot.slot_date,
+          startTime: reqSlot.start_time,
+          endTime: reqSlot.end_time,
+          maxPatientsPerSlot: reqSlot.max_patients_per_slot || 1,
+          fallbackStart,
+          fallbackEnd,
+          fallbackDur,
+          cachedTemplates: templates,
         });
-        if (createdRes.status === 'error') {
-          throw new Error(createdRes.message || 'Oracle rejected slot creation');
-        }
 
         docExistingSlots.push({
-          slot_id: -Date.now(),
-          template_id: tmplId,
+          slot_id: created.slot_id ?? -Date.now(),
+          doctor_id: targetDoctorId,
+          template_id: created.template_id,
           slot_date: reqSlot.slot_date,
           start_time: reqSlot.start_time,
           end_time: reqSlot.end_time,
@@ -3240,7 +3481,7 @@ async function startServer() {
 
     try {
       const [templates, existingSlots, leaves] = await Promise.all([
-        fetchOrdsItems<SlotTemplate>('slot_templates'),
+        fetchSlotTemplatesSafe(),
         fetchOrdsItems<Slot>('slots'),
         fetchOrdsItems<DoctorLeave>('leaves').catch(() => [] as DoctorLeave[]),
       ]);
@@ -3253,12 +3494,14 @@ async function startServer() {
         return;
       }
 
-      const store = readShiftStore();
+      const [store, hydratedShiftStore] = [readShiftStore(), await loadShiftStoreHydrated()];
       const openedSet = new Set(store.opened_slot_keys);
-      const shift = resolveDoctorShift(targetDoctorId, templates, user.full_name, store);
+      const shift = resolveDoctorShift(targetDoctorId, templates, user.full_name, hydratedShiftStore);
       const docTemplates = templates.filter((t) => t.doctor_id === targetDoctorId);
-      const docTemplateIds = new Set(docTemplates.map((t) => t.template_id));
-      const docExistingSlots = existingSlots.filter((s) => docTemplateIds.has(s.template_id));
+      const tmplDoctorMap = buildTemplateDoctorMap(templates, hydratedShiftStore);
+      const docExistingSlots = existingSlots.filter(
+        (s) => resolveSlotDoctorId(s, tmplDoctorMap) === targetDoctorId,
+      );
 
       const allWindows = buildWorkingHourWindows(targetDate, docTemplates, {
         shiftConfig: shift,
@@ -3297,36 +3540,21 @@ async function startServer() {
           continue;
         }
 
-        let tmplId = w.template_id;
-        if (!tmplId) {
-          const weekday = getWeekdayName(wDate);
-          tmplId = await ensureDoctorWeekdayTemplate(
-            targetDoctorId,
-            weekday,
-            shift.sessions[0]?.start_time || '09:00',
-            shift.sessions[0]?.end_time || '17:00',
-            shift.slot_duration_mins || 30,
-            docTemplates,
-          );
-          docTemplateIds.add(tmplId);
-        }
-
-        const createdRes = await fetchOrdsJson<{ status?: string; message?: string }>('slots', {
-          method: 'POST',
-          body: JSON.stringify({
-            template_id: tmplId,
-            slot_date: wDate,
-            start_time: w.start_time,
-            end_time: w.end_time,
-            max_patients_per_slot: 1,
-          }),
+        const created = await createOracleSlotForDoctor({
+          doctorId: targetDoctorId,
+          slotDate: wDate,
+          startTime: w.start_time,
+          endTime: w.end_time,
+          maxPatientsPerSlot: 1,
+          fallbackStart: shift.sessions[0]?.start_time || '09:00',
+          fallbackEnd: shift.sessions[0]?.end_time || '17:00',
+          fallbackDur: shift.slot_duration_mins || 30,
+          cachedTemplates: templates,
         });
-        if (createdRes.status === 'error') {
-          throw new Error(createdRes.message || 'Oracle rejected slot creation');
-        }
         docExistingSlots.push({
-          slot_id: -Date.now(),
-          template_id: tmplId,
+          slot_id: created.slot_id ?? -Date.now(),
+          doctor_id: targetDoctorId,
+          template_id: created.template_id,
           slot_date: wDate,
           start_time: w.start_time,
           end_time: w.end_time,
@@ -3385,7 +3613,7 @@ async function startServer() {
         await Promise.all([
           fetchOrdsItems<Appointment>('appointments'),
           fetchOrdsItems<Slot>('slots'),
-          fetchOrdsItems<SlotTemplate>('slot_templates'),
+          fetchSlotTemplatesSafe(),
           fetchOrdsItems<Doctor>('doctors'),
           fetchOrdsItems<Department>('departments/'),
           fetchOrdsItems<Payment>('payments').catch(() => [] as Payment[]),
@@ -4345,8 +4573,7 @@ async function startServer() {
   app.get('/api/clinical/records', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
     if (!requirePermission(user, res, 'MEDICAL_RECORDS:VIEW', 'Medical Records')) return;
-    const store = readClinicalStore();
-    let records = store.medical_records;
+    let records = await loadMedicalRecordsHydrated();
     if (user.role === 'PATIENT') {
       records = records.filter((r) => r.patient_id === user.patient_id);
     } else if (user.role === 'DOCTOR' && user.doctor_id) {
@@ -4380,8 +4607,7 @@ async function startServer() {
       return;
     }
 
-    const store = readClinicalStore();
-    const entry = {
+    const entry: MedicalRecordEntry = {
       record_id: `MR-${Date.now()}`,
       patient_id: patientId,
       patient_name: patientName || `Patient #${patientId}`,
@@ -4395,6 +4621,27 @@ async function startServer() {
       clinical_notes: clinicalNotes || 'Recorded during OPD consultation.',
       updated_at: new Date().toISOString(),
     };
+
+    try {
+      const ordsRes = await fetchOrdsJson<{ status?: string; message?: string }>('medical-records', {
+        method: 'POST',
+        body: JSON.stringify(serializeMedicalRecordForOracle(entry)),
+      });
+      if (ordsRes?.status === 'error') {
+        res.status(400).json({ status: 'error', message: ordsRes.message || 'Unable to save medical record in Oracle' });
+        return;
+      }
+    } catch (err) {
+      if (!isMissingOracleEndpointError(err)) {
+        res.status(502).json({
+          status: 'error',
+          message: err instanceof Error ? err.message : 'Unable to save medical record in Oracle',
+        });
+        return;
+      }
+    }
+
+    const store = readClinicalStore();
     store.medical_records.unshift(entry);
     writeClinicalStore(store);
 
@@ -4413,16 +4660,15 @@ async function startServer() {
     res.status(201).json({ status: 'success', record: entry });
   });
 
-  app.put('/api/clinical/records/:id', requireAuth, (req, res) => {
+  app.put('/api/clinical/records/:id', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
     if (!requirePermission(user, res, 'MEDICAL_RECORDS:UPDATE', 'Update Medical Record')) return;
-    const store = readClinicalStore();
-    const idx = store.medical_records.findIndex((r) => r.record_id === req.params.id);
-    if (idx < 0) {
+    const allRecords = await loadMedicalRecordsHydrated();
+    const current = allRecords.find((r) => r.record_id === req.params.id);
+    if (!current) {
       res.status(404).json({ status: 'error', message: 'Medical record not found.' });
       return;
     }
-    const current = store.medical_records[idx];
     if (user.role === 'DOCTOR' && user.doctor_id && current.doctor_id !== user.doctor_id) {
       res.status(403).json({
         status: 'error',
@@ -4430,14 +4676,53 @@ async function startServer() {
       });
       return;
     }
-    store.medical_records[idx] = {
+
+    const updatedRecord: MedicalRecordEntry = {
       ...current,
       chief_complaint: String(req.body?.chief_complaint ?? current.chief_complaint).trim(),
       diagnosis: String(req.body?.diagnosis ?? current.diagnosis).trim(),
-      vitals_summary: req.body?.vitals_summary !== undefined ? String(req.body.vitals_summary).trim() || null : current.vitals_summary,
+      vitals_summary:
+        req.body?.vitals_summary !== undefined
+          ? String(req.body.vitals_summary).trim() || null
+          : current.vitals_summary,
       clinical_notes: String(req.body?.clinical_notes ?? current.clinical_notes).trim(),
       updated_at: new Date().toISOString(),
     };
+
+    try {
+      const ordsRes = await fetchOrdsJson<{ status?: string; message?: string }>(
+        `medical-records/${encodeURIComponent(req.params.id)}`,
+        {
+          method: 'PUT',
+          body: JSON.stringify({
+            chief_complaint: updatedRecord.chief_complaint,
+            diagnosis: updatedRecord.diagnosis,
+            vitals_summary: updatedRecord.vitals_summary,
+            clinical_notes: updatedRecord.clinical_notes,
+          }),
+        },
+      );
+      if (ordsRes?.status === 'error') {
+        res.status(400).json({ status: 'error', message: ordsRes.message || 'Unable to update medical record in Oracle' });
+        return;
+      }
+    } catch (err) {
+      if (!isMissingOracleEndpointError(err)) {
+        res.status(502).json({
+          status: 'error',
+          message: err instanceof Error ? err.message : 'Unable to update medical record in Oracle',
+        });
+        return;
+      }
+    }
+
+    const store = readClinicalStore();
+    const idx = store.medical_records.findIndex((r) => r.record_id === req.params.id);
+    if (idx >= 0) {
+      store.medical_records[idx] = updatedRecord;
+    } else {
+      store.medical_records.unshift(updatedRecord);
+    }
     writeClinicalStore(store);
 
     recordRbacAuditLog({
@@ -4451,28 +4736,53 @@ async function startServer() {
       severity: 'info',
     });
 
-    res.json({ status: 'success', record: store.medical_records[idx] });
+    res.json({ status: 'success', record: updatedRecord });
   });
 
-  app.delete('/api/clinical/records/:id', requireAuth, (req, res) => {
+  app.delete('/api/clinical/records/:id', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
     if (!requirePermission(user, res, 'MEDICAL_RECORDS:DELETE', 'Delete Medical Record')) return;
-    const store = readClinicalStore();
-    const idx = store.medical_records.findIndex((r) => r.record_id === req.params.id);
-    if (idx < 0) {
+    const allRecords = await loadMedicalRecordsHydrated();
+    const current = allRecords.find((r) => r.record_id === req.params.id);
+    if (!current) {
       res.status(404).json({ status: 'error', message: 'Medical record not found.' });
       return;
     }
-    const [removed] = store.medical_records.splice(idx, 1);
-    writeClinicalStore(store);
+
+    try {
+      const ordsRes = await fetchOrdsJson<{ status?: string; message?: string }>(
+        `medical-records/${encodeURIComponent(req.params.id)}`,
+        { method: 'DELETE' },
+      );
+      if (ordsRes?.status === 'error') {
+        res.status(400).json({ status: 'error', message: ordsRes.message || 'Unable to delete medical record in Oracle' });
+        return;
+      }
+    } catch (err) {
+      if (!isMissingOracleEndpointError(err)) {
+        res.status(502).json({
+          status: 'error',
+          message: err instanceof Error ? err.message : 'Unable to delete medical record in Oracle',
+        });
+        return;
+      }
+    }
+
+    const store = readClinicalStore();
+    const idx = store.medical_records.findIndex((r) => r.record_id === req.params.id);
+    if (idx >= 0) {
+      store.medical_records.splice(idx, 1);
+      writeClinicalStore(store);
+    }
+
     recordRbacAuditLog({
       actor_user_id: user.user_id,
       actor_name: user.full_name,
       actor_role: user.role,
-      target_label: `${removed.patient_name} (${removed.record_id})`,
+      target_label: `${current.patient_name} (${current.record_id})`,
       action: 'MEDICAL_RECORD_DELETED',
       category: 'CLINICAL',
-      details: `Deleted medical record ${removed.record_id}.`,
+      details: `Deleted medical record ${current.record_id}.`,
       severity: 'warning',
     });
     res.json({ status: 'success', message: 'Medical record deleted.' });
@@ -4481,8 +4791,7 @@ async function startServer() {
   app.get('/api/clinical/prescriptions', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
     if (!requirePermission(user, res, 'PRESCRIPTIONS:VIEW', 'Prescriptions')) return;
-    const store = readClinicalStore();
-    let prescriptions = store.prescriptions;
+    let prescriptions = await loadPrescriptionsHydrated();
     if (user.role === 'PATIENT') {
       prescriptions = prescriptions.filter((p) => p.patient_id === user.patient_id);
     } else if (user.role === 'DOCTOR' && user.doctor_id) {
@@ -4507,7 +4816,8 @@ async function startServer() {
     const initialStore = readClinicalStore();
     if (idempotencyKey && initialStore.prescription_idempotency[`POST:${idempotencyKey}`]) {
       const existingId = initialStore.prescription_idempotency[`POST:${idempotencyKey}`];
-      const existingRx = initialStore.prescriptions.find((p) => p.prescription_id === existingId);
+      const existingList = await loadPrescriptionsHydrated();
+      const existingRx = existingList.find((p) => p.prescription_id === existingId);
       if (existingRx) {
         res.status(200).json({ status: 'success', prescription: existingRx, deduplicated: true });
         return;
@@ -4539,13 +4849,13 @@ async function startServer() {
     }
 
     try {
-      const [rawAppts, rawSlots, templates, doctors] = await Promise.all([
+      const [rawAppts, rawSlots, templates, doctors, shiftStore] = await Promise.all([
         fetchOrdsItems<Appointment>('appointments'),
         fetchOrdsItems<Slot>('slots'),
-        fetchOrdsItems<SlotTemplate>('slot_templates'),
+        fetchSlotTemplatesSafe(),
         fetchOrdsItems<Doctor>('doctors'),
+        loadShiftStoreHydrated(),
       ]);
-      const shiftStore = readShiftStore();
       const joinedSlots = enrichSlots(
         attachDoctorIdsToSlots(rawSlots, templates, shiftStore),
         templates,
@@ -4624,14 +4934,15 @@ async function startServer() {
       const store = readClinicalStore();
       if (idempotencyKey && store.prescription_idempotency[`POST:${idempotencyKey}`]) {
         const existingId = store.prescription_idempotency[`POST:${idempotencyKey}`];
-        const existingRx = store.prescriptions.find((p) => p.prescription_id === existingId);
+        const existingList = await loadPrescriptionsHydrated();
+        const existingRx = existingList.find((p) => p.prescription_id === existingId);
         if (existingRx) {
           res.status(200).json({ status: 'success', prescription: existingRx, deduplicated: true });
           return;
         }
       }
 
-      const entry = {
+      const entry: PrescriptionEntry = {
         prescription_id: `RX-${Date.now()}`,
         patient_id: patientId,
         patient_name: resolvedPatientName,
@@ -4651,11 +4962,41 @@ async function startServer() {
         updated_at: nowIso,
       };
 
+      // Step 1: Persist prescription to Oracle (with 404 fallback to local) BEFORE emitting notification
+      try {
+        const ordsRes = await fetchOrdsJson<{ status?: string; message?: string; prescription_id?: string; deduplicated?: boolean }>(
+          'prescriptions',
+          {
+            method: 'POST',
+            body: JSON.stringify(
+              serializePrescriptionForOracle(entry, idempotencyKey ? `POST:${idempotencyKey}` : undefined),
+            ),
+          },
+        );
+        if (ordsRes?.status === 'error') {
+          res.status(400).json({ status: 'error', message: ordsRes.message || 'Unable to save prescription in Oracle' });
+          return;
+        }
+        if (ordsRes?.deduplicated && ordsRes.prescription_id) {
+          const allRx = await loadPrescriptionsHydrated();
+          const existingRx = allRx.find((p) => p.prescription_id === ordsRes.prescription_id) || entry;
+          res.status(200).json({ status: 'success', prescription: existingRx, deduplicated: true });
+          return;
+        }
+      } catch (err) {
+        if (!isMissingOracleEndpointError(err)) {
+          res.status(502).json({
+            status: 'error',
+            message: err instanceof Error ? err.message : 'Unable to persist prescription in Oracle',
+          });
+          return;
+        }
+      }
+
       store.prescriptions.unshift(entry);
       if (idempotencyKey) {
         store.prescription_idempotency[`POST:${idempotencyKey}`] = entry.prescription_id;
       }
-      // Step 1: Persist prescription BEFORE emitting notification
       writeClinicalStore(store);
 
       // Step 2: Emit patient-only notification after prescription write succeeded
@@ -4669,7 +5010,7 @@ async function startServer() {
           title: 'New Prescription Issued',
           message: `${entry.doctor_name} issued a new prescription for appointment ${entry.appointment_ref}. Please check your prescription in the Prescriptions section.`,
           doctor_name: entry.doctor_name,
-          appointment_ref: entry.appointment_ref,
+          appointment_ref: entry.appointment_ref ?? null,
           created_at: nowIso,
           ...(idempotencyKey ? { idempotency_key: `POST:${idempotencyKey}` } : {}),
         };
@@ -4707,20 +5048,20 @@ async function startServer() {
     ).trim();
 
     const store = readClinicalStore();
+    const allPrescriptions = await loadPrescriptionsHydrated();
     if (idempotencyKey && store.prescription_idempotency[`PUT:${idempotencyKey}`]) {
-      const existingRx = store.prescriptions.find((p) => p.prescription_id === req.params.id);
+      const existingRx = allPrescriptions.find((p) => p.prescription_id === req.params.id);
       if (existingRx) {
         res.json({ status: 'success', prescription: existingRx, deduplicated: true });
         return;
       }
     }
 
-    const idx = store.prescriptions.findIndex((p) => p.prescription_id === req.params.id);
-    if (idx < 0) {
+    const current = allPrescriptions.find((p) => p.prescription_id === req.params.id);
+    if (!current) {
       res.status(404).json({ status: 'error', message: 'Prescription not found.' });
       return;
     }
-    const current = store.prescriptions[idx];
     if (user.role === 'DOCTOR' && user.doctor_id && current.doctor_id !== user.doctor_id) {
       res.status(403).json({
         status: 'error',
@@ -4738,13 +5079,13 @@ async function startServer() {
 
     if (current.appointment_ref) {
       try {
-        const [rawAppts, rawSlots, templates, doctors] = await Promise.all([
+        const [rawAppts, rawSlots, templates, doctors, shiftStore] = await Promise.all([
           fetchOrdsItems<Appointment>('appointments'),
           fetchOrdsItems<Slot>('slots'),
-          fetchOrdsItems<SlotTemplate>('slot_templates'),
+          fetchSlotTemplatesSafe(),
           fetchOrdsItems<Doctor>('doctors'),
+          loadShiftStoreHydrated(),
         ]);
-        const shiftStore = readShiftStore();
         const joinedSlots = enrichSlots(
           attachDoctorIdsToSlots(rawSlots, templates, shiftStore),
           templates,
@@ -4778,7 +5119,7 @@ async function startServer() {
     }
 
     const nowIso = new Date().toISOString();
-    const updatedRx = {
+    const updatedRx: PrescriptionEntry = {
       ...current,
       diagnosis: String(req.body?.diagnosis ?? current.diagnosis).trim(),
       instructions: String(req.body?.instructions ?? current.instructions).trim(),
@@ -4786,7 +5127,41 @@ async function startServer() {
       ...(Array.isArray(req.body?.medications) ? { medications: req.body.medications } : {}),
       updated_at: nowIso,
     };
-    store.prescriptions[idx] = updatedRx;
+
+    try {
+      const ordsRes = await fetchOrdsJson<{ status?: string; message?: string }>(
+        `prescriptions/${encodeURIComponent(req.params.id)}`,
+        {
+          method: 'PUT',
+          body: JSON.stringify({
+            diagnosis: updatedRx.diagnosis,
+            instructions: updatedRx.instructions,
+            status: updatedRx.status,
+            medications: updatedRx.medications,
+            medications_json: JSON.stringify(updatedRx.medications),
+          }),
+        },
+      );
+      if (ordsRes?.status === 'error') {
+        res.status(400).json({ status: 'error', message: ordsRes.message || 'Unable to update prescription in Oracle' });
+        return;
+      }
+    } catch (err) {
+      if (!isMissingOracleEndpointError(err)) {
+        res.status(502).json({
+          status: 'error',
+          message: err instanceof Error ? err.message : 'Unable to update prescription in Oracle',
+        });
+        return;
+      }
+    }
+
+    const idx = store.prescriptions.findIndex((p) => p.prescription_id === req.params.id);
+    if (idx >= 0) {
+      store.prescriptions[idx] = updatedRx;
+    } else {
+      store.prescriptions.unshift(updatedRx);
+    }
     if (idempotencyKey) {
       store.prescription_idempotency[`PUT:${idempotencyKey}`] = updatedRx.prescription_id;
     }
@@ -4832,25 +5207,50 @@ async function startServer() {
     res.json({ status: 'success', prescription: updatedRx });
   });
 
-  app.delete('/api/clinical/prescriptions/:id', requireAuth, (req, res) => {
+  app.delete('/api/clinical/prescriptions/:id', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
     if (!requirePermission(user, res, 'PRESCRIPTIONS:DELETE', 'Delete Prescription')) return;
-    const store = readClinicalStore();
-    const idx = store.prescriptions.findIndex((p) => p.prescription_id === req.params.id);
-    if (idx < 0) {
+    const allPrescriptions = await loadPrescriptionsHydrated();
+    const current = allPrescriptions.find((p) => p.prescription_id === req.params.id);
+    if (!current) {
       res.status(404).json({ status: 'error', message: 'Prescription not found.' });
       return;
     }
-    const [removed] = store.prescriptions.splice(idx, 1);
-    writeClinicalStore(store);
+
+    try {
+      const ordsRes = await fetchOrdsJson<{ status?: string; message?: string }>(
+        `prescriptions/${encodeURIComponent(req.params.id)}`,
+        { method: 'DELETE' },
+      );
+      if (ordsRes?.status === 'error') {
+        res.status(400).json({ status: 'error', message: ordsRes.message || 'Unable to delete prescription in Oracle' });
+        return;
+      }
+    } catch (err) {
+      if (!isMissingOracleEndpointError(err)) {
+        res.status(502).json({
+          status: 'error',
+          message: err instanceof Error ? err.message : 'Unable to delete prescription in Oracle',
+        });
+        return;
+      }
+    }
+
+    const store = readClinicalStore();
+    const idx = store.prescriptions.findIndex((p) => p.prescription_id === req.params.id);
+    if (idx >= 0) {
+      store.prescriptions.splice(idx, 1);
+      writeClinicalStore(store);
+    }
+
     recordRbacAuditLog({
       actor_user_id: user.user_id,
       actor_name: user.full_name,
       actor_role: user.role,
-      target_label: `${removed.patient_name} (${removed.prescription_id})`,
+      target_label: `${current.patient_name} (${current.prescription_id})`,
       action: 'PRESCRIPTION_DELETED',
       category: 'CLINICAL',
-      details: `Deleted prescription ${removed.prescription_id}.`,
+      details: `Deleted prescription ${current.prescription_id}.`,
       severity: 'warning',
     });
     res.json({ status: 'success', message: 'Prescription deleted.' });
@@ -5154,16 +5554,34 @@ async function startServer() {
         }
         if (subPath === 'slots' && method === 'POST') {
           if (user.role === 'DOCTOR') {
-            const tid = Number(req.body?.template_id);
-            const allTmpls = await fetchOrdsItems<SlotTemplate>('slot_templates');
-            const target = allTmpls.find((t) => t.template_id === tid);
-            if (!target || target.doctor_id !== user.doctor_id) {
+            if (!user.doctor_id) {
+              res.status(403).json({ status: 'error', message: 'Doctor profile is not linked' });
+              return;
+            }
+            const requestedDoctorId =
+              req.body?.doctor_id !== undefined && req.body?.doctor_id !== null
+                ? Number(req.body.doctor_id)
+                : null;
+            if (requestedDoctorId !== null && requestedDoctorId !== user.doctor_id) {
               res.status(403).json({
                 status: 'error',
-                message: 'Doctors can only create slots under their own schedule',
+                message: 'Doctors can only create slots under their own doctor_id',
               });
               return;
             }
+            if (req.body?.template_id !== undefined && req.body?.template_id !== null) {
+              const tid = Number(req.body.template_id);
+              const allTmpls = await fetchSlotTemplatesSafe();
+              const target = allTmpls.find((t) => t.template_id === tid);
+              if (target && target.doctor_id !== user.doctor_id) {
+                res.status(403).json({
+                  status: 'error',
+                  message: 'Doctors can only create slots under their own schedule',
+                });
+                return;
+              }
+            }
+            req.body = { ...(req.body ?? {}), doctor_id: user.doctor_id };
           }
           const slotDate = String(req.body?.slot_date || '').slice(0, 10);
           const startTime = String(req.body?.start_time || '').trim();
@@ -5308,6 +5726,16 @@ async function startServer() {
       } else {
         if (!enforceModulePerm('SYSTEM_SETTINGS', actionForMethod(method), `ORDS ${subPath}`)) return;
       }
+    } else if (subPath.startsWith('doctor-shifts') || subPath.startsWith('shift-change-requests')) {
+      if (method === 'GET') {
+        if (!enforceModulePerm('SLOTS', 'VIEW', `ORDS ${subPath}`)) return;
+      } else {
+        if (!enforceModulePerm('SLOTS', 'UPDATE', `ORDS ${subPath}`)) return;
+      }
+    } else if (subPath.startsWith('medical-records')) {
+      if (!enforceModulePerm('MEDICAL_RECORDS', actionForMethod(method), `ORDS ${subPath}`)) return;
+    } else if (subPath.startsWith('prescriptions')) {
+      if (!enforceModulePerm('PRESCRIPTIONS', actionForMethod(method), `ORDS ${subPath}`)) return;
     } else {
       // Strict deny-by-default for any unmapped ORDS endpoint unless SUPER_ADMIN
       if (user.role !== 'SUPER_ADMIN') {
@@ -5396,7 +5824,7 @@ async function startServer() {
       await ensureOverdueHoldsExpired();
       const [slotsList, templatesList, existingAppts] = await Promise.all([
         fetchOrdsItems<Slot>('slots'),
-        fetchOrdsItems<SlotTemplate>('slot_templates'),
+        fetchSlotTemplatesSafe(),
         fetchOrdsItems<Appointment>('appointments'),
       ]);
       trackNextHoldExpiry(existingAppts);
@@ -5561,7 +5989,7 @@ async function startServer() {
       const [rawAppts, rawSlots, templates, doctors, departments] = await Promise.all([
         fetchOrdsItems<Appointment>('appointments'),
         fetchOrdsItems<Slot>('slots'),
-        fetchOrdsItems<SlotTemplate>('slot_templates'),
+        fetchSlotTemplatesSafe(),
         fetchOrdsItems<Doctor>('doctors'),
         fetchOrdsItems<Department>('departments/'),
       ]);
@@ -6037,14 +6465,12 @@ async function startServer() {
               } else if (user.role === 'DOCTOR') {
                 const [slots, templates] = await Promise.all([
                   fetchOrdsItems<Slot>('slots'),
-                  fetchOrdsItems<SlotTemplate>('slot_templates'),
+                  fetchSlotTemplatesSafe(),
                 ]);
                 const tmplDoctorMap = buildTemplateDoctorMap(templates);
                 const docSlotIds = new Set(
                   slots
-                    .filter(
-                      (s) => (s.doctor_id ?? tmplDoctorMap.get(s.template_id)) === user.doctor_id,
-                    )
+                    .filter((s) => resolveSlotDoctorId(s, tmplDoctorMap) === user.doctor_id)
                     .map((s) => s.slot_id),
                 );
                 appts = appts.filter((a) => docSlotIds.has(a.slot_id));
