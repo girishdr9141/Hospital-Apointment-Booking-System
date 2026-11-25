@@ -21,6 +21,7 @@ import { LoginPage } from './pages/auth/LoginPage';
 import { RegisterPatientPage } from './pages/auth/RegisterPatientPage';
 import { PatientForgotPasswordPage } from './pages/auth/PatientForgotPasswordPage';
 import { AppShell } from './components/layout/AppShell';
+import { BackendToggle } from './components/common/BackendToggle';
 import { Modal } from './components/common/Modal';
 import { DashboardSkeleton } from './components/layout/SkeletonBlock';
 import { UnauthorizedView } from './components/layout/UnauthorizedView';
@@ -234,8 +235,9 @@ function PortalContent() {
   }
 
   if (!user) {
+    let authContent: React.ReactNode;
     if (!selectedRole) {
-      return (
+      authContent = (
         <RoleSelectorPage
           onSelectRole={(role) => {
             setSelectedRole(role);
@@ -245,10 +247,8 @@ function PortalContent() {
           }}
         />
       );
-    }
-
-    if (selectedRole === 'PATIENT' && authMode === 'register') {
-      return (
+    } else if (selectedRole === 'PATIENT' && authMode === 'register') {
+      authContent = (
         <RegisterPatientPage
           onSwitchToLogin={() => {
             setAuthMode('login');
@@ -261,10 +261,8 @@ function PortalContent() {
           }}
         />
       );
-    }
-
-    if (selectedRole === 'PATIENT' && authMode === 'forgot-password') {
-      return (
+    } else if (selectedRole === 'PATIENT' && authMode === 'forgot-password') {
+      authContent = (
         <PatientForgotPasswordPage
           onBackToLogin={() => setAuthMode('login')}
           onResetSuccess={(resetEmail, message) => {
@@ -274,37 +272,51 @@ function PortalContent() {
           }}
         />
       );
+    } else {
+      authContent = (
+        <LoginPage
+          key={selectedRole}
+          selectedRole={selectedRole}
+          onChangeRole={() => {
+            setSelectedRole(null);
+            setAuthMode('login');
+            setAuthBanner(null);
+            setPrefillEmail('');
+          }}
+          onSwitchToRegister={
+            selectedRole === 'PATIENT'
+              ? () => {
+                  setAuthBanner(null);
+                  setAuthMode('register');
+                }
+              : undefined
+          }
+          onSwitchToForgotPassword={
+            selectedRole === 'PATIENT'
+              ? () => {
+                  setAuthBanner(null);
+                  setAuthMode('forgot-password');
+                }
+              : undefined
+          }
+          initialEmail={prefillEmail}
+          bannerMessage={authBanner}
+        />
+      );
     }
 
     return (
-      <LoginPage
-        key={selectedRole}
-        selectedRole={selectedRole}
-        onChangeRole={() => {
-          setSelectedRole(null);
-          setAuthMode('login');
-          setAuthBanner(null);
-          setPrefillEmail('');
-        }}
-        onSwitchToRegister={
-          selectedRole === 'PATIENT'
-            ? () => {
-                setAuthBanner(null);
-                setAuthMode('register');
-              }
-            : undefined
-        }
-        onSwitchToForgotPassword={
-          selectedRole === 'PATIENT'
-            ? () => {
-                setAuthBanner(null);
-                setAuthMode('forgot-password');
-              }
-            : undefined
-        }
-        initialEmail={prefillEmail}
-        bannerMessage={authBanner}
-      />
+      <div className="flex min-h-screen flex-col bg-slate-50">
+        <header className="sticky top-0 z-30 border-b border-slate-200 bg-white px-4 py-2.5 sm:px-6 lg:px-8">
+          <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-2">
+            <span className="text-xs font-semibold tracking-wide text-slate-600">
+              CarePulse OPD · Backend Mode
+            </span>
+            <BackendToggle compact />
+          </div>
+        </header>
+        <div className="flex flex-1 flex-col">{authContent}</div>
+      </div>
     );
   }
 

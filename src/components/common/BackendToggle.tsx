@@ -1,176 +1,170 @@
 import React, { useEffect, useState } from 'react';
-import { Layers } from 'lucide-react';
-import { apiClient } from '../../services/apiClient';
+import {
+  apiClient,
+  getSelectedBackendMode,
+  setSelectedBackendMode,
+} from '../../services/apiClient';
+import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
-import { ALL_OIC_PHASES, type BackendMode, type OicPhaseId } from '../../utils/backendRouter';
-import { OicBlueprintModal } from '../modals/OicBlueprintModal';
+import { parseBackendMode, type BackendMode } from '../../utils/backendRouter';
 
 interface BackendToggleProps {
   compact?: boolean;
   onChanged?: (mode: BackendMode) => void;
 }
 
-export function BackendToggle({ compact = false, onChanged }: BackendToggleProps) {
+const MODES: BackendMode[] = ['HYBRID', 'OIC', 'ORDS'];
+
+export function BackendToggle({
+  compact = false,
+  onChanged,
+}: BackendToggleProps) {
+  const { user } = useAuth();
   const { notify } = useToast();
-  const [mode, setMode] = useState<BackendMode>('ords');
-  const [oicConfigured, setOicConfigured] = useState(false);
-  const [oicHostPreview, setOicHostPreview] = useState<string | null>(null);
-  const [enabledPhases, setEnabledPhases] = useState<OicPhaseId[]>(ALL_OIC_PHASES);
+  const isAdmin = user?.role === 'SUPER_ADMIN' || user?.role === 'ADMIN';
+  const [mode, setMode] = useState<BackendMode>(() => getSelectedBackendMode());
+  const [oicConfigured, setOicConfigured] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [guideOpen, setGuideOpen] = useState(false);
 
   useEffect(() => {
     apiClient
       .getBackendMode()
       .then((res) => {
-        setMode(res.mode);
         setOicConfigured(res.oic_configured);
-        setOicHostPreview(res.oic_host_preview ?? null);
-        if (Array.isArray(res.oic_phases) && res.oic_phases.length > 0) {
-          setEnabledPhases(res.oic_phases);
+        let stored: BackendMode | null = null;
+        try {
+          stored = parseBackendMode(window.localStorage.getItem('carepulse_opd_backend_mode'));
+        } catch {
+          stored = null;
+        }
+        if (!res.oic_configured) {
+          setMode('ORDS');
+          setSelectedBackendMode('ORDS');
+        } else if (stored) {
+          setMode(stored);
+          setSelectedBackendMode(stored);
+        } else {
+          setMode(res.mode);
+          setSelectedBackendMode(res.mode);
         }
       })
       .catch(() => {
-        // Toggle stays on ORDS if the mode endpoint is unreachable
+        // Keep current selection if mode endpoint is temporarily unreachable
       });
-  }, []);
+  }, [user?.user_id]);
+
+  const describeMode = (active: BackendMode) =>
+    active === 'HYBRID'
+      ? 'HYBRID mode active: GET reads -> ORDS, writes -> OIC (OAuth 2.0)'
+      : active === 'OIC'
+        ? 'OIC mode active: writes -> OIC (OAuth 2.0), GET reads -> ORDS'
+        : 'ORDS mode active: all reads and writes -> Oracle APEX (ORDS)';
 
   const choose = async (next: BackendMode) => {
     if (next === mode || busy) return;
+    const prevMode = mode;
+    setMode(next);
+    setSelectedBackendMode(next);
+
+    if (!isAdmin) {
+      notify(describeMode(next), 'success');
+      onChanged?.(next);
+      return;
+    }
+
     setBusy(true);
     try {
       const res = await apiClient.setBackendMode({ mode: next });
       setMode(res.mode);
-      setEnabledPhases(res.oic_phases);
-      const scopeLabel =
-        res.oic_phases.length === ALL_OIC_PHASES.length
-          ? 'entire application'
-          : `${res.oic_phases.length}/5 OIC phases`;
-      notify(
-        res.mode === 'oic'
-          ? `Switched ${scopeLabel} to Oracle Integration Cloud (OIC)`
-          : 'Switched entire application to Oracle APEX (ORDS)',
-        'success',
-      );
+      setSelectedBackendMode(res.mode);
+      notify(describeMode(res.mode), 'success');
       onChanged?.(res.mode);
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'Could not switch backend', 'error');
+      setMode(prevMode);
+      setSelectedBackendMode(prevMode);
+      notify(err instanceof Error ? err.message : 'Could not switch backend mode', 'error');
     } finally {
       setBusy(false);
     }
   };
 
   const base = compact
-    ? 'px-2.5 py-1 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50'
-    : 'px-3.5 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50';
+    ? 'px-2 py-1 text-[10px] sm:px-2.5 sm:text-[11px] font-semibold tracking-wide transition-colors disabled:cursor-not-allowed disabled:opacity-50'
+    : 'px-3 py-1.5 text-xs font-semibold tracking-wide transition-colors disabled:cursor-not-allowed disabled:opacity-50';
   const on = 'bg-teal-700 text-white';
   const off = 'bg-white text-slate-700 hover:bg-slate-50';
 
-  const oicTitle = oicConfigured
-    ? `Route ${enabledPhases.length}/5 phases through Oracle Integration Cloud (OIC)`
-    : 'Set OIC_BASE_URL, OIC_USERNAME, and OIC_PASSWORD in .env to enable OIC';
+  const getModeTitle = (target: BackendMode) => {
+    if (!oicConfigured && target !== 'ORDS') {
+      return 'Configure OIC_BASE_URL, OIC_TOKEN_URL, OIC_CLIENT_ID, and OIC_CLIENT_SECRET in .env to enable';
+    }
+    if (target === 'HYBRID') {
+      return 'HYBRID: GET requests route directly to ORDS; POST/PUT/PATCH/DELETE route to OIC';
+    }
+    if (target === 'OIC') {
+      return 'OIC: Mutations route via OIC (OAuth 2.0 Client Credentials); fast reads stay on ORDS';
+    }
+    return 'ORDS: Route all GET and write operations directly to ORDS_BASE_URL';
+  };
+
+  if (compact) {
+    return (
+      <div
+        className="inline-flex overflow-hidden rounded-lg border border-slate-200 bg-white"
+        role="group"
+        aria-label="Backend routing mode"
+      >
+        {MODES.map((m, idx) => {
+          const disabled = busy || (m !== 'ORDS' && !oicConfigured);
+          return (
+            <button
+              key={m}
+              type="button"
+              disabled={disabled}
+              aria-pressed={mode === m}
+              title={getModeTitle(m)}
+              onClick={() => void choose(m)}
+              className={`${base} ${idx > 0 ? 'border-l border-slate-200' : ''} ${
+                mode === m ? on : off
+              }`}
+            >
+              {m}
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
 
   return (
-    <>
-      {compact ? (
-        <div className="flex items-center gap-1.5">
-          <div
-            className="inline-flex overflow-hidden rounded-lg border border-slate-200 bg-white"
-            role="group"
-            aria-label="Global backend data source"
-          >
+    <div className="flex flex-wrap items-center gap-3 rounded-xl border border-slate-200 bg-white px-4 py-2.5 shadow-sm">
+      <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+        Routing Mode
+      </span>
+      <div
+        className="inline-flex overflow-hidden rounded-lg border border-slate-300"
+        role="group"
+        aria-label="Application backend routing mode"
+      >
+        {MODES.map((m, idx) => {
+          const disabled = busy || (m !== 'ORDS' && !oicConfigured);
+          return (
             <button
+              key={m}
               type="button"
-              disabled={busy}
-              aria-pressed={mode === 'ords'}
-              onClick={() => void choose('ords')}
-              className={`${base} ${mode === 'ords' ? on : off}`}
+              disabled={disabled}
+              aria-pressed={mode === m}
+              title={getModeTitle(m)}
+              onClick={() => void choose(m)}
+              className={`${base} ${idx > 0 ? 'border-l border-slate-300' : ''} ${
+                mode === m ? on : off
+              }`}
             >
-              ORDS
+              {m}
             </button>
-            <button
-              type="button"
-              disabled={busy || !oicConfigured}
-              aria-pressed={mode === 'oic'}
-              title={oicTitle}
-              onClick={() => void choose('oic')}
-              className={`${base} border-l border-slate-200 ${mode === 'oic' ? on : off}`}
-            >
-              OIC
-            </button>
-          </div>
-          <button
-            type="button"
-            onClick={() => setGuideOpen(true)}
-            aria-label="OIC phase rollout guide and endpoint tester"
-            title="OIC 5-Phase Integration Guide & Endpoint Tester"
-            className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50"
-          >
-            <Layers className="h-3.5 w-3.5 text-teal-700" aria-hidden="true" />
-            <span className="hidden xl:inline">OIC Phases</span>
-          </button>
-        </div>
-      ) : (
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-2.5 shadow-sm">
-          <div className="flex flex-wrap items-center gap-3">
-            <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-              Data source
-            </span>
-            <div
-              className="inline-flex overflow-hidden rounded-lg border border-slate-300"
-              role="group"
-              aria-label="Application backend data source"
-            >
-              <button
-                type="button"
-                disabled={busy}
-                aria-pressed={mode === 'ords'}
-                onClick={() => void choose('ords')}
-                className={`${base} ${mode === 'ords' ? on : off}`}
-              >
-                ORDS (APEX)
-              </button>
-              <button
-                type="button"
-                disabled={busy || !oicConfigured}
-                aria-pressed={mode === 'oic'}
-                title={oicTitle}
-                onClick={() => void choose('oic')}
-                className={`${base} border-l border-slate-300 ${mode === 'oic' ? on : off}`}
-              >
-                OIC
-              </button>
-            </div>
-            <span className="rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-700">
-              Active: {mode === 'oic' ? `OIC (${enabledPhases.length}/5 phases)` : 'ORDS'}
-            </span>
-          </div>
-          <button
-            type="button"
-            onClick={() => setGuideOpen(true)}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
-          >
-            <Layers className="h-3.5 w-3.5 text-teal-700" aria-hidden="true" />
-            <span>OIC 5-Phase Guide &amp; Tester</span>
-          </button>
-        </div>
-      )}
-
-      <OicBlueprintModal
-        open={guideOpen}
-        mode={mode}
-        oicConfigured={oicConfigured}
-        oicHostPreview={oicHostPreview}
-        enabledPhases={enabledPhases}
-        onClose={() => setGuideOpen(false)}
-        onStateUpdated={(next) => {
-          setMode(next.mode);
-          setEnabledPhases(next.oic_phases);
-          if (next.mode === 'oic') {
-            onChanged?.(next.mode);
-          }
-        }}
-      />
-    </>
+          );
+        })}
+      </div>
+    </div>
   );
 }

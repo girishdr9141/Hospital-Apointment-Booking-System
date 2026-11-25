@@ -34,11 +34,66 @@ import type {
   TokenQueueItem,
   UserAccount,
 } from '../types/opd';
-import type { BackendMode, OicPhaseId } from '../utils/backendRouter';
+import {
+  parseBackendMode,
+  type BackendMode,
+  type OicIntegrationDescriptor,
+  type OicPhaseId,
+  type ServedBy,
+} from '../utils/backendRouter';
 import { normalizeOrdsError } from '../utils/rules';
 
 const TOKEN_STORAGE_KEY = 'carepulse_opd_session_token';
+const BACKEND_MODE_STORAGE_KEY = 'carepulse_opd_backend_mode';
 const departmentByIdCache = new Map<number, Department | null>();
+
+export interface ServedByTelemetry {
+  servedBy: ServedBy;
+  integrationName: string | null;
+  requestedMode: BackendMode;
+  method: string;
+  url: string;
+  at: string;
+}
+
+let currentBackendMode: BackendMode = (() => {
+  try {
+    const stored = window.localStorage.getItem(BACKEND_MODE_STORAGE_KEY);
+    return parseBackendMode(stored) || 'HYBRID';
+  } catch {
+    return 'HYBRID';
+  }
+})();
+
+let lastServedByTelemetry: ServedByTelemetry | null = null;
+const telemetryListeners = new Set<(info: ServedByTelemetry) => void>();
+
+export function getSelectedBackendMode(): BackendMode {
+  return currentBackendMode;
+}
+
+export function setSelectedBackendMode(mode: BackendMode): void {
+  const normalized = parseBackendMode(mode) || 'HYBRID';
+  currentBackendMode = normalized;
+  try {
+    window.localStorage.setItem(BACKEND_MODE_STORAGE_KEY, normalized);
+  } catch {
+    // Ignore storage unavailability
+  }
+}
+
+export function getLastServedByInfo(): ServedByTelemetry | null {
+  return lastServedByTelemetry;
+}
+
+export function subscribeBackendTelemetry(
+  listener: (info: ServedByTelemetry) => void,
+): () => void {
+  telemetryListeners.add(listener);
+  return () => {
+    telemetryListeners.delete(listener);
+  };
+}
 
 export class ApiHttpError extends Error {
   statusCode: number;
@@ -75,8 +130,11 @@ export function setStoredSessionToken(token: string | null): void {
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const token = getStoredSessionToken();
+  const requestedMode = getSelectedBackendMode();
+  const method = String(init?.method || 'GET').toUpperCase();
   const headers: Record<string, string> = {
     Accept: 'application/json',
+    'X-Backend-Mode': requestedMode,
     ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...((init?.headers as Record<string, string>) || {}),
@@ -87,6 +145,22 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
     credentials: 'include',
     headers,
   });
+
+  const rawServedBy = (response.headers.get('X-Served-By') || '').trim().toUpperCase();
+  if (rawServedBy === 'OIC' || rawServedBy === 'ORDS') {
+    const telemetry: ServedByTelemetry = {
+      servedBy: rawServedBy,
+      integrationName: response.headers.get('X-OIC-Integration') || null,
+      requestedMode,
+      method,
+      url,
+      at: new Date().toISOString(),
+    };
+    lastServedByTelemetry = telemetry;
+    for (const listener of telemetryListeners) {
+      listener(telemetry);
+    }
+  }
 
   const text = await response.text();
   let parsed: unknown = {};
@@ -254,27 +328,48 @@ export const apiClient = {
       body: JSON.stringify(payload),
     });
   },
-  // Global Backend Toggle (ORDS <-> OIC) & Phase Tester
-  getBackendMode: () =>
-    requestJson<{
+  // Global Backend Toggle (HYBRID | OIC | ORDS) & OIC Integration Tester
+  getBackendMode: async () => {
+    const res = await requestJson<{
       mode: BackendMode;
+      persisted_mode?: BackendMode;
       oic_configured: boolean;
+      oic_oauth_configured?: boolean;
       oic_phases: OicPhaseId[];
       oic_host_preview?: string | null;
-    }>('/api/backend-mode'),
-  setBackendMode: (payload: { mode?: BackendMode; oic_phases?: OicPhaseId[] } | BackendMode) =>
-    requestJson<{
+      integrations?: OicIntegrationDescriptor[];
+    }>('/api/backend-mode');
+    if (res.mode) {
+      setSelectedBackendMode(res.mode);
+    }
+    return res;
+  },
+  setBackendMode: async (
+    payload: { mode?: BackendMode; oic_phases?: OicPhaseId[] } | BackendMode,
+  ) => {
+    const bodyObj = typeof payload === 'string' ? { mode: payload } : payload;
+    if (bodyObj.mode) {
+      setSelectedBackendMode(bodyObj.mode);
+    }
+    const res = await requestJson<{
       status: string;
       mode: BackendMode;
       oic_configured: boolean;
+      oic_oauth_configured?: boolean;
       oic_phases: OicPhaseId[];
     }>('/api/backend-mode', {
       method: 'POST',
-      body: JSON.stringify(typeof payload === 'string' ? { mode: payload } : payload),
-    }),
+      body: JSON.stringify(bodyObj),
+    });
+    if (res.mode) {
+      setSelectedBackendMode(res.mode);
+    }
+    return res;
+  },
   testOicEndpoints: (phaseId?: OicPhaseId) =>
     requestJson<{
       status: string;
+      oauth_token_verified?: boolean;
       results: Array<{
         phaseId: OicPhaseId;
         endpointId: string;

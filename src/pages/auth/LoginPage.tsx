@@ -111,7 +111,7 @@ export function LoginPage({
   };
 
   return (
-    <div className="flex min-h-screen flex-col justify-center bg-slate-50 px-4 py-10 sm:px-6 lg:px-8">
+    <div className="flex flex-1 flex-col justify-center bg-slate-50 px-4 py-10 sm:px-6 lg:px-8">
       <div className="mx-auto w-full max-w-md">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">

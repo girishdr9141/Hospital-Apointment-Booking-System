@@ -1,0 +1,10 @@
+{
+  "mode": "OIC",
+  "oic_phases": [
+    "phase1",
+    "phase2",
+    "phase3",
+    "phase4",
+    "phase5"
+  ]
+}

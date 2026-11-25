@@ -48,7 +48,7 @@ export function RoleSelectorPage({ onSelectRole }: RoleSelectorPageProps) {
   const SuperIcon = ROLE_ICON.SUPER_ADMIN;
 
   return (
-    <div className="flex min-h-screen flex-col justify-center bg-slate-50 px-4 py-10 sm:px-6 lg:px-8">
+    <div className="flex flex-1 flex-col justify-center bg-slate-50 px-4 py-10 sm:px-6 lg:px-8">
       <div className="mx-auto w-full max-w-4xl">
         <div className="flex flex-col items-center text-center">
           <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-teal-700 text-white shadow-xs">

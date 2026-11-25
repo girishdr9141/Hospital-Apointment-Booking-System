@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -145,14 +146,18 @@ function getServerTodayIso(): string {
 
 import {
   ALL_OIC_PHASES,
+  OIC_INTEGRATIONS_CATALOG,
   OIC_PHASE_SPECS,
-  buildUpstreamUrl,
   classifyEndpointPhase,
+  normalizeBackendMode,
   normalizeBackendPayload,
   normalizeEnabledPhases,
-  shouldUseOicForEndpoint,
+  normalizeOicMutationPayload,
+  parseBackendMode,
+  resolveRoutingDecision,
   type BackendMode,
   type OicPhaseId,
+  type ServedBy,
 } from './src/utils/backendRouter.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -162,9 +167,17 @@ const ORDS_BASE_URL = (
   'https://ga97be9115f23e9-moviestreamworkshop.adb.ap-mumbai-1.oraclecloudapps.com/ords/nov_2026_batch/girish_opd_api/v1'
 ).replace(/\/+$/, '');
 const OIC_BASE_URL = (process.env.OIC_BASE_URL || '').replace(/\/+$/, '');
+const OIC_TOKEN_URL = (process.env.OIC_TOKEN_URL || '').trim();
+const OIC_CLIENT_ID = (process.env.OIC_CLIENT_ID || '').trim();
+const OIC_CLIENT_SECRET = (process.env.OIC_CLIENT_SECRET || '').trim();
+const OIC_SCOPE = (process.env.OIC_SCOPE || '').trim();
 const OIC_USERNAME = process.env.OIC_USERNAME || '';
 const OIC_PASSWORD = process.env.OIC_PASSWORD || '';
-const OIC_CONFIGURED = Boolean(OIC_BASE_URL && OIC_USERNAME && OIC_PASSWORD);
+const OIC_OAUTH_CONFIGURED = Boolean(
+  OIC_BASE_URL && OIC_TOKEN_URL && OIC_CLIENT_ID && OIC_CLIENT_SECRET,
+);
+const OIC_BASIC_CONFIGURED = Boolean(OIC_BASE_URL && OIC_USERNAME && OIC_PASSWORD);
+const OIC_CONFIGURED = OIC_OAUTH_CONFIGURED || OIC_BASIC_CONFIGURED;
 const BACKEND_MODE_PATH = path.resolve(__dirname, 'data', 'backend_mode.json');
 
 interface PersistedBackendState {
@@ -173,13 +186,14 @@ interface PersistedBackendState {
 }
 
 function readBackendState(): PersistedBackendState {
+  const defaultMode: BackendMode = OIC_CONFIGURED ? 'HYBRID' : 'ORDS';
   try {
     if (fs.existsSync(BACKEND_MODE_PATH)) {
       const raw = JSON.parse(fs.readFileSync(BACKEND_MODE_PATH, 'utf8')) as {
         mode?: unknown;
         oic_phases?: unknown;
       };
-      const parsedMode: BackendMode = raw.mode === 'oic' && OIC_CONFIGURED ? 'oic' : 'ords';
+      const parsedMode = normalizeBackendMode(raw.mode, OIC_CONFIGURED, defaultMode);
       const parsedPhases = normalizeEnabledPhases(raw.oic_phases);
       return {
         mode: parsedMode,
@@ -187,9 +201,9 @@ function readBackendState(): PersistedBackendState {
       };
     }
   } catch {
-    // Fall back to ORDS defaults
+    // Fall back to defaults
   }
-  return { mode: 'ords', oic_phases: [...ALL_OIC_PHASES] };
+  return { mode: defaultMode, oic_phases: [...ALL_OIC_PHASES] };
 }
 
 function writeBackendState(next: PersistedBackendState): void {
@@ -203,27 +217,157 @@ function writeBackendState(next: PersistedBackendState): void {
 
 let backendState: PersistedBackendState = readBackendState();
 
-function resolveUpstreamTarget(endpoint: string): {
-  backend: BackendMode;
+let cachedOicToken: { accessToken: string; expiresAtMs: number } | null = null;
+let inFlightOicTokenPromise: Promise<string> | null = null;
+
+async function getOicAccessToken(forceRefresh = false): Promise<string> {
+  if (!OIC_OAUTH_CONFIGURED) {
+    throw new Error('OIC OAuth 2.0 client credentials are not configured.');
+  }
+  const now = Date.now();
+  if (!forceRefresh && cachedOicToken && cachedOicToken.expiresAtMs - 60_000 > now) {
+    return cachedOicToken.accessToken;
+  }
+  if (!forceRefresh && inFlightOicTokenPromise) {
+    return inFlightOicTokenPromise;
+  }
+
+  inFlightOicTokenPromise = (async () => {
+    const basicCreds = Buffer.from(`${OIC_CLIENT_ID}:${OIC_CLIENT_SECRET}`).toString('base64');
+    const form = new URLSearchParams();
+    form.set('grant_type', 'client_credentials');
+    if (OIC_SCOPE) {
+      form.set('scope', OIC_SCOPE);
+    }
+
+    const tokenRes = await fetch(OIC_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Basic ${basicCreds}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: form.toString(),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const tokenText = await tokenRes.text();
+    let tokenJson: {
+      access_token?: string;
+      expires_in?: number;
+      error?: string;
+      error_description?: string;
+    } = {};
+    try {
+      tokenJson = tokenText ? (JSON.parse(tokenText) as typeof tokenJson) : {};
+    } catch {
+      // Non-JSON error body
+    }
+
+    if (!tokenRes.ok || !tokenJson.access_token) {
+      throw new Error(
+        tokenJson.error_description ||
+          tokenJson.error ||
+          `OIC OAuth token request failed (HTTP ${tokenRes.status})`,
+      );
+    }
+
+    const ttlSec = Math.max(60, Number(tokenJson.expires_in || 3600));
+    cachedOicToken = {
+      accessToken: tokenJson.access_token,
+      expiresAtMs: Date.now() + ttlSec * 1000,
+    };
+    return cachedOicToken.accessToken;
+  })();
+
+  try {
+    return await inFlightOicTokenPromise;
+  } finally {
+    inFlightOicTokenPromise = null;
+  }
+}
+
+interface RequestRoutingContext {
+  mode: BackendMode;
+  servedBy: ServedBy | null;
+  integrationName: string | null;
+  res: Response;
+}
+
+const requestRoutingStorage = new AsyncLocalStorage<RequestRoutingContext>();
+
+function getActiveBackendMode(): BackendMode {
+  return requestRoutingStorage.getStore()?.mode ?? backendState.mode;
+}
+
+function recordRequestServedBy(
+  servedBy: ServedBy,
+  integrationName?: string | null,
+  explicitRes?: Response,
+): void {
+  const ctx = requestRoutingStorage.getStore();
+  if (ctx) {
+    if (ctx.servedBy !== 'OIC' || servedBy === 'OIC') {
+      ctx.servedBy = servedBy;
+      ctx.integrationName = integrationName ?? null;
+    }
+    if (!ctx.res.headersSent) {
+      ctx.res.setHeader('X-Served-By', ctx.servedBy);
+      if (ctx.integrationName) {
+        ctx.res.setHeader('X-OIC-Integration', ctx.integrationName);
+      }
+    }
+  } else if (explicitRes && !explicitRes.headersSent) {
+    explicitRes.setHeader('X-Served-By', servedBy);
+    if (integrationName) {
+      explicitRes.setHeader('X-OIC-Integration', integrationName);
+    }
+  }
+}
+
+async function resolveUpstreamTarget(
+  endpoint: string,
+  method = 'GET',
+  forceRefreshToken = false,
+): Promise<{
+  servedBy: ServedBy;
+  backend: ServedBy;
+  mode: BackendMode;
   phase: OicPhaseId;
+  integrationName: string | null;
   url: string;
   headers: Record<string, string>;
-} {
-  const phase = classifyEndpointPhase(endpoint);
-  const useOic = shouldUseOicForEndpoint(
-    backendState.mode,
-    backendState.oic_phases,
+}> {
+  const activeMode = getActiveBackendMode();
+  const decision = resolveRoutingDecision({
+    mode: activeMode,
+    method,
     endpoint,
-    OIC_CONFIGURED,
-  );
-  const backend: BackendMode = useOic ? 'oic' : 'ords';
-  const url = buildUpstreamUrl(ORDS_BASE_URL, OIC_BASE_URL, endpoint, backend);
+    oicConfigured: OIC_CONFIGURED,
+    ordsBaseUrl: ORDS_BASE_URL,
+    oicBaseUrl: OIC_BASE_URL,
+    enabledPhases: backendState.oic_phases,
+  });
+
   const headers: Record<string, string> = {};
-  if (useOic) {
-    const auth = Buffer.from(`${OIC_USERNAME}:${OIC_PASSWORD}`).toString('base64');
-    headers.Authorization = `Basic ${auth}`;
+  if (decision.servedBy === 'OIC') {
+    if (OIC_OAUTH_CONFIGURED) {
+      const token = await getOicAccessToken(forceRefreshToken);
+      headers.Authorization = `Bearer ${token}`;
+    } else if (OIC_BASIC_CONFIGURED) {
+      const auth = Buffer.from(`${OIC_USERNAME}:${OIC_PASSWORD}`).toString('base64');
+      headers.Authorization = `Basic ${auth}`;
+    }
   }
-  return { backend, phase, url, headers };
+
+  return {
+    servedBy: decision.servedBy,
+    backend: decision.servedBy,
+    mode: decision.mode,
+    phase: decision.phase,
+    integrationName: decision.integrationName,
+    url: decision.url,
+    headers,
+  };
 }
 
 const SESSION_SECRET = process.env.SESSION_SECRET || 'carepulse-opd-dev-session-secret-2026';
@@ -376,17 +520,65 @@ function clearSessionCookie(req: Request, res: Response): void {
   });
 }
 
-async function fetchOrdsJson<T>(endpoint: string, init?: RequestInit): Promise<T> {
-  const target = resolveUpstreamTarget(endpoint);
-  const response = await fetch(target.url, {
+async function fetchUpstreamWithRetry(
+  endpoint: string,
+  init?: RequestInit,
+): Promise<{
+  response: globalThis.Response;
+  target: Awaited<ReturnType<typeof resolveUpstreamTarget>>;
+}> {
+  const method = String(init?.method || 'GET').toUpperCase();
+  let target = await resolveUpstreamTarget(endpoint, method, false);
+  let body = init?.body;
+
+  if (
+    target.servedBy === 'OIC' &&
+    method !== 'GET' &&
+    method !== 'HEAD' &&
+    typeof body === 'string' &&
+    body.trim()
+  ) {
+    try {
+      const parsedBody = JSON.parse(body);
+      body = JSON.stringify(normalizeOicMutationPayload(method, endpoint, parsedBody));
+    } catch {
+      // Keep original body if non-JSON
+    }
+  }
+
+  let response = await fetch(target.url, {
     ...init,
+    method,
+    body,
     headers: {
       Accept: 'application/json',
-      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
       ...target.headers,
       ...(init?.headers || {}),
     },
   });
+
+  if (response.status === 401 && target.servedBy === 'OIC' && OIC_OAUTH_CONFIGURED) {
+    target = await resolveUpstreamTarget(endpoint, method, true);
+    response = await fetch(target.url, {
+      ...init,
+      method,
+      body,
+      headers: {
+        Accept: 'application/json',
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+        ...target.headers,
+        ...(init?.headers || {}),
+      },
+    });
+  }
+
+  recordRequestServedBy(target.servedBy, target.integrationName);
+  return { response, target };
+}
+
+async function fetchOrdsJson<T>(endpoint: string, init?: RequestInit): Promise<T> {
+  const { response, target } = await fetchUpstreamWithRetry(endpoint, init);
   const text = await response.text();
   let parsed: unknown = {};
   if (text) {
@@ -397,7 +589,7 @@ async function fetchOrdsJson<T>(endpoint: string, init?: RequestInit): Promise<T
     }
   }
   if (!response.ok) {
-    const label = target.backend === 'oic' ? 'OIC' : 'ORDS';
+    const label = target.servedBy;
     const err = new Error(normalizeOrdsError(parsed, `${label} returned HTTP ${response.status}`));
     (err as Error & { statusCode?: number }).statusCode = response.status;
     throw err;
@@ -1436,6 +1628,30 @@ async function startServer() {
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '1mb' }));
 
+  app.use('/api', (req, res, next) => {
+    const headerMode = parseBackendMode(req.header('X-Backend-Mode'));
+    const activeMode = headerMode
+      ? normalizeBackendMode(headerMode, OIC_CONFIGURED, backendState.mode)
+      : backendState.mode;
+    const ctx: RequestRoutingContext = {
+      mode: activeMode,
+      servedBy: null,
+      integrationName: null,
+      res,
+    };
+    const origJson = res.json.bind(res);
+    res.json = ((body?: unknown) => {
+      if (!res.headersSent) {
+        res.setHeader('X-Served-By', ctx.servedBy || 'ORDS');
+        if (ctx.integrationName) {
+          res.setHeader('X-OIC-Integration', ctx.integrationName);
+        }
+      }
+      return origJson(body);
+    }) as Response['json'];
+    requestRoutingStorage.run(ctx, () => next());
+  });
+
   app.get('/api/health', async (_req, res) => {
     try {
       const depts = await fetchOrdsItems<Department>('departments/');
@@ -1877,8 +2093,18 @@ async function startServer() {
         },
       );
       if (ordsAuth.status === 'success' && ordsAuth.user) {
+        const rawDocId = ordsAuth.user.doctor_id;
+        const rawPatId = ordsAuth.user.patient_id;
         const candidate: AuthUser = {
           ...ordsAuth.user,
+          doctor_id:
+            rawDocId !== undefined && rawDocId !== null && String(rawDocId).trim() !== ''
+              ? Number(rawDocId) || null
+              : null,
+          patient_id:
+            rawPatId !== undefined && rawPatId !== null && String(rawPatId).trim() !== ''
+              ? Number(rawPatId) || null
+              : null,
           auth_mode: 'ords',
         };
 
@@ -1975,7 +2201,15 @@ async function startServer() {
       }
     } catch (err) {
       const statusCode = (err as Error & { statusCode?: number }).statusCode;
-      if (!statusCode || statusCode === 404 || statusCode === 405) {
+      const errMsg = ((err as Error).message || '').toLowerCase();
+      if (
+        !statusCode ||
+        statusCode === 404 ||
+        statusCode === 405 ||
+        errMsg.includes('invalid email') ||
+        errMsg.includes('no account found') ||
+        errMsg.includes('not found')
+      ) {
         ordsUnavailableOrNotFound = true;
       } else {
         failLogin(401, (err as Error).message);
@@ -3047,6 +3281,7 @@ async function startServer() {
       status?: string;
       message?: string;
       slot_id?: number;
+      id?: number;
     }>('slots', {
       method: 'POST',
       body: JSON.stringify({
@@ -3059,7 +3294,7 @@ async function startServer() {
     });
 
     if (directRes.status !== 'error') {
-      return { slot_id: directRes.slot_id, template_id: null };
+      return { slot_id: directRes.slot_id ?? directRes.id, template_id: null };
     }
 
     const msg = directRes.message || 'Oracle rejected slot creation';
@@ -3847,49 +4082,83 @@ async function startServer() {
       );
 
       let paymentRef = alreadyPaid?.payment_ref || '';
+      let effectiveAmount = doctorFee;
       if (!alreadyPaid) {
-        const payRes = await fetchOrdsJson<{
-          status?: string;
-          message?: string;
-          payment_ref?: string;
-        }>('payments', {
+        const payConfirmRoute = resolveRoutingDecision({
+          mode: getActiveBackendMode(),
           method: 'POST',
-          body: JSON.stringify({
-            appointment_id: apptId,
-            amount: doctorFee,
-            payment_method: paymentMethod,
-            status: 'SUCCESS',
-          }),
+          endpoint: `appointments/${apptId}/pay-and-confirm`,
+          oicConfigured: OIC_CONFIGURED,
+          ordsBaseUrl: ORDS_BASE_URL,
+          oicBaseUrl: OIC_BASE_URL,
+          enabledPhases: backendState.oic_phases,
         });
-        if (payRes.status === 'error') {
-          res.status(400).json({
-            status: 'error',
-            message: payRes.message || 'Unable to record consultation fee payment.',
-          });
-          return;
-        }
-        paymentRef = payRes.payment_ref || `PAY${Date.now()}`;
-      }
 
-      // Ensure HELD appointment transitions to CONFIRMED even if upstream payment handler does not auto-confirm
-      const refreshedAppts = await fetchOrdsItems<Appointment>('appointments').catch(
-        () => [] as Appointment[],
-      );
-      const latestTarget = refreshedAppts.find((a) => a.appointment_id === apptId);
-      if (latestTarget && latestTarget.status === 'HELD') {
-        const confirmRes = await fetchOrdsJson<{ status?: string; message?: string }>(
-          `appointments/${apptId}/confirm`,
-          {
+        if (payConfirmRoute.servedBy === 'OIC') {
+          const oicPayRes = await fetchOrdsJson<{
+            status?: string;
+            message?: string;
+            payment_ref?: string;
+            amount?: number;
+          }>(`appointments/${apptId}/pay-and-confirm`, {
             method: 'POST',
-            body: JSON.stringify({}),
-          },
-        );
-        if (confirmRes.status === 'error') {
-          res.status(400).json({
-            status: 'error',
-            message: confirmRes.message || 'Payment recorded, but appointment confirmation failed.',
+            body: JSON.stringify({ payment_method: paymentMethod }),
           });
-          return;
+          if (oicPayRes.status === 'error') {
+            res.status(400).json({
+              status: 'error',
+              message: oicPayRes.message || 'Unable to process payment and confirm booking via OIC.',
+            });
+            return;
+          }
+          paymentRef = oicPayRes.payment_ref || `PAY${Date.now()}`;
+          if (typeof oicPayRes.amount === 'number' && !Number.isNaN(oicPayRes.amount)) {
+            effectiveAmount = oicPayRes.amount;
+          }
+        } else {
+          const payRes = await fetchOrdsJson<{
+            status?: string;
+            message?: string;
+            payment_ref?: string;
+          }>('payments', {
+            method: 'POST',
+            body: JSON.stringify({
+              appointment_id: apptId,
+              amount: doctorFee,
+              payment_method: paymentMethod,
+              status: 'SUCCESS',
+            }),
+          });
+          if (payRes.status === 'error') {
+            res.status(400).json({
+              status: 'error',
+              message: payRes.message || 'Unable to record consultation fee payment.',
+            });
+            return;
+          }
+          paymentRef = payRes.payment_ref || `PAY${Date.now()}`;
+
+          // Ensure HELD appointment transitions to CONFIRMED even if upstream payment handler does not auto-confirm
+          const refreshedAppts = await fetchOrdsItems<Appointment>('appointments').catch(
+            () => [] as Appointment[],
+          );
+          const latestTarget = refreshedAppts.find((a) => a.appointment_id === apptId);
+          if (latestTarget && latestTarget.status === 'HELD') {
+            const confirmRes = await fetchOrdsJson<{ status?: string; message?: string }>(
+              `appointments/${apptId}/confirm`,
+              {
+                method: 'POST',
+                body: JSON.stringify({}),
+              },
+            );
+            if (confirmRes.status === 'error') {
+              res.status(400).json({
+                status: 'error',
+                message: confirmRes.message || 'Payment recorded, but appointment confirmation failed.',
+              });
+              return;
+            }
+          }
         }
       }
 
@@ -3902,7 +4171,7 @@ async function startServer() {
         patient_id: targetAppt.patient_id,
         slot_id: targetAppt.slot_id,
         payment_status: 'SUCCESS',
-        paid_amount: doctorFee,
+        paid_amount: effectiveAmount,
         payment_ref: paymentRef,
         payment_method: paymentMethod,
         paid_at: paidAt,
@@ -3919,7 +4188,7 @@ async function startServer() {
         category: 'BILLING',
         previous_value: targetAppt.status,
         new_value: `CONFIRMED (${paymentRef})`,
-        details: `${user.full_name} (${user.role}) paid ₹${doctorFee.toFixed(2)} via ${paymentMethod} (${paymentRef}) and confirmed ${targetAppt.appointment_ref} for ${targetAppt.patient_name} with ${targetAppt.doctor_name || `Doctor #${targetAppt.doctor_id ?? ''}`} on ${getIsoDatePart(targetAppt.slot_date) || ''} ${targetAppt.start_time || ''} [${targetAppt.consultation_mode || 'FACE_TO_FACE'}].`,
+        details: `${user.full_name} (${user.role}) paid ₹${effectiveAmount.toFixed(2)} via ${paymentMethod} (${paymentRef}) and confirmed ${targetAppt.appointment_ref} for ${targetAppt.patient_name} with ${targetAppt.doctor_name || `Doctor #${targetAppt.doctor_id ?? ''}`} on ${getIsoDatePart(targetAppt.slot_date) || ''} ${targetAppt.start_time || ''} [${targetAppt.consultation_mode || 'FACE_TO_FACE'}].`,
         severity: 'info',
       });
 
@@ -3929,9 +4198,9 @@ async function startServer() {
         appointment_ref: targetAppt.appointment_ref,
         appointment_status: 'CONFIRMED',
         payment_ref: paymentRef,
-        amount: doctorFee,
+        amount: effectiveAmount,
         payment_method: paymentMethod,
-        message: `Payment of ₹${doctorFee.toFixed(2)} recorded and booking confirmed.`,
+        message: `Payment of ₹${effectiveAmount.toFixed(2)} recorded and booking confirmed.`,
       });
     } catch (err) {
       res.status(502).json({
@@ -5437,11 +5706,12 @@ async function startServer() {
     res.json({ status: 'success', message: 'Prescription deleted.' });
   });
   // ============================================================================
-  // FULL-APPLICATION ORDS <-> OIC BACKEND TOGGLE & PHASE PROBE
+  // FULL-APPLICATION HYBRID (OIC + ORDS) / OIC / ORDS BACKEND TOGGLE & PROBE
   // ============================================================================
-  app.get('/api/backend-mode', requireAuth, (_req, res) => {
+  app.get('/api/backend-mode', (req, res) => {
+    const authUser = verifySession(getRequestToken(req));
     let oicHostPreview: string | null = null;
-    if (OIC_BASE_URL) {
+    if (authUser && OIC_BASE_URL) {
       try {
         const u = new URL(OIC_BASE_URL);
         oicHostPreview = `${u.host}${u.pathname.replace(/\/+$/, '')}`;
@@ -5449,11 +5719,19 @@ async function startServer() {
         oicHostPreview = 'configured';
       }
     }
+    const effectiveMode = getActiveBackendMode();
     res.json({
-      mode: backendState.mode,
+      mode: effectiveMode,
+      persisted_mode: backendState.mode,
       oic_configured: OIC_CONFIGURED,
+      oic_oauth_configured: OIC_OAUTH_CONFIGURED,
       oic_phases: backendState.oic_phases,
-      oic_host_preview: oicHostPreview,
+      ...(authUser
+        ? {
+            oic_host_preview: oicHostPreview,
+            integrations: OIC_INTEGRATIONS_CATALOG,
+          }
+        : {}),
     });
   });
 
@@ -5466,15 +5744,16 @@ async function startServer() {
 
     const body = (req.body || {}) as { mode?: unknown; oic_phases?: unknown };
     const hasMode = body.mode !== undefined;
-    const requestedMode = hasMode ? String(body.mode).toLowerCase() : backendState.mode;
-    if (requestedMode !== 'ords' && requestedMode !== 'oic') {
-      res.status(400).json({ status: 'error', message: 'mode must be "ords" or "oic".' });
+    const requestedMode = hasMode ? parseBackendMode(body.mode) : backendState.mode;
+    if (!requestedMode) {
+      res.status(400).json({ status: 'error', message: 'mode must be "HYBRID", "OIC", or "ORDS".' });
       return;
     }
-    if (requestedMode === 'oic' && !OIC_CONFIGURED) {
+    if ((requestedMode === 'OIC' || requestedMode === 'HYBRID') && !OIC_CONFIGURED) {
       res.status(400).json({
         status: 'error',
-        message: 'OIC is not configured. Set OIC_BASE_URL, OIC_USERNAME, and OIC_PASSWORD in .env.',
+        message:
+          'OIC is not configured. Set OIC_BASE_URL, OIC_TOKEN_URL, OIC_CLIENT_ID, and OIC_CLIENT_SECRET in .env.',
       });
       return;
     }
@@ -5483,10 +5762,10 @@ async function startServer() {
       body.oic_phases !== undefined
         ? normalizeEnabledPhases(body.oic_phases)
         : backendState.oic_phases;
-    if (requestedMode === 'oic' && nextPhases.length === 0) {
+    if ((requestedMode === 'OIC' || requestedMode === 'HYBRID') && nextPhases.length === 0) {
       res.status(400).json({
         status: 'error',
-        message: 'Select at least one OIC phase before switching to OIC mode.',
+        message: 'Select at least one OIC phase before enabling OIC routing.',
       });
       return;
     }
@@ -5494,7 +5773,7 @@ async function startServer() {
     const previousMode = backendState.mode;
     const previousPhases = backendState.oic_phases.join(',');
     backendState = {
-      mode: requestedMode as BackendMode,
+      mode: requestedMode,
       oic_phases: nextPhases.length > 0 ? nextPhases : [...ALL_OIC_PHASES],
     };
     writeBackendState(backendState);
@@ -5507,9 +5786,9 @@ async function startServer() {
         target_label: 'application_backend',
         action: 'BACKEND_MODE_CHANGED',
         category: 'SECURITY',
-        previous_value: `${previousMode.toUpperCase()} [${previousPhases}]`,
-        new_value: `${backendState.mode.toUpperCase()} [${backendState.oic_phases.join(',')}]`,
-        details: `${user.full_name} set application data source to ${backendState.mode.toUpperCase()} (OIC phases: ${backendState.oic_phases.join(', ')}).`,
+        previous_value: `${previousMode} [${previousPhases}]`,
+        new_value: `${backendState.mode} [${backendState.oic_phases.join(',')}]`,
+        details: `${user.full_name} set application routing mode to ${backendState.mode} (OIC phases: ${backendState.oic_phases.join(', ')}).`,
         severity: 'info',
       });
     }
@@ -5518,6 +5797,7 @@ async function startServer() {
       status: 'success',
       mode: backendState.mode,
       oic_configured: OIC_CONFIGURED,
+      oic_oauth_configured: OIC_OAUTH_CONFIGURED,
       oic_phases: backendState.oic_phases,
     });
   });
@@ -5531,17 +5811,33 @@ async function startServer() {
     if (!OIC_CONFIGURED) {
       res.status(400).json({
         status: 'error',
-        message: 'OIC is not configured. Set OIC_BASE_URL, OIC_USERNAME, and OIC_PASSWORD in .env.',
+        message:
+          'OIC is not configured. Set OIC_BASE_URL, OIC_TOKEN_URL, OIC_CLIENT_ID, and OIC_CLIENT_SECRET in .env.',
       });
       return;
     }
 
     const requestedPhase = req.body?.phaseId ? (String(req.body.phaseId) as OicPhaseId) : null;
-    const specsToProbe = requestedPhase
-      ? OIC_PHASE_SPECS.filter((p) => p.id === requestedPhase)
-      : OIC_PHASE_SPECS;
+    const catalogToProbe = requestedPhase
+      ? OIC_INTEGRATIONS_CATALOG.filter((item) => item.phase === requestedPhase)
+      : OIC_INTEGRATIONS_CATALOG;
 
-    const auth = Buffer.from(`${OIC_USERNAME}:${OIC_PASSWORD}`).toString('base64');
+    let authHeader = '';
+    try {
+      if (OIC_OAUTH_CONFIGURED) {
+        const token = await getOicAccessToken(true);
+        authHeader = `Bearer ${token}`;
+      } else {
+        authHeader = `Basic ${Buffer.from(`${OIC_USERNAME}:${OIC_PASSWORD}`).toString('base64')}`;
+      }
+    } catch (err) {
+      res.status(502).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'OIC OAuth 2.0 token acquisition failed',
+      });
+      return;
+    }
+
     const results: Array<{
       phaseId: OicPhaseId;
       endpointId: string;
@@ -5553,46 +5849,43 @@ async function startServer() {
       error?: string;
     }> = [];
 
-    for (const phase of specsToProbe) {
-      for (const ep of phase.endpoints) {
-        if (!ep.probePath) continue;
-        const targetUrl = buildUpstreamUrl(ORDS_BASE_URL, OIC_BASE_URL, ep.probePath, 'oic');
+    await Promise.all(
+      catalogToProbe.map(async (desc) => {
+        const swaggerUrl = `${OIC_BASE_URL}${desc.swaggerPath}`;
         const started = Date.now();
         try {
-          const response = await fetch(targetUrl, {
-            headers: { Accept: 'application/json', Authorization: `Basic ${auth}` },
-            signal: AbortSignal.timeout(10000),
+          const response = await fetch(swaggerUrl, {
+            headers: { Accept: 'application/json', Authorization: authHeader },
+            signal: AbortSignal.timeout(10_000),
           });
           const latencyMs = Date.now() - started;
           const bodyText = await response.text();
-          let itemCount: number | null = null;
+          let opCount: number | null = desc.operations.length;
           if (bodyText.trim()) {
             try {
-              const normalized = normalizeBackendPayload(JSON.parse(bodyText)) as {
-                items?: unknown[];
-              };
-              if (Array.isArray(normalized?.items)) {
-                itemCount = normalized.items.length;
+              const parsed = JSON.parse(bodyText) as { paths?: Record<string, unknown> };
+              if (parsed?.paths && typeof parsed.paths === 'object') {
+                opCount = Object.keys(parsed.paths).length;
               }
             } catch {
-              // Non-JSON payload
+              // Keep catalog count
             }
           }
           results.push({
-            phaseId: phase.id,
-            endpointId: ep.id,
-            oicPath: ep.oicPath,
+            phaseId: desc.phase,
+            endpointId: desc.integrationName,
+            oicPath: `${desc.integrationName}/${desc.version}`,
             ok: response.ok,
             status: response.status,
             latencyMs,
-            itemCount,
+            itemCount: opCount,
             ...(!response.ok ? { error: `HTTP ${response.status}` } : {}),
           });
         } catch (err) {
           results.push({
-            phaseId: phase.id,
-            endpointId: ep.id,
-            oicPath: ep.oicPath,
+            phaseId: desc.phase,
+            endpointId: desc.integrationName,
+            oicPath: `${desc.integrationName}/${desc.version}`,
             ok: false,
             status: 0,
             latencyMs: Date.now() - started,
@@ -5600,10 +5893,10 @@ async function startServer() {
             error: err instanceof Error ? err.message : 'Request failed',
           });
         }
-      }
-    }
+      }),
+    );
 
-    res.json({ status: 'success', results });
+    res.json({ status: 'success', oauth_token_verified: true, results });
   });
   // ============================================================================
   // GENERIC AUTHENTICATED ORDS BFF PROXY WITH DENY-BY-DEFAULT MODULE:ACTION RBAC
@@ -6307,18 +6600,20 @@ async function startServer() {
     }
 
     try {
-      const target = resolveUpstreamTarget(`${subPath}${queryString}`);
-      res.setHeader('X-Backend', target.backend);
-      res.setHeader('X-Backend-Phase', target.phase);
-      const upstream = await fetch(target.url, {
+      const normalizedOutgoing =
+        method !== 'GET' && method !== 'HEAD'
+          ? normalizeOicMutationPayload(method, `${subPath}${queryString}`, outgoingBody, user.full_name)
+          : outgoingBody;
+      const { response: upstream, target } = await fetchUpstreamWithRetry(`${subPath}${queryString}`, {
         method,
-        headers: {
-          Accept: 'application/json',
-          ...(method !== 'GET' && method !== 'HEAD' ? { 'Content-Type': 'application/json' } : {}),
-          ...target.headers,
-        },
-        body: method !== 'GET' && method !== 'HEAD' ? JSON.stringify(outgoingBody) : undefined,
+        body: method !== 'GET' && method !== 'HEAD' ? JSON.stringify(normalizedOutgoing) : undefined,
       });
+      res.setHeader('X-Backend', target.servedBy);
+      res.setHeader('X-Served-By', target.servedBy);
+      if (target.integrationName) {
+        res.setHeader('X-OIC-Integration', target.integrationName);
+      }
+      res.setHeader('X-Backend-Phase', target.phase);
       const text = await upstream.text();
       const contentType = upstream.headers.get('content-type') || 'application/json';
 

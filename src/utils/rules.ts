@@ -178,15 +178,33 @@ export function enrichAppointments(
 
 export function normalizeOrdsError(payload: unknown, fallback = 'Request failed'): string {
   if (!payload) return fallback;
-  if (typeof payload === 'string') return payload;
+  if (typeof payload === 'string') {
+    const causeMatch = payload.match(/cause:\s*\{([^}]+)\}/i);
+    const extracted = (causeMatch ? causeMatch[1] : payload).replace(/^ORA-\d+:\s*/i, '').trim();
+    return extracted || fallback;
+  }
   if (typeof payload === 'object') {
     const record = payload as Record<string, unknown>;
-    const raw =
+    let raw =
       (typeof record.message === 'string' && record.message) ||
       (typeof record.error === 'string' && record.error) ||
+      (typeof record.detail === 'string' && record.detail) ||
       '';
+    if (!raw && Array.isArray(record['o:errorDetails']) && record['o:errorDetails'].length > 0) {
+      const firstDetail = record['o:errorDetails'][0] as Record<string, unknown> | undefined;
+      if (firstDetail && typeof firstDetail.title === 'string') {
+        raw = firstDetail.title;
+      } else if (firstDetail && typeof firstDetail.detail === 'string') {
+        raw = firstDetail.detail;
+      }
+    }
+    if (!raw && typeof record.title === 'string' && !/^-?\d+$/.test(record.title.trim())) {
+      raw = record.title;
+    }
     if (raw) {
-      return raw.replace(/^ORA-\d+:\s*/i, '').trim();
+      const causeMatch = raw.match(/cause:\s*\{([^}]+)\}/i);
+      const cleaned = (causeMatch ? causeMatch[1] : raw).replace(/^ORA-\d+:\s*/i, '').trim();
+      if (cleaned) return cleaned;
     }
   }
   return fallback;

@@ -137,6 +137,14 @@ test('formatDisplayDate, formatCurrencyInr, and normalizeOrdsError behave cleanl
     normalizeOrdsError({ status: 'error', message: 'ORA-20004: Slot is not available' }),
     'Slot is not available',
   );
+  assert.equal(
+    normalizeOrdsError({
+      title: '-20101',
+      detail:
+        'faultName: {{http://schemas.oracle.com/bpel/extension}remoteFault} cause: {Invalid email/username or password}',
+    }),
+    'Invalid email/username or password',
+  );
 });
 
 test('paginateItems slices accurately and clamps out-of-range pages', () => {
