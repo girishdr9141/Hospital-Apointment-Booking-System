@@ -180,5 +180,10 @@
     "allow_patient_registration": true,
     "enforce_strict_role_portal": true
   },
-  "login_failures": {}
+  "login_failures": {
+    "karan.tulsani@carepulse.local": {
+      "count": 1,
+      "locked_until": null
+    }
+  }
 }

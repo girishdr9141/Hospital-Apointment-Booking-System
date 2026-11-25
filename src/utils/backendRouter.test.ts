@@ -8,10 +8,12 @@ import {
   normalizeBackendMode,
   normalizeBackendPayload,
   normalizeEnabledPhases,
+  normalizeOicBaseUrl,
   normalizeOicMutationPayload,
   parseBackendMode,
   resolveOicIntegrationRoute,
   resolveRoutingDecision,
+  sanitizeEnvValue,
 } from './backendRouter';
 
 const ORDS_URL =
@@ -328,4 +330,21 @@ test('phase classification, catalogs, and ORDS collection payload normalization 
     departments: [{ department_id: 2 }],
     items: [{ department_id: 2 }],
   });
+
+  assert.equal(sanitizeEnvValue('  "https://example.com"  '), 'https://example.com');
+  assert.equal(sanitizeEnvValue(" 'abc-123' "), 'abc-123');
+  assert.equal(
+    normalizeOicBaseUrl(
+      ` "${OIC_URL}/CAREPULS_BOOK_APPOINTM_MAIN/1.0/metadata/swagger" `,
+    ),
+    OIC_URL,
+  );
+
+  const leavePost = normalizeOicMutationPayload('POST', 'leaves', {
+    doctor_id: 2,
+    start_date: '2026-12-01',
+    end_date: '2026-12-02',
+    leave_reason: 'Conference',
+  });
+  assert.equal(leavePost.requested_by, 1);
 });

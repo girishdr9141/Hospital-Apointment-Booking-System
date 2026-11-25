@@ -38,8 +38,8 @@ export function BackendToggle({
           stored = null;
         }
         if (!res.oic_configured) {
+          // Do not overwrite localStorage so restarting with .env configured immediately enables HYBRID/OIC
           setMode('ORDS');
-          setSelectedBackendMode('ORDS');
         } else if (stored) {
           setMode(stored);
           setSelectedBackendMode(stored);

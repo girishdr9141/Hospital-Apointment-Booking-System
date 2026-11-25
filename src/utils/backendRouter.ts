@@ -395,6 +395,29 @@ export function normalizeBackendMode(
   return parsed;
 }
 
+export function sanitizeEnvValue(raw: string | undefined | null): string {
+  const trimmed = String(raw || '').trim();
+  if (
+    trimmed.length >= 2 &&
+    ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'")))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+export function normalizeOicBaseUrl(raw: string | undefined | null): string {
+  const cleaned = sanitizeEnvValue(raw).replace(/\/+$/, '');
+  if (!cleaned) return '';
+  // If someone pasted a full OIC Swagger or endpoint URL, normalize back to .../project/<PROJECT_CODE>
+  const projectMatch = cleaned.match(/^(https?:\/\/[^?#]+\/flows\/rest\/project\/[^/]+)/i);
+  if (projectMatch) {
+    return projectMatch[1].replace(/\/+$/, '');
+  }
+  return cleaned;
+}
+
 function splitEndpoint(endpoint: string): { cleanPath: string; queryPart: string } {
   const trimmed = String(endpoint || '').trim().replace(/^\/+/, '');
   const qIdx = trimmed.indexOf('?');
@@ -804,6 +827,12 @@ export function normalizeOicMutationPayload(
       specialization: payload.specialization ?? '',
       tele_consult_flag: payload.tele_consult_flag ?? 'N',
       employment_type: payload.employment_type ?? 'FULL_TIME',
+    };
+  }
+  if (lower === 'leaves' && upperMethod === 'POST') {
+    return {
+      ...payload,
+      requested_by: payload.requested_by ?? 1,
     };
   }
   if (/^leaves\/[^/]+\/decide$/.test(lower) && upperMethod === 'POST') {

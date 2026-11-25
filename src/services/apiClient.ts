@@ -339,8 +339,11 @@ export const apiClient = {
       oic_host_preview?: string | null;
       integrations?: OicIntegrationDescriptor[];
     }>('/api/backend-mode');
-    if (res.mode) {
-      setSelectedBackendMode(res.mode);
+    if (typeof res?.oic_configured !== 'boolean') {
+      throw new ApiHttpError(
+        'Backend API server is not running. Start the app with "npm run dev" instead of standalone Vite.',
+        502,
+      );
     }
     return res;
   },

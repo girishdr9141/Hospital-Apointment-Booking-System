@@ -152,9 +152,11 @@ import {
   normalizeBackendMode,
   normalizeBackendPayload,
   normalizeEnabledPhases,
+  normalizeOicBaseUrl,
   normalizeOicMutationPayload,
   parseBackendMode,
   resolveRoutingDecision,
+  sanitizeEnvValue,
   type BackendMode,
   type OicPhaseId,
   type ServedBy,
@@ -163,16 +165,16 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
 const ORDS_BASE_URL = (
-  process.env.ORDS_BASE_URL ||
+  sanitizeEnvValue(process.env.ORDS_BASE_URL) ||
   'https://ga97be9115f23e9-moviestreamworkshop.adb.ap-mumbai-1.oraclecloudapps.com/ords/nov_2026_batch/girish_opd_api/v1'
 ).replace(/\/+$/, '');
-const OIC_BASE_URL = (process.env.OIC_BASE_URL || '').replace(/\/+$/, '');
-const OIC_TOKEN_URL = (process.env.OIC_TOKEN_URL || '').trim();
-const OIC_CLIENT_ID = (process.env.OIC_CLIENT_ID || '').trim();
-const OIC_CLIENT_SECRET = (process.env.OIC_CLIENT_SECRET || '').trim();
-const OIC_SCOPE = (process.env.OIC_SCOPE || '').trim();
-const OIC_USERNAME = process.env.OIC_USERNAME || '';
-const OIC_PASSWORD = process.env.OIC_PASSWORD || '';
+const OIC_BASE_URL = normalizeOicBaseUrl(process.env.OIC_BASE_URL);
+const OIC_TOKEN_URL = sanitizeEnvValue(process.env.OIC_TOKEN_URL);
+const OIC_CLIENT_ID = sanitizeEnvValue(process.env.OIC_CLIENT_ID);
+const OIC_CLIENT_SECRET = sanitizeEnvValue(process.env.OIC_CLIENT_SECRET);
+const OIC_SCOPE = sanitizeEnvValue(process.env.OIC_SCOPE);
+const OIC_USERNAME = sanitizeEnvValue(process.env.OIC_USERNAME);
+const OIC_PASSWORD = sanitizeEnvValue(process.env.OIC_PASSWORD);
 const OIC_OAUTH_CONFIGURED = Boolean(
   OIC_BASE_URL && OIC_TOKEN_URL && OIC_CLIENT_ID && OIC_CLIENT_SECRET,
 );
@@ -546,31 +548,36 @@ async function fetchUpstreamWithRetry(
     }
   }
 
-  let response = await fetch(target.url, {
-    ...init,
-    method,
-    body,
-    headers: {
-      Accept: 'application/json',
-      ...(body ? { 'Content-Type': 'application/json' } : {}),
-      ...target.headers,
-      ...(init?.headers || {}),
-    },
-  });
+  const fetchWithTimeout = async (activeTarget: typeof target) => {
+    try {
+      return await fetch(activeTarget.url, {
+        ...init,
+        method,
+        body,
+        signal: init?.signal ?? AbortSignal.timeout(25_000),
+        headers: {
+          Accept: 'application/json',
+          ...(body ? { 'Content-Type': 'application/json' } : {}),
+          ...activeTarget.headers,
+          ...(init?.headers || {}),
+        },
+      });
+    } catch (err) {
+      const cause = (err as Error & { cause?: { code?: string; message?: string } })?.cause;
+      const detail = cause?.code || cause?.message || (err instanceof Error ? err.message : 'Network error');
+      const wrapped = new Error(
+        `${activeTarget.servedBy} request failed (${activeTarget.integrationName || endpoint}): ${detail}`,
+      );
+      (wrapped as Error & { statusCode?: number }).statusCode = 502;
+      throw wrapped;
+    }
+  };
+
+  let response = await fetchWithTimeout(target);
 
   if (response.status === 401 && target.servedBy === 'OIC' && OIC_OAUTH_CONFIGURED) {
     target = await resolveUpstreamTarget(endpoint, method, true);
-    response = await fetch(target.url, {
-      ...init,
-      method,
-      body,
-      headers: {
-        Accept: 'application/json',
-        ...(body ? { 'Content-Type': 'application/json' } : {}),
-        ...target.headers,
-        ...(init?.headers || {}),
-      },
-    });
+    response = await fetchWithTimeout(target);
   }
 
   recordRequestServedBy(target.servedBy, target.integrationName);
@@ -5719,7 +5726,7 @@ async function startServer() {
         oicHostPreview = 'configured';
       }
     }
-    const effectiveMode = getActiveBackendMode();
+    const effectiveMode: BackendMode = OIC_CONFIGURED ? backendState.mode : 'ORDS';
     res.json({
       mode: effectiveMode,
       persisted_mode: backendState.mode,
@@ -6570,10 +6577,13 @@ async function startServer() {
     }
 
     if (subPath === 'leaves' && method === 'POST') {
+      const requestedBy =
+        Number(outgoingBody?.requested_by) ||
+        (user.auth_mode === 'ords' || user.auth_mode === 'bridge' ? user.user_id : 1);
       outgoingBody = {
         ...outgoingBody,
         ...(user.role === 'DOCTOR' && user.doctor_id ? { doctor_id: user.doctor_id } : {}),
-        ...(user.auth_mode === 'ords' ? { requested_by: user.user_id } : {}),
+        requested_by: requestedBy,
       };
     }
 
@@ -6604,9 +6614,13 @@ async function startServer() {
         method !== 'GET' && method !== 'HEAD'
           ? normalizeOicMutationPayload(method, `${subPath}${queryString}`, outgoingBody, user.full_name)
           : outgoingBody;
+      const shouldSendBody =
+        method !== 'GET' &&
+        method !== 'HEAD' &&
+        !(method === 'DELETE' && Object.keys(normalizedOutgoing).length === 0);
       const { response: upstream, target } = await fetchUpstreamWithRetry(`${subPath}${queryString}`, {
         method,
-        body: method !== 'GET' && method !== 'HEAD' ? JSON.stringify(normalizedOutgoing) : undefined,
+        body: shouldSendBody ? JSON.stringify(normalizedOutgoing) : undefined,
       });
       res.setHeader('X-Backend', target.servedBy);
       res.setHeader('X-Served-By', target.servedBy);
@@ -7451,6 +7465,21 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`CarePulse OPD server listening on http://localhost:${PORT}`);
+    if (OIC_CONFIGURED) {
+      console.log(
+        `Backend routing: ${backendState.mode} | OIC configured: YES (${OIC_OAUTH_CONFIGURED ? 'OAuth 2.0' : 'Basic'})`,
+      );
+    } else {
+      const missingOicVars = [
+        !OIC_BASE_URL && 'OIC_BASE_URL',
+        !OIC_TOKEN_URL && 'OIC_TOKEN_URL',
+        !OIC_CLIENT_ID && 'OIC_CLIENT_ID',
+        !OIC_CLIENT_SECRET && 'OIC_CLIENT_SECRET',
+      ].filter(Boolean);
+      console.log(
+        `Backend routing: ${backendState.mode} | OIC configured: NO (missing in .env: ${missingOicVars.join(', ')})`,
+      );
+    }
   });
 }
 
