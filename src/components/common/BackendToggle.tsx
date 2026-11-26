@@ -37,28 +37,38 @@ export function BackendToggle({
         } catch {
           stored = null;
         }
-        if (!res.oic_configured) {
-          // Do not overwrite localStorage so restarting with .env configured immediately enables HYBRID/OIC
-          setMode('ORDS');
-        } else if (stored) {
-          setMode(stored);
-          setSelectedBackendMode(stored);
-        } else {
-          setMode(res.mode);
-          setSelectedBackendMode(res.mode);
-        }
+        const resolved = stored || res.mode;
+        setMode(resolved);
+        setSelectedBackendMode(resolved);
       })
       .catch(() => {
         // Keep current selection if mode endpoint is temporarily unreachable
       });
   }, [user?.user_id]);
 
-  const describeMode = (active: BackendMode) =>
-    active === 'HYBRID'
-      ? 'HYBRID mode active: GET reads -> ORDS, writes -> OIC (OAuth 2.0)'
-      : active === 'OIC'
-        ? 'OIC mode active: writes -> OIC (OAuth 2.0), GET reads -> ORDS'
-        : 'ORDS mode active: all reads and writes -> Oracle APEX (ORDS)';
+  const describeMode = (active: BackendMode, configured: boolean): { text: string; tone: 'success' | 'info' } => {
+    if (active === 'ORDS') {
+      return {
+        text: 'ORDS mode active: all reads and writes -> Oracle APEX (ORDS)',
+        tone: 'success',
+      };
+    }
+    if (!configured) {
+      return {
+        text: `${active} mode selected. Add OIC credentials in .env locally to execute writes via OIC (using ORDS fallback meanwhile).`,
+        tone: 'info',
+      };
+    }
+    return active === 'HYBRID'
+      ? {
+          text: 'HYBRID mode active: GET reads -> ORDS, writes -> OIC (OAuth 2.0)',
+          tone: 'success',
+        }
+      : {
+          text: 'OIC mode active: writes -> OIC (OAuth 2.0), GET reads -> ORDS',
+          tone: 'success',
+        };
+  };
 
   const choose = async (next: BackendMode) => {
     if (next === mode || busy) return;
@@ -67,7 +77,8 @@ export function BackendToggle({
     setSelectedBackendMode(next);
 
     if (!isAdmin) {
-      notify(describeMode(next), 'success');
+      const msg = describeMode(next, oicConfigured);
+      notify(msg.text, msg.tone);
       onChanged?.(next);
       return;
     }
@@ -75,9 +86,11 @@ export function BackendToggle({
     setBusy(true);
     try {
       const res = await apiClient.setBackendMode({ mode: next });
+      setOicConfigured(res.oic_configured);
       setMode(res.mode);
       setSelectedBackendMode(res.mode);
-      notify(describeMode(res.mode), 'success');
+      const msg = describeMode(res.mode, res.oic_configured);
+      notify(msg.text, msg.tone);
       onChanged?.(res.mode);
     } catch (err) {
       setMode(prevMode);
@@ -96,7 +109,7 @@ export function BackendToggle({
 
   const getModeTitle = (target: BackendMode) => {
     if (!oicConfigured && target !== 'ORDS') {
-      return 'Configure OIC_BASE_URL, OIC_TOKEN_URL, OIC_CLIENT_ID, and OIC_CLIENT_SECRET in .env to enable';
+      return `${target} mode: routes writes via OIC when .env OIC credentials are configured locally (safely falls back to ORDS until then)`;
     }
     if (target === 'HYBRID') {
       return 'HYBRID: GET requests route directly to ORDS; POST/PUT/PATCH/DELETE route to OIC';
@@ -114,24 +127,21 @@ export function BackendToggle({
         role="group"
         aria-label="Backend routing mode"
       >
-        {MODES.map((m, idx) => {
-          const disabled = busy || (m !== 'ORDS' && !oicConfigured);
-          return (
-            <button
-              key={m}
-              type="button"
-              disabled={disabled}
-              aria-pressed={mode === m}
-              title={getModeTitle(m)}
-              onClick={() => void choose(m)}
-              className={`${base} ${idx > 0 ? 'border-l border-slate-200' : ''} ${
-                mode === m ? on : off
-              }`}
-            >
-              {m}
-            </button>
-          );
-        })}
+        {MODES.map((m, idx) => (
+          <button
+            key={m}
+            type="button"
+            disabled={busy}
+            aria-pressed={mode === m}
+            title={getModeTitle(m)}
+            onClick={() => void choose(m)}
+            className={`${base} ${idx > 0 ? 'border-l border-slate-200' : ''} ${
+              mode === m ? on : off
+            }`}
+          >
+            {m}
+          </button>
+        ))}
       </div>
     );
   }
@@ -146,24 +156,21 @@ export function BackendToggle({
         role="group"
         aria-label="Application backend routing mode"
       >
-        {MODES.map((m, idx) => {
-          const disabled = busy || (m !== 'ORDS' && !oicConfigured);
-          return (
-            <button
-              key={m}
-              type="button"
-              disabled={disabled}
-              aria-pressed={mode === m}
-              title={getModeTitle(m)}
-              onClick={() => void choose(m)}
-              className={`${base} ${idx > 0 ? 'border-l border-slate-300' : ''} ${
-                mode === m ? on : off
-              }`}
-            >
-              {m}
-            </button>
-          );
-        })}
+        {MODES.map((m, idx) => (
+          <button
+            key={m}
+            type="button"
+            disabled={busy}
+            aria-pressed={mode === m}
+            title={getModeTitle(m)}
+            onClick={() => void choose(m)}
+            className={`${base} ${idx > 0 ? 'border-l border-slate-300' : ''} ${
+              mode === m ? on : off
+            }`}
+          >
+            {m}
+          </button>
+        ))}
       </div>
     </div>
   );

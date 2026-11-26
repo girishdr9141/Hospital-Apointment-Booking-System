@@ -95,6 +95,7 @@ function PortalContent() {
   const [authMode, setAuthMode] = useState<'login' | 'register' | 'forgot-password'>('login');
   const [authBanner, setAuthBanner] = useState<string | null>(null);
   const [prefillEmail, setPrefillEmail] = useState<string>('');
+  const [authSessionNonce, setAuthSessionNonce] = useState(0);
   const [activeRoute, setActiveRoute] = useState<RouteKey>(() => parseHashRoute());
   const [selectedMatrixRole, setSelectedMatrixRole] = useState<RoleName | undefined>(undefined);
   const [dashboardData, setDashboardData] = useState<DashboardSummaryResponse | null>(null);
@@ -198,6 +199,7 @@ function PortalContent() {
     setAuthMode('login');
     setAuthBanner(null);
     setPrefillEmail('');
+    setAuthSessionNonce((n) => n + 1);
     setActiveRoute('dashboard');
     setNotifications([]);
     setShiftModalDismissedForUser(null);
@@ -244,6 +246,7 @@ function PortalContent() {
             setAuthMode('login');
             setAuthBanner(null);
             setPrefillEmail('');
+            setAuthSessionNonce((n) => n + 1);
           }}
         />
       );
@@ -258,6 +261,8 @@ function PortalContent() {
             setSelectedRole(null);
             setAuthMode('login');
             setAuthBanner(null);
+            setPrefillEmail('');
+            setAuthSessionNonce((n) => n + 1);
           }}
         />
       );
@@ -275,13 +280,14 @@ function PortalContent() {
     } else {
       authContent = (
         <LoginPage
-          key={selectedRole}
+          key={`${selectedRole}:${authSessionNonce}`}
           selectedRole={selectedRole}
           onChangeRole={() => {
             setSelectedRole(null);
             setAuthMode('login');
             setAuthBanner(null);
             setPrefillEmail('');
+            setAuthSessionNonce((n) => n + 1);
           }}
           onSwitchToRegister={
             selectedRole === 'PATIENT'
@@ -299,7 +305,7 @@ function PortalContent() {
                 }
               : undefined
           }
-          initialEmail={prefillEmail}
+          initialEmail={selectedRole === 'PATIENT' ? prefillEmail : ''}
           bannerMessage={authBanner}
         />
       );

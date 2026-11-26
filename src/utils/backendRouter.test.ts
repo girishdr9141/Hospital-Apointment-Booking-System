@@ -347,4 +347,23 @@ test('phase classification, catalogs, and ORDS collection payload normalization 
     leave_reason: 'Conference',
   });
   assert.equal(leavePost.requested_by, 1);
+
+  const payConfirmPost = normalizeOicMutationPayload('POST', 'appointments/181/pay-and-confirm', {
+    payment_method: 'UPI',
+    amount: 500,
+  });
+  assert.equal(payConfirmPost.payment_method, 'UPI');
+  assert.equal(payConfirmPost.amount, 500);
+
+  const safeFallback = resolveRoutingDecision({
+    mode: 'OIC',
+    method: 'POST',
+    endpoint: 'appointments/',
+    oicConfigured: false,
+    ordsBaseUrl: ORDS_URL,
+    oicBaseUrl: OIC_URL,
+  });
+  assert.equal(safeFallback.servedBy, 'ORDS');
+  assert.equal(safeFallback.url, `${ORDS_URL}/appointments/`);
 });
+

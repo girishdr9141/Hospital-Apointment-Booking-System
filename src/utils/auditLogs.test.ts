@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import type { RbacAuditLogEntry } from '../types/opd';
 import {
   ALL_AUDIT_CATEGORIES,
+  buildOracleAuditPayload,
   describeBookingAuditDetails,
   describeCancellationAuditDetails,
+  extractOracleAuditActor,
   filterAuditLogs,
   formatAuditActorLabel,
   getAuditCategoryLabel,
@@ -138,4 +140,57 @@ test('describeCancellationAuditDetails records exact cancelling actor for both u
   });
   assert.match(paidRefund, /Cancelled by Girish DR \(ADMIN\)/);
   assert.match(paidRefund, /refund ₹500\.00 \(100% via Full Refund >24h\) scheduled within 2 hours/);
+});
+
+test('buildOracleAuditPayload maps table names, actor metadata, and length bounds accurately', () => {
+  const cancelPayload = buildOracleAuditPayload(SAMPLE_LOGS[1]);
+  assert.equal(cancelPayload.table_name, 'GIRISH_APPOINTMENTS');
+  assert.equal(cancelPayload.action_name, 'APPOINTMENT_CANCELLED');
+  assert.equal(cancelPayload.record_id, 'APT20261124001');
+  assert.equal(cancelPayload.user_id, 4001);
+  assert.match(cancelPayload.action_description, /^\[Meera Kulkarni \(RECEPTIONIST, meera\.kulkarni@hospital\.com\)\]/);
+  assert.match(cancelPayload.action_description, /\[CONFIRMED -> CANCELLED\]$/);
+
+  const leavePayload = buildOracleAuditPayload(SAMPLE_LOGS[2]);
+  assert.equal(leavePayload.table_name, 'GIRISH_DOCTOR_LEAVES');
+
+  const shiftPayload = buildOracleAuditPayload({
+    ...SAMPLE_LOGS[2],
+    action: 'SHIFT_WINDOW_REGISTERED',
+  });
+  assert.equal(shiftPayload.table_name, 'GIRISH_DOCTOR_SHIFT_WINDOWS');
+
+  const payPayload = buildOracleAuditPayload({
+    ...SAMPLE_LOGS[1],
+    action: 'APPOINTMENT_PAID_AND_CONFIRMED',
+    category: 'BILLING',
+  });
+  assert.equal(payPayload.table_name, 'GIRISH_PAYMENTS');
+});
+
+test('extractOracleAuditActor falls back cleanly to embedded actor prefix when username is null', () => {
+  assert.equal(
+    extractOracleAuditActor({
+      username: 'girish.dr',
+      user_id: 1,
+      action_description: '[Girish DR (ADMIN)] Approved leave',
+    }),
+    'girish.dr',
+  );
+  assert.equal(
+    extractOracleAuditActor({
+      username: null,
+      user_id: null,
+      action_description: '[Karan Tulsani (SUPER_ADMIN, karan.tulsani@hospital.com)] Signed in.',
+    }),
+    'Karan Tulsani (SUPER_ADMIN, karan.tulsani@hospital.com)',
+  );
+  assert.equal(
+    extractOracleAuditActor({
+      username: null,
+      user_id: null,
+      action_description: 'Legacy system operation',
+    }),
+    'SYSTEM',
+  );
 });

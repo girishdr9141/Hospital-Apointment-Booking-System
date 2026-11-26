@@ -27,6 +27,7 @@ import type {
   PermissionAction,
   PortalNotification,
   PrescriptionEntry,
+  RbacAuditLogEntry,
   RoleName,
   ShiftChangeRequest,
   ShiftSession,
@@ -100,9 +101,17 @@ import {
   generateHistoricalAnalyticsSeed,
 } from './src/utils/analyticsSeed.ts';
 import {
+  buildOracleAuditPayload,
   describeBookingAuditDetails,
   describeCancellationAuditDetails,
 } from './src/utils/auditLogs.ts';
+import {
+  buildScopedPortalNotifications,
+  canDecideLeaveOrShiftRequest,
+  canViewAllShiftChangeRequests,
+  scopeLeavesForUser,
+  shouldIncludePendingApprovalsCount,
+} from './src/utils/notifications.ts';
 import { normalizeRecordConsultationMode } from './src/utils/analytics.ts';
 import {
   buildRoleDefinitions,
@@ -118,6 +127,7 @@ import {
   readRbacStore,
   recordFailedLoginAttempt,
   recordRbacAuditLog,
+  registerExternalAuditLogSink,
   verifyPasswordScrypt,
   writeRbacStore,
 } from './server/rbacStore.ts';
@@ -324,6 +334,50 @@ function recordRequestServedBy(
       explicitRes.setHeader('X-OIC-Integration', integrationName);
     }
   }
+}
+
+let auditLogsEndpointMissingUntilMs = 0;
+
+function syncAuditLogToOracleDirect(entry: RbacAuditLogEntry): void {
+  if (Date.now() < auditLogsEndpointMissingUntilMs) {
+    return;
+  }
+  const payload = buildOracleAuditPayload(entry);
+  const url = `${ORDS_BASE_URL}/audit-logs`;
+  // Out-of-band direct ORDS sync: bypasses fetchUpstreamWithRetry and requestRoutingStorage
+  // so OIC routing and X-Served-By / X-OIC-Integration headers remain completely untouched.
+  void fetch(url, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(8_000),
+  })
+    .then(async (res) => {
+      if (res.status === 404 || res.status === 405) {
+        auditLogsEndpointMissingUntilMs = Date.now() + 5 * 60 * 1000;
+        return;
+      }
+      if (!res.ok) {
+        return;
+      }
+      const txt = await res.text().catch(() => '');
+      if (txt) {
+        try {
+          const parsed = JSON.parse(txt) as { status?: string; message?: string };
+          if (parsed?.status === 'error') {
+            console.warn('[audit-sync] Oracle ORDS POST /audit-logs returned error:', parsed.message);
+          }
+        } catch {
+          // Non-JSON 2xx response is acceptable
+        }
+      }
+    })
+    .catch(() => {
+      // Non-blocking audit sync: never interrupt primary portal operations
+    });
 }
 
 async function resolveUpstreamTarget(
@@ -1300,8 +1354,21 @@ function writeShiftStore(data: ShiftStoreData): void {
   );
 }
 
+let slotTemplatesMissingUntilMs = 0;
+
 async function fetchSlotTemplatesSafe(): Promise<SlotTemplate[]> {
-  return fetchOrdsItems<SlotTemplate>('slot_templates').catch(() => [] as SlotTemplate[]);
+  if (Date.now() < slotTemplatesMissingUntilMs) {
+    return [];
+  }
+  try {
+    return await fetchOrdsItems<SlotTemplate>('slot_templates');
+  } catch (err) {
+    const statusCode = (err as { statusCode?: number } | null)?.statusCode;
+    if (statusCode === 404 || statusCode === 405 || isMissingOracleEndpointError(err)) {
+      slotTemplatesMissingUntilMs = Date.now() + 5 * 60 * 1000;
+    }
+    return [];
+  }
 }
 
 function buildTemplateDoctorMap(
@@ -1436,8 +1503,14 @@ async function syncShiftToOracleTemplates(
   durationMins: number,
   workingDays: string[],
 ): Promise<void> {
+  if (Date.now() < slotTemplatesMissingUntilMs) {
+    return;
+  }
   try {
     const existingTemplates = await fetchSlotTemplatesSafe();
+    if (Date.now() < slotTemplatesMissingUntilMs) {
+      return;
+    }
     const activeDocTemplates = existingTemplates.filter(
       (t) => t.doctor_id === doctorId && t.is_active === 'Y',
     );
@@ -1631,6 +1704,7 @@ async function loadPrescriptionsHydrated(): Promise<PrescriptionEntry[]> {
 }
 
 async function startServer() {
+  registerExternalAuditLogSink(syncAuditLogToOracleDirect);
   const app = express();
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '1mb' }));
@@ -1718,6 +1792,17 @@ async function startServer() {
       emailInput === SINGLE_ADMIN_EMAIL.toLowerCase() ||
       emailInput === SUPER_ADMIN_EMAIL.toLowerCase()
     ) {
+      recordRbacAuditLog({
+        actor_user_id: null,
+        actor_name: emailInput,
+        actor_email: emailInput,
+        actor_role: 'PUBLIC',
+        target_label: emailInput,
+        action: 'PASSWORD_SELF_RESET_BLOCKED',
+        category: 'SECURITY',
+        details: `Blocked patient self-service password reset attempt for protected administrator email ${emailInput}.`,
+        severity: 'warning',
+      });
       res.status(403).json({
         status: 'error',
         message: 'Password reset is only available for Patient accounts.',
@@ -1742,6 +1827,17 @@ async function startServer() {
         BRIDGE_ACCOUNTS.some((b) => b.email.toLowerCase() === emailInput && b.role !== 'PATIENT') ||
         store.managed_users.some((m) => m.email.toLowerCase() === emailInput && m.role !== 'PATIENT')
       ) {
+        recordRbacAuditLog({
+          actor_user_id: nonPatientUser?.user_id ?? null,
+          actor_name: nonPatientUser?.full_name || emailInput,
+          actor_email: emailInput,
+          actor_role: nonPatientUser?.role_name || 'STAFF',
+          target_label: emailInput,
+          action: 'PASSWORD_SELF_RESET_BLOCKED',
+          category: 'SECURITY',
+          details: `Blocked patient self-service password reset attempt for non-patient account ${emailInput}.`,
+          severity: 'warning',
+        });
         res.status(403).json({
           status: 'error',
           message: 'Password self-reset is only permitted for Patient accounts.',
@@ -1756,6 +1852,17 @@ async function startServer() {
       );
 
       if (!matchedPatient) {
+        recordRbacAuditLog({
+          actor_user_id: null,
+          actor_name: emailInput,
+          actor_email: emailInput,
+          actor_role: 'PATIENT',
+          target_label: emailInput,
+          action: 'PASSWORD_SELF_RESET_FAILED',
+          category: 'AUTH',
+          details: `Patient self-reset failed: no patient matched email ${emailInput} with provided registered phone.`,
+          severity: 'warning',
+        });
         res.status(400).json({
           status: 'error',
           message: 'No patient record matches that email ID and registered phone number.',
@@ -2087,23 +2194,26 @@ async function startServer() {
     // 1. Prefer Oracle ORDS /auth/login
     let ordsUnavailableOrNotFound = false;
     try {
-      const ordsAuth = await fetchOrdsJson<{ status?: string; message?: string; user?: AuthUser }>(
-        'auth/login',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            identifier: emailInput,
-            email: emailInput,
-            full_name: fullNameInput,
-            password,
-          }),
-        },
-      );
-      if (ordsAuth.status === 'success' && ordsAuth.user) {
-        const rawDocId = ordsAuth.user.doctor_id;
-        const rawPatId = ordsAuth.user.patient_id;
+      const ordsAuth = await fetchOrdsJson<Record<string, unknown>>('auth/login', {
+        method: 'POST',
+        body: JSON.stringify({
+          identifier: emailInput,
+          email: emailInput,
+          full_name: fullNameInput,
+          password,
+        }),
+      });
+      const authStatus = String(ordsAuth.status || '').trim().toLowerCase();
+      const rawUpstreamUser =
+        (ordsAuth.user as AuthUser | undefined) ||
+        (Array.isArray(ordsAuth.items) ? (ordsAuth.items[0] as AuthUser | undefined) : undefined) ||
+        (ordsAuth.user_id || ordsAuth.email ? (ordsAuth as unknown as AuthUser) : undefined);
+
+      if ((authStatus === 'success' || (!authStatus && Boolean(rawUpstreamUser))) && rawUpstreamUser) {
+        const rawDocId = rawUpstreamUser.doctor_id;
+        const rawPatId = rawUpstreamUser.patient_id;
         const candidate: AuthUser = {
-          ...ordsAuth.user,
+          ...rawUpstreamUser,
           doctor_id:
             rawDocId !== undefined && rawDocId !== null && String(rawDocId).trim() !== ''
               ? Number(rawDocId) || null
@@ -2193,8 +2303,8 @@ async function startServer() {
         finalizeAndRespond(candidate);
         return;
       }
-      if (ordsAuth.status === 'error') {
-        const msg = (ordsAuth.message || '').toLowerCase();
+      if (authStatus === 'error') {
+        const msg = String(ordsAuth.message || '').toLowerCase();
         if (
           msg.includes('invalid email') ||
           msg.includes('no account found') ||
@@ -2202,7 +2312,7 @@ async function startServer() {
         ) {
           ordsUnavailableOrNotFound = true;
         } else {
-          failLogin(401, ordsAuth.message || 'Invalid credentials');
+          failLogin(401, String(ordsAuth.message || 'Invalid credentials'));
           return;
         }
       }
@@ -2454,41 +2564,57 @@ async function startServer() {
     };
 
     try {
-      const ordsReg = await fetchOrdsJson<{ status?: string; message?: string; user?: AuthUser }>(
-        'auth/register',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            first_name,
-            last_name,
-            phone_number,
-            email,
-            city,
-            locality,
-            date_of_birth: date_of_birth || null,
-            gender: gender || null,
-            blood_group: blood_group || null,
-            password,
-          }),
-        },
-      );
-      if (ordsReg.status === 'success' && ordsReg.user) {
-        const user: AuthUser = { ...ordsReg.user, auth_mode: 'ords' };
-        let resolvedPatientId = user.patient_id ?? null;
+      const ordsReg = await fetchOrdsJson<Record<string, unknown>>('auth/register', {
+        method: 'POST',
+        body: JSON.stringify({
+          first_name,
+          last_name,
+          phone_number,
+          email,
+          city,
+          locality,
+          date_of_birth: date_of_birth || null,
+          gender: gender || null,
+          blood_group: blood_group || null,
+          password,
+        }),
+      });
+      const regStatus = String(ordsReg.status || '').trim().toLowerCase();
+      const regUserRaw =
+        (ordsReg.user as AuthUser | undefined) ||
+        (Array.isArray(ordsReg.items) ? (ordsReg.items[0] as AuthUser | undefined) : undefined);
+
+      if (regStatus === 'success' || (!regStatus && Boolean(regUserRaw))) {
+        const resolvedBaseUser: AuthUser = regUserRaw
+          ? { ...regUserRaw, auth_mode: 'ords' }
+          : {
+              user_id: Number(ordsReg.user_id || ordsReg.patient_id || Date.now()),
+              username: email.toLowerCase(),
+              email: email.toLowerCase(),
+              full_name: `${first_name} ${last_name}`,
+              phone_number,
+              role: 'PATIENT',
+              roles: ['PATIENT'],
+              permissions: computeEffectivePermissions('PATIENT', store.role_matrix),
+              patient_id: ordsReg.patient_id ? Number(ordsReg.patient_id) : null,
+              doctor_id: null,
+              auth_mode: 'ords',
+            };
+        let resolvedPatientId = resolvedBaseUser.patient_id ?? null;
         if (!resolvedPatientId) {
           const matches = await fetchOrdsItems<Patient>(
             `patients?phone=${encodeURIComponent(phone_number)}`,
           ).catch(() => [] as Patient[]);
           resolvedPatientId = matches[0]?.patient_id ?? null;
-          if (resolvedPatientId) user.patient_id = resolvedPatientId;
+          if (resolvedPatientId) resolvedBaseUser.patient_id = resolvedPatientId;
         }
         if (resolvedPatientId) {
           savePatientRegion(resolvedPatientId, city, locality);
         }
-        finishRegister(user, 201);
+        finishRegister(resolvedBaseUser, 201);
         return;
       }
-      if (ordsReg.status === 'error') {
+      if (regStatus === 'error') {
         res.status(400).json({ status: 'error', message: normalizeOrdsError(ordsReg) });
         return;
       }
@@ -2765,7 +2891,7 @@ async function startServer() {
       const referenceSlots = slotsToday.length > 0 ? slotsToday : scopedSlots;
 
       let pendingApprovalsCount: number | null = null;
-      if (isHospitalAdminOrSuper(user) || hasEffectivePermission(user.permissions, user.role, 'SLOTS:UPDATE')) {
+      if (shouldIncludePendingApprovalsCount(user)) {
         const pendingShiftReqs = shiftStore.change_requests.filter(
           (r) => r.status === 'PENDING',
         ).length;
@@ -3051,53 +3177,30 @@ async function startServer() {
   });
 
   async function buildNotificationsForUser(user: AuthUser): Promise<PortalNotification[]> {
-    const shiftStore = await loadShiftStoreHydrated();
     const ackKey = `${user.role}:${user.user_id}`;
     const dismissed = new Set(readNotificationAcks()[ackKey] || []);
-    const list: PortalNotification[] = [];
 
-    if (
-      isHospitalAdminOrSuper(user) ||
-      hasEffectivePermission(user.permissions, user.role, 'SLOTS:UPDATE')
-    ) {
-      for (const reqItem of shiftStore.change_requests) {
-        if (reqItem.status === 'PENDING') {
-          const id = `shift-req-${reqItem.request_id}`;
-          list.push({
-            id,
-            category: 'SHIFT_REQUEST',
-            title: `Shift change request from ${reqItem.doctor_name}`,
-            message: `Requested ${formatShiftSummary(reqItem.requested_sessions, reqItem.requested_slot_duration_mins)} · ${reqItem.reason}`,
-            route: 'approvals',
-            created_at: reqItem.requested_on,
-            read: dismissed.has(id),
-            severity: 'warning',
-          });
-        }
-      }
+    if (user.role === 'ADMIN') {
+      const [shiftStore, leaves] = await Promise.all([
+        loadShiftStoreHydrated(),
+        fetchOrdsItems<DoctorLeave>('leaves').catch(() => [] as DoctorLeave[]),
+      ]);
+      return buildScopedPortalNotifications({
+        user,
+        shiftChangeRequests: shiftStore.change_requests,
+        leaves,
+        doctorAppointments: [],
+        patientNotifications: [],
+        dismissedIds: dismissed,
+      });
+    }
 
-      const leaves = await fetchOrdsItems<DoctorLeave>('leaves').catch(() => [] as DoctorLeave[]);
-
-      for (const lv of leaves) {
-        if (lv.leave_status === 'PENDING') {
-          const id = `leave-req-${lv.leave_id}`;
-          list.push({
-            id,
-            category: 'LEAVE_REQUEST',
-            title: `Leave request from ${lv.doctor_name || `Doctor #${lv.doctor_id}`}`,
-            message: `${formatDisplayDate(lv.start_date)} – ${formatDisplayDate(lv.end_date)}${lv.leave_reason ? ` · ${lv.leave_reason}` : ''}`,
-            route: 'doctor-leaves',
-            created_at: lv.requested_on || '',
-            read: dismissed.has(id),
-            severity: 'warning',
-          });
-        }
-      }
-    } else if (user.role === 'DOCTOR' && user.doctor_id) {
-      const [rawAppts, rawSlots, templates, doctors, leaves] = await Promise.all([
+    if (user.role === 'DOCTOR' && user.doctor_id) {
+      const [shiftStore, rawAppts, rawSlots, templates, doctors, leaves] = await Promise.all([
+        loadShiftStoreHydrated(),
         fetchOrdsItems<Appointment>('appointments').catch(() => [] as Appointment[]),
         fetchOrdsItems<Slot>('slots').catch(() => [] as Slot[]),
-        fetchOrdsItems<SlotTemplate>('slot_templates').catch(() => [] as SlotTemplate[]),
+        fetchSlotTemplatesSafe(),
         fetchOrdsItems<Doctor>('doctors').catch(() => [] as Doctor[]),
         fetchOrdsItems<DoctorLeave>('leaves').catch(() => [] as DoctorLeave[]),
       ]);
@@ -3108,77 +3211,29 @@ async function startServer() {
         (a) => a.doctor_id === user.doctor_id && ['HELD', 'CONFIRMED'].includes(a.status),
       );
 
-      for (const a of docAppts) {
-        const id = `doc-appt-${a.appointment_id}-${a.status}`;
-        list.push({
-          id,
-          category: 'NEW_APPOINTMENT',
-          title: `Appointment ${a.status.toLowerCase()}: ${a.patient_name}`,
-          message: `${a.appointment_ref} · ${a.slot_date ? formatDisplayDate(a.slot_date) : ''} ${a.start_time || ''}`.trim(),
-          route: 'appointments',
-          created_at: a.created_on || '',
-          read: dismissed.has(id),
-          severity: 'info',
-        });
-      }
-
-      for (const reqItem of shiftStore.change_requests) {
-        if (reqItem.doctor_id === user.doctor_id && reqItem.status !== 'PENDING') {
-          const id = `shift-resp-${reqItem.request_id}-${reqItem.status}`;
-          list.push({
-            id,
-            category: 'ADMIN_RESPONSE',
-            title: `Shift change request ${reqItem.status.toLowerCase()}`,
-            message: `${formatShiftSummary(reqItem.requested_sessions, reqItem.requested_slot_duration_mins)}${reqItem.decision_comments ? ` · Note: ${reqItem.decision_comments}` : ''}`,
-            route: 'slots',
-            created_at: reqItem.decided_on || reqItem.requested_on,
-            read: dismissed.has(id),
-            severity: reqItem.status === 'APPROVED' ? 'success' : 'warning',
-          });
-        }
-      }
-
-      for (const lv of leaves) {
-        if (lv.doctor_id === user.doctor_id && ['APPROVED', 'REJECTED'].includes(lv.leave_status)) {
-          const id = `leave-resp-${lv.leave_id}-${lv.leave_status}`;
-          list.push({
-            id,
-            category: 'ADMIN_RESPONSE',
-            title: `Leave request ${lv.leave_status.toLowerCase()} by admin`,
-            message: `${formatDisplayDate(lv.start_date)} – ${formatDisplayDate(lv.end_date)}${lv.leave_reason ? ` · ${lv.leave_reason}` : ''}`,
-            route: 'doctor-leaves',
-            created_at: lv.approved_on || lv.requested_on || '',
-            read: dismissed.has(id),
-            severity: lv.leave_status === 'APPROVED' ? 'success' : 'warning',
-          });
-        }
-      }
-    } else if (user.role === 'PATIENT' && user.patient_id) {
-      const store = readClinicalStore();
-      const myNotifs = store.patient_notifications.filter(
-        (n) => n.patient_id === user.patient_id,
-      );
-      for (const n of myNotifs) {
-        list.push({
-          id: n.id,
-          category:
-            n.event_type === 'CREATED' ? 'PRESCRIPTION_CREATED' : 'PRESCRIPTION_UPDATED',
-          title: n.title,
-          message: n.message,
-          route: 'prescriptions',
-          created_at: n.created_at,
-          read: dismissed.has(n.id),
-          severity: 'success',
-          doctor_name: n.doctor_name,
-          appointment_ref: n.appointment_ref,
-          prescription_id: n.prescription_id,
-          patient_id: n.patient_id,
-        });
-      }
+      return buildScopedPortalNotifications({
+        user,
+        shiftChangeRequests: shiftStore.change_requests,
+        leaves,
+        doctorAppointments: docAppts,
+        patientNotifications: [],
+        dismissedIds: dismissed,
+      });
     }
 
-    list.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
-    return list;
+    if (user.role === 'PATIENT' && user.patient_id) {
+      const clinicalStore = readClinicalStore();
+      return buildScopedPortalNotifications({
+        user,
+        shiftChangeRequests: [],
+        leaves: [],
+        doctorAppointments: [],
+        patientNotifications: clinicalStore.patient_notifications,
+        dismissedIds: dismissed,
+      });
+    }
+
+    return [];
   }
 
   app.get('/api/notifications', requireAuth, async (req, res) => {
@@ -3300,7 +3355,7 @@ async function startServer() {
       }),
     });
 
-    if (directRes.status !== 'error') {
+    if (String(directRes?.status || '').trim().toLowerCase() !== 'error') {
       return { slot_id: directRes.slot_id ?? directRes.id, template_id: null };
     }
 
@@ -3379,11 +3434,7 @@ async function startServer() {
       res.json({
         status: 'success',
         shifts,
-        change_requests:
-          isHospitalAdminOrSuper(user) ||
-          hasEffectivePermission(user.permissions, user.role, 'SLOTS:UPDATE')
-            ? store.change_requests
-            : [],
+        change_requests: canViewAllShiftChangeRequests(user) ? store.change_requests : [],
       });
     } catch (err) {
       res.status(502).json({
@@ -3583,6 +3634,13 @@ async function startServer() {
 
   app.get('/api/admin/shift-change-requests', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!canViewAllShiftChangeRequests(user)) {
+      res.status(403).json({
+        status: 'error',
+        message: 'Only hospital administrators can view hospital-wide shift change requests.',
+      });
+      return;
+    }
     if (!requirePermission(user, res, 'SLOTS:UPDATE', 'Shift Change Requests')) return;
     const store = await loadShiftStoreHydrated();
     res.json({ status: 'success', requests: store.change_requests });
@@ -3590,10 +3648,10 @@ async function startServer() {
 
   app.post('/api/admin/shift-change-requests/:id/decide', requireAuth, async (req, res) => {
     const user = (req as Request & { authUser: AuthUser }).authUser;
-    if (user.role === 'DOCTOR') {
+    if (!canDecideLeaveOrShiftRequest(user)) {
       res.status(403).json({
         status: 'error',
-        message: 'Doctors cannot approve or reject their own shift change requests.',
+        message: 'Only hospital administrators can approve or reject shift change requests.',
       });
       return;
     }
@@ -4109,9 +4167,9 @@ async function startServer() {
             amount?: number;
           }>(`appointments/${apptId}/pay-and-confirm`, {
             method: 'POST',
-            body: JSON.stringify({ payment_method: paymentMethod }),
+            body: JSON.stringify({ payment_method: paymentMethod, amount: doctorFee }),
           });
-          if (oicPayRes.status === 'error') {
+          if (String(oicPayRes?.status || '').trim().toLowerCase() === 'error') {
             res.status(400).json({
               status: 'error',
               message: oicPayRes.message || 'Unable to process payment and confirm booking via OIC.',
@@ -4237,7 +4295,7 @@ async function startServer() {
         loadUnifiedDirectory(),
         fetchOrdsItems<Appointment>('appointments').catch(() => [] as Appointment[]),
         fetchOrdsItems<Slot>('slots').catch(() => [] as Slot[]),
-        fetchOrdsItems<SlotTemplate>('slot_templates').catch(() => [] as SlotTemplate[]),
+        fetchSlotTemplatesSafe(),
         fetchOrdsItems<Doctor>('doctors').catch(() => [] as Doctor[]),
       ]);
       const roles = buildRoleDefinitions(directory);
@@ -5728,10 +5786,13 @@ async function startServer() {
     }
     const effectiveMode: BackendMode = OIC_CONFIGURED ? backendState.mode : 'ORDS';
     res.json({
-      mode: effectiveMode,
+      mode: backendState.mode,
+      effective_mode: effectiveMode,
       persisted_mode: backendState.mode,
       oic_configured: OIC_CONFIGURED,
       oic_oauth_configured: OIC_OAUTH_CONFIGURED,
+      oic_basic_configured: OIC_BASIC_CONFIGURED,
+      fallback_to_ords: !OIC_CONFIGURED && backendState.mode !== 'ORDS',
       oic_phases: backendState.oic_phases,
       ...(authUser
         ? {
@@ -5754,14 +5815,6 @@ async function startServer() {
     const requestedMode = hasMode ? parseBackendMode(body.mode) : backendState.mode;
     if (!requestedMode) {
       res.status(400).json({ status: 'error', message: 'mode must be "HYBRID", "OIC", or "ORDS".' });
-      return;
-    }
-    if ((requestedMode === 'OIC' || requestedMode === 'HYBRID') && !OIC_CONFIGURED) {
-      res.status(400).json({
-        status: 'error',
-        message:
-          'OIC is not configured. Set OIC_BASE_URL, OIC_TOKEN_URL, OIC_CLIENT_ID, and OIC_CLIENT_SECRET in .env.',
-      });
       return;
     }
 
@@ -5795,7 +5848,7 @@ async function startServer() {
         category: 'SECURITY',
         previous_value: `${previousMode} [${previousPhases}]`,
         new_value: `${backendState.mode} [${backendState.oic_phases.join(',')}]`,
-        details: `${user.full_name} set application routing mode to ${backendState.mode} (OIC phases: ${backendState.oic_phases.join(', ')}).`,
+        details: `${user.full_name} set application routing mode to ${backendState.mode} (OIC phases: ${backendState.oic_phases.join(', ')}${!OIC_CONFIGURED && backendState.mode !== 'ORDS' ? '; OIC credentials pending in .env, using ORDS fallback' : ''}).`,
         severity: 'info',
       });
     }
@@ -5803,8 +5856,11 @@ async function startServer() {
     res.json({
       status: 'success',
       mode: backendState.mode,
+      effective_mode: OIC_CONFIGURED ? backendState.mode : 'ORDS',
       oic_configured: OIC_CONFIGURED,
       oic_oauth_configured: OIC_OAUTH_CONFIGURED,
+      oic_basic_configured: OIC_BASIC_CONFIGURED,
+      fallback_to_ords: !OIC_CONFIGURED && backendState.mode !== 'ORDS',
       oic_phases: backendState.oic_phases,
     });
   });
@@ -5958,6 +6014,13 @@ async function startServer() {
         return;
       }
     } else if (subPath.startsWith('approvals')) {
+      if (!canViewAllShiftChangeRequests(user)) {
+        res.status(403).json({
+          status: 'error',
+          message: 'Only hospital administrators can access approval queues.',
+        });
+        return;
+      }
       if (
         !requireAnyPermission(
           user,
@@ -6173,8 +6236,11 @@ async function startServer() {
       } else if (subPath === 'leaves') {
         if (!requireAnyPermission(user, res, ['SLOTS:CREATE', 'SLOTS:UPDATE'], `ORDS ${subPath}`)) return;
       } else if (/^leaves\/\d+\/decide$/.test(subPath)) {
-        if (user.role === 'DOCTOR') {
-          res.status(403).json({ status: 'error', message: 'Doctors cannot approve their own leave requests' });
+        if (!canDecideLeaveOrShiftRequest(user)) {
+          res.status(403).json({
+            status: 'error',
+            message: 'Only hospital administrators can approve or reject leave requests',
+          });
           return;
         }
         if (!enforceModulePerm('SLOTS', 'UPDATE', `ORDS ${subPath}`)) return;
@@ -6211,6 +6277,13 @@ async function startServer() {
       if (method === 'GET') {
         if (!enforceModulePerm('SLOTS', 'VIEW', `ORDS ${subPath}`)) return;
       } else {
+        if (subPath.startsWith('shift-change-requests') && subPath.includes('/decide') && !canDecideLeaveOrShiftRequest(user)) {
+          res.status(403).json({
+            status: 'error',
+            message: 'Only hospital administrators can approve or reject shift change requests',
+          });
+          return;
+        }
         if (!enforceModulePerm('SLOTS', 'UPDATE', `ORDS ${subPath}`)) return;
       }
     } else if (subPath.startsWith('medical-records')) {
@@ -6700,7 +6773,9 @@ async function startServer() {
         }
       }
       const mutationSucceeded =
-        upstream.ok && (!parsedMutationBody || parsedMutationBody.status !== 'error');
+        upstream.ok &&
+        (!parsedMutationBody ||
+          String(parsedMutationBody.status || '').trim().toLowerCase() !== 'error');
 
       if (upstream.ok && pendingBookingInfo) {
         try {
@@ -7179,6 +7254,24 @@ async function startServer() {
         });
       }
 
+      if (mutationSucceeded && subPath.startsWith('users') && method !== 'GET') {
+        const userLabel =
+          String(outgoingBody?.email || outgoingBody?.username || outgoingBody?.full_name || subPath).trim();
+        const userAction =
+          method === 'POST' ? 'USER_ORDS_CREATED' : method === 'DELETE' ? 'USER_ORDS_DEACTIVATED' : 'USER_ORDS_UPDATED';
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: userLabel,
+          action: userAction,
+          category: 'USER',
+          details: `${user.full_name} (${user.role}) executed ${method} on ORDS ${subPath} for ${userLabel}.`,
+          severity: method === 'DELETE' ? 'warning' : 'info',
+        });
+      }
+
       if (mutationSucceeded && subPath.startsWith('cancellation-rules') && method !== 'GET') {
         const ruleLabel = String(outgoingBody?.rule_name || subPath).trim();
         const ruleAction =
@@ -7413,14 +7506,17 @@ async function startServer() {
                 myApptIds.has((t as TokenQueueItem).appointment_id),
               );
             } else if (subPath === 'slots') {
-              const templates = await fetchOrdsItems<SlotTemplate>('slot_templates').catch(
-                () => [] as SlotTemplate[],
-              );
+              const templates = await fetchSlotTemplatesSafe();
               parsed.items = filterConfirmedSlots(parsed.items as Slot[], templates);
-            } else if (subPath === 'leaves' && user.role === 'DOCTOR') {
-              parsed.items = parsed.items.filter(
-                (l) => (l as { doctor_id?: number }).doctor_id === user.doctor_id,
-              );
+            } else if (subPath === 'leaves') {
+              parsed.items = scopeLeavesForUser(parsed.items as DoctorLeave[], user);
+            } else if (subPath === 'shift-change-requests' && !canViewAllShiftChangeRequests(user)) {
+              parsed.items =
+                user.role === 'DOCTOR' && user.doctor_id
+                  ? parsed.items.filter(
+                      (r) => Number((r as { doctor_id?: number }).doctor_id) === user.doctor_id,
+                    )
+                  : [];
             }
             res.status(upstream.status).json(parsed);
             return;

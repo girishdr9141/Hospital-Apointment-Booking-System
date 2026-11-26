@@ -183,7 +183,9 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
     parsed &&
     typeof parsed === 'object' &&
     'status' in parsed &&
-    (parsed as { status?: string }).status === 'error'
+    String((parsed as { status?: string }).status || '')
+      .trim()
+      .toLowerCase() === 'error'
   ) {
     throw new ApiHttpError(normalizeOrdsError(parsed, 'Oracle ORDS returned an error'), 400);
   }
@@ -332,9 +334,12 @@ export const apiClient = {
   getBackendMode: async () => {
     const res = await requestJson<{
       mode: BackendMode;
+      effective_mode?: BackendMode;
       persisted_mode?: BackendMode;
       oic_configured: boolean;
       oic_oauth_configured?: boolean;
+      oic_basic_configured?: boolean;
+      fallback_to_ords?: boolean;
       oic_phases: OicPhaseId[];
       oic_host_preview?: string | null;
       integrations?: OicIntegrationDescriptor[];
@@ -357,8 +362,11 @@ export const apiClient = {
     const res = await requestJson<{
       status: string;
       mode: BackendMode;
+      effective_mode?: BackendMode;
       oic_configured: boolean;
       oic_oauth_configured?: boolean;
+      oic_basic_configured?: boolean;
+      fallback_to_ords?: boolean;
       oic_phases: OicPhaseId[];
     }>('/api/backend-mode', {
       method: 'POST',

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   CheckCircle2,
@@ -65,17 +65,58 @@ export function LoginPage({
   const portal = getRolePortalConfig(selectedRole);
   const RoleIcon = ROLE_ICON[selectedRole];
 
+  const roleSlug = selectedRole.toLowerCase();
+  const safeInitialEmail = selectedRole === 'PATIENT' ? initialEmail : '';
+
   const [fullName, setFullName] = useState('');
-  const [email, setEmail] = useState(initialEmail);
+  const [email, setEmail] = useState(safeInitialEmail);
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [allowPatientReg, setAllowPatientReg] = useState(true);
 
+  const fullNameInputRef = useRef<HTMLInputElement | null>(null);
+  const emailInputRef = useRef<HTMLInputElement | null>(null);
+  const passwordInputRef = useRef<HTMLInputElement | null>(null);
+  const userEditedRef = useRef({ fullName: false, email: false, password: false });
+
   useEffect(() => {
-    if (initialEmail) setEmail(initialEmail);
-  }, [initialEmail]);
+    const nextEmail = selectedRole === 'PATIENT' ? initialEmail : '';
+    userEditedRef.current = { fullName: false, email: false, password: false };
+    setFullName('');
+    setEmail(nextEmail);
+    setPassword('');
+    setShowPassword(false);
+    setErrorMsg(null);
+
+    const scrubAutofill = () => {
+      if (!userEditedRef.current.fullName && fullNameInputRef.current && fullNameInputRef.current.value) {
+        fullNameInputRef.current.value = '';
+        setFullName('');
+      }
+      if (
+        !userEditedRef.current.email &&
+        !nextEmail &&
+        emailInputRef.current &&
+        emailInputRef.current.value
+      ) {
+        emailInputRef.current.value = '';
+        setEmail('');
+      }
+      if (!userEditedRef.current.password && passwordInputRef.current && passwordInputRef.current.value) {
+        passwordInputRef.current.value = '';
+        setPassword('');
+      }
+    };
+
+    const rafId = window.requestAnimationFrame(scrubAutofill);
+    const timerId = window.setTimeout(scrubAutofill, 120);
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      window.clearTimeout(timerId);
+    };
+  }, [selectedRole, initialEmail]);
 
   useEffect(() => {
     apiClient
@@ -168,9 +209,20 @@ export function LoginPage({
             </div>
           )}
 
-          <form onSubmit={handleSubmit} className="mt-5 space-y-4" noValidate>
+          <form
+            onSubmit={handleSubmit}
+            autoComplete="off"
+            data-lpignore="true"
+            data-1p-ignore="true"
+            data-form-type="other"
+            className="mt-5 space-y-4"
+            noValidate
+          >
             <div>
-              <label htmlFor="login-fullname" className="block text-sm font-medium text-slate-700">
+              <label
+                htmlFor={`login-${roleSlug}-fullname`}
+                className="block text-sm font-medium text-slate-700"
+              >
                 Full Name
               </label>
               <div className="relative mt-1.5">
@@ -179,11 +231,19 @@ export function LoginPage({
                   aria-hidden="true"
                 />
                 <input
-                  id="login-fullname"
+                  ref={fullNameInputRef}
+                  id={`login-${roleSlug}-fullname`}
+                  name={`carepulse_${roleSlug}_fullname`}
                   type="text"
-                  autoComplete="name"
+                  autoComplete="off"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
+                  data-form-type="other"
                   value={fullName}
-                  onChange={(e) => setFullName(e.target.value)}
+                  onChange={(e) => {
+                    userEditedRef.current.fullName = true;
+                    setFullName(e.target.value);
+                  }}
                   placeholder={NAME_PLACEHOLDER[selectedRole]}
                   className="w-full rounded-lg border border-slate-300 bg-white py-2.5 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
                 />
@@ -191,7 +251,10 @@ export function LoginPage({
             </div>
 
             <div>
-              <label htmlFor="login-email" className="block text-sm font-medium text-slate-700">
+              <label
+                htmlFor={`login-${roleSlug}-email`}
+                className="block text-sm font-medium text-slate-700"
+              >
                 Email ID
               </label>
               <div className="relative mt-1.5">
@@ -200,11 +263,19 @@ export function LoginPage({
                   aria-hidden="true"
                 />
                 <input
-                  id="login-email"
+                  ref={emailInputRef}
+                  id={`login-${roleSlug}-email`}
+                  name={`carepulse_${roleSlug}_email`}
                   type="email"
-                  autoComplete="email"
+                  autoComplete="off"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
+                  data-form-type="other"
                   value={email}
-                  onChange={(e) => setEmail(e.target.value)}
+                  onChange={(e) => {
+                    userEditedRef.current.email = true;
+                    setEmail(e.target.value);
+                  }}
                   placeholder={EMAIL_PLACEHOLDER[selectedRole]}
                   className="w-full rounded-lg border border-slate-300 bg-white py-2.5 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
                 />
@@ -213,7 +284,10 @@ export function LoginPage({
 
             <div>
               <div className="flex items-center justify-between gap-2">
-                <label htmlFor="login-password" className="block text-sm font-medium text-slate-700">
+                <label
+                  htmlFor={`login-${roleSlug}-password`}
+                  className="block text-sm font-medium text-slate-700"
+                >
                   Password
                 </label>
                 {portal.allowForgotPassword && onSwitchToForgotPassword && (
@@ -232,11 +306,19 @@ export function LoginPage({
                   aria-hidden="true"
                 />
                 <input
-                  id="login-password"
+                  ref={passwordInputRef}
+                  id={`login-${roleSlug}-password`}
+                  name={`carepulse_${roleSlug}_password`}
                   type={showPassword ? 'text' : 'password'}
-                  autoComplete="current-password"
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
+                  data-form-type="other"
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
+                  onChange={(e) => {
+                    userEditedRef.current.password = true;
+                    setPassword(e.target.value);
+                  }}
                   placeholder="Enter password"
                   className="w-full rounded-lg border border-slate-300 bg-white py-2.5 pl-9 pr-10 text-sm text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
                 />

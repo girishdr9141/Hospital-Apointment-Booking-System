@@ -293,6 +293,14 @@ export function readRbacAuditLogs(limit = 1000): RbacAuditLogEntry[] {
   }
 }
 
+export type ExternalAuditLogSink = (entry: RbacAuditLogEntry) => void;
+
+let externalAuditLogSink: ExternalAuditLogSink | null = null;
+
+export function registerExternalAuditLogSink(sink: ExternalAuditLogSink | null): void {
+  externalAuditLogSink = sink;
+}
+
 export function recordRbacAuditLog(
   entry: Omit<RbacAuditLogEntry, 'id' | 'timestamp'>,
 ): RbacAuditLogEntry {
@@ -305,6 +313,13 @@ export function recordRbacAuditLog(
   const next = [fullEntry, ...existing].slice(0, 5000);
   fs.mkdirSync(DATA_DIR, { recursive: true });
   fs.writeFileSync(RBAC_AUDIT_PATH, JSON.stringify(next, null, 2), 'utf8');
+  if (externalAuditLogSink) {
+    try {
+      externalAuditLogSink(fullEntry);
+    } catch {
+      // Never let remote audit sink interrupt primary application flow
+    }
+  }
   return fullEntry;
 }
 

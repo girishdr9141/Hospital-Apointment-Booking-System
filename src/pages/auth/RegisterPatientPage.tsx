@@ -161,7 +161,14 @@ export function RegisterPatientPage({
                 </div>
               )}
 
-              <form onSubmit={handleSubmit} className="mt-6 space-y-4" noValidate>
+              <form
+                onSubmit={handleSubmit}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
+                className="mt-6 space-y-4"
+                noValidate
+              >
                 <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                   <div>
                     <label
@@ -172,7 +179,9 @@ export function RegisterPatientPage({
                     </label>
                     <input
                       id="reg-first-name"
+                      name="carepulse_reg_first_name"
                       type="text"
+                      autoComplete="off"
                       value={firstName}
                       onChange={(e) => setFirstName(e.target.value)}
                       className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
@@ -187,7 +196,9 @@ export function RegisterPatientPage({
                     </label>
                     <input
                       id="reg-last-name"
+                      name="carepulse_reg_last_name"
                       type="text"
+                      autoComplete="off"
                       value={lastName}
                       onChange={(e) => setLastName(e.target.value)}
                       className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
@@ -202,7 +213,9 @@ export function RegisterPatientPage({
                     </label>
                     <input
                       id="reg-phone"
+                      name="carepulse_reg_phone"
                       type="tel"
+                      autoComplete="off"
                       value={phoneNumber}
                       onChange={(e) => setPhoneNumber(e.target.value)}
                       placeholder="9876543211"
@@ -215,7 +228,11 @@ export function RegisterPatientPage({
                     </label>
                     <input
                       id="reg-email"
+                      name="carepulse_reg_email"
                       type="email"
+                      autoComplete="off"
+                      data-lpignore="true"
+                      data-1p-ignore="true"
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
                       placeholder="patient@example.com"
@@ -239,6 +256,7 @@ export function RegisterPatientPage({
                     </label>
                     <input
                       id="reg-dob"
+                      name="carepulse_reg_dob"
                       type="date"
                       value={dateOfBirth}
                       onChange={(e) => setDateOfBirth(e.target.value)}
@@ -251,6 +269,7 @@ export function RegisterPatientPage({
                     </label>
                     <select
                       id="reg-gender"
+                      name="carepulse_reg_gender"
                       value={gender}
                       onChange={(e) =>
                         setGender(e.target.value as 'MALE' | 'FEMALE' | 'OTHER' | '')
@@ -269,7 +288,9 @@ export function RegisterPatientPage({
                     </label>
                     <input
                       id="reg-blood"
+                      name="carepulse_reg_blood"
                       type="text"
+                      autoComplete="off"
                       value={bloodGroup}
                       onChange={(e) => setBloodGroup(e.target.value)}
                       placeholder="O+"
@@ -287,7 +308,11 @@ export function RegisterPatientPage({
                   </label>
                   <input
                     id="reg-password"
+                    name="carepulse_reg_password"
                     type="password"
+                    autoComplete="new-password"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder={`At least ${minPasswordLen} characters`}

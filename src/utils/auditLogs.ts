@@ -1,4 +1,9 @@
-import type { AuditLogCategory, ConsultationMode, RbacAuditLogEntry } from '../types/opd';
+import type {
+  AuditLogCategory,
+  AuditLogRecord,
+  ConsultationMode,
+  RbacAuditLogEntry,
+} from '../types/opd';
 
 export type AuditLogCategoryFilter = 'ALL' | AuditLogCategory;
 
@@ -122,3 +127,95 @@ export function describeCancellationAuditDetails(params: {
 
   return `${whoCancelled}: ${params.appointmentRef}${patientPart}${docPart}${whenPart} [was ${params.previousStatus}]. Unpaid booking cancelled and slot released.`;
 }
+
+export interface OracleAuditLogPayload {
+  user_id: number | null;
+  action_name: string;
+  table_name: string;
+  record_id: string | null;
+  action_description: string;
+}
+
+export function inferOracleAuditTableName(entry: Pick<RbacAuditLogEntry, 'action' | 'category'>): string {
+  const action = String(entry.action || '').toUpperCase();
+  if (action.startsWith('SHIFT_WINDOW')) return 'GIRISH_DOCTOR_SHIFT_WINDOWS';
+  if (action.startsWith('SHIFT_CHANGE')) return 'GIRISH_SHIFT_CHANGE_REQUESTS';
+  if (action.startsWith('LEAVE_REQUEST')) return 'GIRISH_DOCTOR_LEAVES';
+  if (action.startsWith('SLOT')) return 'GIRISH_SLOTS';
+  if (action.startsWith('MEDICAL_RECORD')) return 'GIRISH_MEDICAL_RECORDS';
+  if (action.startsWith('PRESCRIPTION')) return 'GIRISH_PRESCRIPTIONS';
+  if (action.startsWith('TOKEN_')) return 'GIRISH_TOKEN_QUEUE';
+  if (action.startsWith('CANCELLATION_RULE')) return 'GIRISH_CANCELLATION_RULES';
+  if (action.startsWith('PAYMENT_') || action.startsWith('REFUND_') || action.includes('PAID')) {
+    return 'GIRISH_PAYMENTS';
+  }
+  if (action.startsWith('APPOINTMENT_')) return 'GIRISH_APPOINTMENTS';
+  if (action.startsWith('PATIENT_')) return 'GIRISH_PATIENTS';
+  if (action.startsWith('DOCTOR_')) return 'GIRISH_DOCTORS';
+  if (action.startsWith('DEPARTMENT_')) return 'GIRISH_DEPARTMENTS';
+  if (action.startsWith('CONSULTATION_TYPE')) return 'GIRISH_CONSULTATION_TYPES';
+  if (action.startsWith('ROLE_')) return 'GIRISH_ROLES';
+  if (action.startsWith('PERMISSION_') || action.startsWith('RBAC_')) return 'GIRISH_PERMISSIONS';
+
+  switch (entry.category) {
+    case 'APPOINTMENTS':
+      return 'GIRISH_APPOINTMENTS';
+    case 'BILLING':
+      return 'GIRISH_PAYMENTS';
+    case 'SHIFTS_LEAVES':
+      return 'GIRISH_DOCTOR_LEAVES';
+    case 'CLINICAL':
+      return 'GIRISH_MEDICAL_RECORDS';
+    case 'ROLE':
+      return 'GIRISH_ROLES';
+    case 'PERMISSION':
+      return 'GIRISH_PERMISSIONS';
+    default:
+      return 'GIRISH_USERS';
+  }
+}
+
+export function buildOracleAuditPayload(entry: RbacAuditLogEntry): OracleAuditLogPayload {
+  const userId =
+    typeof entry.actor_user_id === 'number' && entry.actor_user_id > 0
+      ? entry.actor_user_id
+      : null;
+  const actionName = String(entry.action || 'SYSTEM_EVENT').trim().toUpperCase().slice(0, 100);
+  const tableName = inferOracleAuditTableName(entry).slice(0, 100);
+
+  const rawRecordId =
+    entry.target_label ||
+    (entry.target_user_id != null ? String(entry.target_user_id) : '') ||
+    entry.id;
+  const recordId = rawRecordId ? String(rawRecordId).trim().slice(0, 100) : null;
+
+  const actorEmailPart = entry.actor_email ? `, ${entry.actor_email}` : '';
+  const actorPrefix = `[${entry.actor_name} (${entry.actor_role}${actorEmailPart})]`;
+  const diffPart =
+    entry.previous_value || entry.new_value
+      ? ` [${entry.previous_value ? `${entry.previous_value} -> ` : ''}${entry.new_value || ''}]`
+      : '';
+  const fullDesc = `${actorPrefix} ${entry.details}${diffPart}`.replace(/\s+/g, ' ').trim();
+
+  return {
+    user_id: userId,
+    action_name: actionName,
+    table_name: tableName,
+    record_id: recordId,
+    action_description: fullDesc.slice(0, 1000),
+  };
+}
+
+export function extractOracleAuditActor(
+  row: Pick<AuditLogRecord, 'username' | 'user_id' | 'action_description'>,
+): string {
+  if (row.username) return row.username;
+  const desc = String(row.action_description || '').trim();
+  const match = desc.match(/^\[([^\]]+)\]/);
+  if (match?.[1]) {
+    return match[1];
+  }
+  if (row.user_id) return `User #${row.user_id}`;
+  return 'SYSTEM';
+}
+

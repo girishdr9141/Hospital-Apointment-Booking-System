@@ -7,6 +7,7 @@ import { useToast } from '../../context/ToastContext';
 import { buildCsvString, downloadCsvFile } from '../../utils/csv';
 import {
   ALL_AUDIT_CATEGORIES,
+  extractOracleAuditActor,
   filterAuditLogs,
   getAuditCategoryLabel,
   type AuditLogCategoryFilter,
@@ -241,9 +242,7 @@ export function LogsPage({ mode }: LogsPageProps) {
       key: 'user',
       header: 'Actor',
       render: (row) => (
-        <span className="text-slate-700">
-          {row.username || (row.user_id ? `User #${row.user_id}` : 'SYSTEM')}
-        </span>
+        <span className="text-slate-700">{extractOracleAuditActor(row)}</span>
       ),
     },
     {

@@ -101,7 +101,14 @@ export function PatientForgotPasswordPage({
             </div>
           )}
 
-          <form onSubmit={handleSubmit} className="mt-5 space-y-4" noValidate>
+          <form
+            onSubmit={handleSubmit}
+            autoComplete="off"
+            data-lpignore="true"
+            data-1p-ignore="true"
+            className="mt-5 space-y-4"
+            noValidate
+          >
             <div>
               <label htmlFor="forgot-email" className="block text-sm font-medium text-slate-700">
                 Registered Email ID
@@ -113,8 +120,11 @@ export function PatientForgotPasswordPage({
                 />
                 <input
                   id="forgot-email"
+                  name="carepulse_forgot_email"
                   type="email"
-                  autoComplete="email"
+                  autoComplete="off"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="patient@example.com"
@@ -134,8 +144,11 @@ export function PatientForgotPasswordPage({
                 />
                 <input
                   id="forgot-phone"
+                  name="carepulse_forgot_phone"
                   type="tel"
-                  autoComplete="tel"
+                  autoComplete="off"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                   value={phoneNumber}
                   onChange={(e) => setPhoneNumber(e.target.value)}
                   placeholder="10-digit registered mobile number"
@@ -155,8 +168,11 @@ export function PatientForgotPasswordPage({
                 />
                 <input
                   id="forgot-new-pw"
+                  name="carepulse_forgot_new_pw"
                   type={showPassword ? 'text' : 'password'}
                   autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                   value={newPassword}
                   onChange={(e) => setNewPassword(e.target.value)}
                   placeholder="At least 6 characters"
@@ -188,8 +204,11 @@ export function PatientForgotPasswordPage({
                 />
                 <input
                   id="forgot-confirm-pw"
+                  name="carepulse_forgot_confirm_pw"
                   type={showPassword ? 'text' : 'password'}
                   autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                   value={confirmPassword}
                   onChange={(e) => setConfirmPassword(e.target.value)}
                   placeholder="Re-enter new password"
