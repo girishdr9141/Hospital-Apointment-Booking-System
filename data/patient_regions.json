@@ -22,5 +22,13 @@
   "101": {
     "city": "Bengaluru",
     "locality": "Malleshwaram"
+  },
+  "121": {
+    "city": "Bengaluru",
+    "locality": "HSR Layout"
+  },
+  "182": {
+    "city": "Bengaluru",
+    "locality": "Marathahalli"
   }
 }

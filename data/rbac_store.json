@@ -188,6 +188,22 @@
     "girish.dr@conneqtiongroup.com": {
       "count": 1,
       "locked_until": null
+    },
+    "anuradha.b@hospital.com": {
+      "count": 1,
+      "locked_until": null
+    },
+    "anuradha.b@example.com": {
+      "count": 1,
+      "locked_until": null
+    },
+    "anuradha.b.patient@example.com": {
+      "count": 1,
+      "locked_until": null
+    },
+    "anuradha.patient@example.com": {
+      "count": 1,
+      "locked_until": null
     }
   }
 }

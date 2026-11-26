@@ -96,6 +96,29 @@
       "is_registered": true,
       "registered_at": "2026-11-15T17:11:49.144Z",
       "updated_at": "2026-11-15T17:15:52.297Z"
+    },
+    "61": {
+      "doctor_id": 61,
+      "doctor_name": "Dr. Suhas G",
+      "sessions": [
+        {
+          "start_time": "09:00",
+          "end_time": "13:00"
+        }
+      ],
+      "slot_duration_mins": 30,
+      "working_days": [
+        "MONDAY",
+        "TUESDAY",
+        "WEDNESDAY",
+        "THURSDAY",
+        "FRIDAY",
+        "SATURDAY",
+        "SUNDAY"
+      ],
+      "is_registered": true,
+      "registered_at": "2026-11-26T07:44:25.672Z",
+      "updated_at": "2026-11-26T07:44:25.672Z"
     }
   },
   "change_requests": [
@@ -164,7 +187,9 @@
     "3|2026-11-17|18:00",
     "3|2026-11-17|22:30",
     "46|2026-11-18|10:40",
-    "2|2026-11-25|09:00"
+    "2|2026-11-25|09:00",
+    "101|2026-11-26|23:00",
+    "101|2026-11-26|22:30"
   ],
   "template_doctor_map": {
     "261": 2,
