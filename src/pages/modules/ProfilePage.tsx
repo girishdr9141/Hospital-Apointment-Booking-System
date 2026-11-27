@@ -3,6 +3,7 @@ import { Clock } from 'lucide-react';
 import type { Department, Doctor, DoctorShiftConfig, Patient } from '../../types/opd';
 import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient';
 import { useAuth } from '../../context/AuthContext';
+import { useBranchContext } from '../../context/BranchContext';
 import { useToast } from '../../context/ToastContext';
 import { ROLE_LABELS } from '../../utils/permissions';
 import { formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
@@ -14,6 +15,7 @@ import { DoctorShiftModal } from '../../components/modals/DoctorShiftModal';
 export function ProfilePage() {
   const { user } = useAuth();
   const { notify } = useToast();
+  const { countries, branches, headquartersBranch } = useBranchContext();
 
   const [loading, setLoading] = useState(true);
   const [patient, setPatient] = useState<Patient | null>(null);
@@ -32,6 +34,9 @@ export function ProfilePage() {
   const [dob, setDob] = useState('');
   const [gender, setGender] = useState<'MALE' | 'FEMALE' | 'OTHER' | ''>('');
   const [bloodGroup, setBloodGroup] = useState('');
+  const [countryId, setCountryId] = useState('');
+  const [homeBranchId, setHomeBranchId] = useState('');
+  const [postalCode, setPostalCode] = useState('');
   const [saving, setSaving] = useState(false);
 
   const loadProfile = useCallback(async () => {
@@ -39,7 +44,10 @@ export function ProfilePage() {
     setLoading(true);
     try {
       if (user.role === 'PATIENT') {
-        const list = await apiClient.getPatients();
+        const [list, globalProfiles] = await Promise.all([
+          apiClient.getPatients(),
+          apiClient.getGlobalPatientProfiles().catch(() => []),
+        ]);
         const found =
           (user.patient_id ? list.find((p) => p.patient_id === user.patient_id) : undefined) ||
           list[0] ||
@@ -55,6 +63,14 @@ export function ProfilePage() {
           setDob(found.date_of_birth ? found.date_of_birth.slice(0, 10) : '');
           setGender((found.gender as 'MALE' | 'FEMALE' | 'OTHER' | '') || '');
           setBloodGroup(found.blood_group || '');
+          const gProfile = globalProfiles.find((gp) => gp.patient_id === found.patient_id);
+          setCountryId(
+            String(gProfile?.country_id || headquartersBranch?.country_id || countries[0]?.country_id || 1),
+          );
+          setHomeBranchId(
+            String(gProfile?.home_branch_id || headquartersBranch?.branch_id || branches[0]?.branch_id || 1),
+          );
+          setPostalCode(gProfile?.postal_code || '');
         }
       } else if (user.role === 'DOCTOR') {
         const [docs, activeDepts, shiftsRes] = await Promise.all([
@@ -105,7 +121,17 @@ export function ProfilePage() {
         gender: gender || undefined,
         blood_group: bloodGroup.trim() || undefined,
       });
-      notify('Profile updated in Oracle GIRISH_PATIENTS', 'success');
+      await apiClient
+        .saveGlobalPatientProfile({
+          patient_id: patient.patient_id,
+          country_id: countryId ? Number(countryId) : null,
+          home_branch_id: homeBranchId ? Number(homeBranchId) : null,
+          city: city.trim(),
+          address_line: locality.trim(),
+          postal_code: postalCode.trim() || null,
+        })
+        .catch(() => null);
+      notify('Profile updated in Oracle GIRISH_PATIENTS & Global CarePulse profile', 'success');
       await loadProfile();
     } catch (err) {
       if (isEndpointNotDeployedError(err)) {
@@ -221,6 +247,69 @@ export function ProfilePage() {
               onCityChange={setCity}
               onLocalityChange={setLocality}
             />
+
+            {countries.length > 0 && (
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                <div>
+                  <label htmlFor="prof-country" className="block text-sm font-medium text-slate-700">
+                    Country
+                  </label>
+                  <select
+                    id="prof-country"
+                    value={countryId}
+                    onChange={(e) => {
+                      const nextCid = e.target.value;
+                      setCountryId(nextCid);
+                      const matchingBranch = branches.find(
+                        (b) => b.is_active === 'Y' && String(b.country_id) === nextCid,
+                      );
+                      if (matchingBranch) setHomeBranchId(String(matchingBranch.branch_id));
+                    }}
+                    className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none"
+                  >
+                    {countries
+                      .filter((c) => c.is_active === 'Y')
+                      .map((c) => (
+                        <option key={c.country_id} value={String(c.country_id)}>
+                          {c.country_name} ({c.currency_code})
+                        </option>
+                      ))}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="prof-branch" className="block text-sm font-medium text-slate-700">
+                    Preferred Home Branch
+                  </label>
+                  <select
+                    id="prof-branch"
+                    value={homeBranchId}
+                    onChange={(e) => setHomeBranchId(e.target.value)}
+                    className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none"
+                  >
+                    {branches
+                      .filter((b) => b.is_active === 'Y' && (!countryId || String(b.country_id) === countryId))
+                      .map((b) => (
+                        <option key={b.branch_id} value={String(b.branch_id)}>
+                          {b.branch_name} ({b.city})
+                        </option>
+                      ))}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="prof-postal" className="block text-sm font-medium text-slate-700">
+                    Postal Code
+                  </label>
+                  <input
+                    id="prof-postal"
+                    type="text"
+                    value={postalCode}
+                    onChange={(e) => setPostalCode(e.target.value)}
+                    placeholder="560038"
+                    className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm focus:border-teal-700 focus:outline-none"
+                  />
+                </div>
+              </div>
+            )}
 
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
               <div>

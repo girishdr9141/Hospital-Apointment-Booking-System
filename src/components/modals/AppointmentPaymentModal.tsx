@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { CreditCard, ShieldCheck, Stethoscope } from 'lucide-react';
 import type { ConsultationMode } from '../../types/opd';
 import { formatCurrencyInr, formatDisplayDate } from '../../utils/rules';
+import { formatBranchCurrency } from '../../utils/globalBranch';
 import { Modal } from '../common/Modal';
 
 export interface PaymentModalAppointmentDetails {
@@ -15,6 +16,11 @@ export interface PaymentModalAppointmentDetails {
   end_time?: string | null;
   consultation_mode?: ConsultationMode | string | null;
   consultation_fee: number;
+  branch_id?: number | null;
+  branch_name?: string | null;
+  country_name?: string | null;
+  local_currency?: string | null;
+  local_amount?: number | null;
 }
 
 interface AppointmentPaymentModalProps {
@@ -52,6 +58,12 @@ export function AppointmentPaymentModal({
   if (!appointment) return null;
 
   const feeAmount = Math.max(0, Number(appointment.consultation_fee || 0));
+  const localCurrency = (appointment.local_currency || 'INR').toUpperCase();
+  const hasForeignLocalAmount =
+    localCurrency !== 'INR' && appointment.local_amount != null && Number(appointment.local_amount) > 0;
+  const formattedPrimaryFee = hasForeignLocalAmount
+    ? formatBranchCurrency(appointment.local_amount, localCurrency)
+    : formatCurrencyInr(feeAmount);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -76,6 +88,8 @@ export function AppointmentPaymentModal({
               </p>
               <p className="mt-0.5 text-xs text-teal-800">
                 {appointment.department_name || 'OPD'}
+                {appointment.branch_name ? ` · ${appointment.branch_name}` : ''}
+                {appointment.country_name ? ` (${appointment.country_name})` : ''}
                 {appointment.patient_name ? ` · Patient: ${appointment.patient_name}` : ''}
               </p>
             </div>
@@ -84,8 +98,13 @@ export function AppointmentPaymentModal({
                 Doctor Fee
               </p>
               <p className="font-mono text-lg font-bold text-teal-950 tabular-nums">
-                {formatCurrencyInr(feeAmount)}
+                {formattedPrimaryFee}
               </p>
+              {hasForeignLocalAmount && (
+                <p className="font-mono text-[11px] text-teal-800 tabular-nums">
+                  Base {formatCurrencyInr(feeAmount)}
+                </p>
+              )}
             </div>
           </div>
 
@@ -187,7 +206,7 @@ export function AppointmentPaymentModal({
           >
             <CreditCard className="h-3.5 w-3.5" aria-hidden="true" />
             <span>
-              {busy ? 'Processing Payment...' : `Pay ${formatCurrencyInr(feeAmount)} & Finish Booking`}
+              {busy ? 'Processing Payment...' : `Pay ${formattedPrimaryFee} & Finish Booking`}
             </span>
           </button>
         </div>

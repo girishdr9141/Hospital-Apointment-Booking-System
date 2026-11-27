@@ -1,11 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CalendarPlus, Check, Clock, Download, RefreshCw, XCircle } from 'lucide-react';
-import type { Appointment, CancellationRule, Department, Doctor, Patient, Slot } from '../../types/opd';
+import type {
+  Appointment,
+  CancellationRule,
+  Department,
+  Doctor,
+  GlobalBranchMetadata,
+  Patient,
+  Slot,
+} from '../../types/opd';
 import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient';
 import { useAuth } from '../../context/AuthContext';
+import { useBranchContext } from '../../context/BranchContext';
 import { useToast } from '../../context/ToastContext';
 import { hasModulePermission } from '../../utils/permissions';
 import { buildCsvString, downloadCsvFile } from '../../utils/csv';
+import {
+  formatBranchCurrency,
+  getDoctorEffectiveBranchFee,
+} from '../../utils/globalBranch';
 import {
   enrichAppointments,
   enrichSlots,
@@ -37,12 +50,28 @@ interface AppointmentsPageProps {
   onDataChanged?: () => Promise<void> | void;
 }
 
+type AppointmentWithBranch = Appointment & {
+  branch_meta?: GlobalBranchMetadata | null;
+  local_currency?: string | null;
+  local_amount?: number | null;
+};
+type SlotWithBranch = Slot & { branch_meta?: GlobalBranchMetadata | null };
+
 export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }: AppointmentsPageProps) {
   const { user } = useAuth();
   const { notify } = useToast();
+  const {
+    countries,
+    branches,
+    branchDepartments,
+    doctorBranches,
+    headquartersBranch,
+    selectedBranchId,
+    activeBranch,
+  } = useBranchContext();
 
-  const [appointments, setAppointments] = useState<Appointment[]>([]);
-  const [slots, setSlots] = useState<Slot[]>([]);
+  const [appointments, setAppointments] = useState<AppointmentWithBranch[]>([]);
+  const [slots, setSlots] = useState<SlotWithBranch[]>([]);
   const [doctors, setDoctors] = useState<Doctor[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
   const [patients, setPatients] = useState<Patient[]>([]);
@@ -88,8 +117,8 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
     setLoading(true);
     try {
       const [rawAppts, rawSlots, templates, docs, activeDepts, pats, rules] = await Promise.all([
-        apiClient.getAppointments(),
-        apiClient.getSlots(),
+        apiClient.getGlobalAppointments().catch(() => apiClient.getAppointments()),
+        apiClient.getGlobalSlots().catch(() => apiClient.getSlots()),
         apiClient.getSlotTemplates(),
         apiClient.getDoctors(),
         apiClient.getDepartments(),
@@ -103,13 +132,44 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
         activeDepts,
       );
 
-      const joinedSlots = enrichSlots(rawSlots, templates, docs, allDepts);
-      const joinedAppts = enrichAppointments(rawAppts, joinedSlots, docs);
+      const rawApptMetaById = new Map(
+        (rawAppts as AppointmentWithBranch[]).map((a) => [
+          a.appointment_id,
+          {
+            branch_meta: a.branch_meta ?? null,
+            local_currency: a.local_currency ?? null,
+            local_amount: a.local_amount ?? null,
+          },
+        ]),
+      );
+      const rawSlotBranchById = new Map(
+        (rawSlots as SlotWithBranch[]).map((s) => [s.slot_id, s.branch_meta ?? null]),
+      );
+
+      const joinedSlots: SlotWithBranch[] = enrichSlots(rawSlots, templates, docs, allDepts).map(
+        (s) => ({
+          ...s,
+          branch_meta: rawSlotBranchById.get(s.slot_id) ?? null,
+        }),
+      );
+      const joinedAppts: AppointmentWithBranch[] = enrichAppointments(
+        rawAppts,
+        joinedSlots,
+        docs,
+      ).map((a) => {
+        const meta = rawApptMetaById.get(a.appointment_id);
+        return {
+          ...a,
+          branch_meta: meta?.branch_meta ?? null,
+          local_currency: meta?.local_currency ?? null,
+          local_amount: meta?.local_amount ?? null,
+        };
+      });
 
       setAppointments(joinedAppts);
       setSlots(joinedSlots);
       setDoctors(docs);
-      setDepartments(activeDepts);
+      setDepartments(allDepts);
       setPatients(pats);
       setCancellationRules(rules);
     } catch (err) {
@@ -143,9 +203,20 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
     void loadData();
   }, [appointments, nowMs, loadData]);
 
-  const handleOpenConfirmPaymentModal = (appt: Appointment) => {
+  const handleOpenConfirmPaymentModal = (appt: AppointmentWithBranch) => {
     const doc = doctors.find((d) => d.doctor_id === appt.doctor_id);
-    const fee = Number(appt.consultation_fee ?? doc?.consultation_fee ?? 0);
+    const branchObj =
+      (appt.branch_meta
+        ? branches.find((b) => b.branch_id === appt.branch_meta?.branch_id)
+        : undefined) || headquartersBranch;
+    const feeInfo = getDoctorEffectiveBranchFee({
+      doctor: doc,
+      branch: branchObj,
+      countries,
+      doctorBranches,
+      branchDepartments,
+    });
+    const fee = Number(appt.consultation_fee ?? feeInfo.base_inr_amount ?? 0);
     setPaymentTarget({
       appointment_id: appt.appointment_id,
       appointment_ref: appt.appointment_ref,
@@ -159,6 +230,11 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
       end_time: appt.end_time,
       consultation_mode: appt.consultation_mode,
       consultation_fee: fee,
+      branch_id: branchObj?.branch_id ?? appt.branch_meta?.branch_id ?? null,
+      branch_name: branchObj?.branch_name ?? appt.branch_meta?.branch_name ?? null,
+      country_name: branchObj?.country_name ?? appt.branch_meta?.country_name ?? null,
+      local_currency: appt.local_currency ?? feeInfo.currency_code,
+      local_amount: appt.local_amount ?? feeInfo.local_amount,
     });
   };
 
@@ -168,11 +244,22 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
     if (!paymentTarget) return;
     setPaymentBusy(true);
     try {
-      const res = await apiClient.payAndConfirmAppointment(paymentTarget.appointment_id, {
-        payment_method: paymentMethod,
-      });
+      const res = paymentTarget.branch_id
+        ? await apiClient.payAndConfirmGlobalAppointment(paymentTarget.appointment_id, {
+            payment_method: paymentMethod,
+            branch_id: paymentTarget.branch_id,
+          })
+        : await apiClient.payAndConfirmAppointment(paymentTarget.appointment_id, {
+            payment_method: paymentMethod,
+          });
+      const paidDisplay =
+        paymentTarget.local_currency &&
+        paymentTarget.local_currency !== 'INR' &&
+        paymentTarget.local_amount != null
+          ? formatBranchCurrency(paymentTarget.local_amount, paymentTarget.local_currency)
+          : formatCurrencyInr(paymentTarget.consultation_fee);
       notify(
-        `Paid ${formatCurrencyInr(paymentTarget.consultation_fee)} (${res.payment_ref || paymentMethod}) · Appointment ${paymentTarget.appointment_ref} confirmed!`,
+        `Paid ${paidDisplay} (${res.payment_ref || paymentMethod}) · Appointment ${paymentTarget.appointment_ref} confirmed!`,
         'success',
       );
       setPaymentTarget(null);
@@ -245,9 +332,14 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
 
   const filteredAppointments = useMemo(() => {
     const q = search.trim().toLowerCase();
+    const hqId = headquartersBranch?.branch_id ?? 1;
     return appointments.filter((a) => {
       if (mode === 'history' && !['COMPLETED', 'CANCELLED', 'NO_SHOW'].includes(a.status)) {
         return false;
+      }
+      if (selectedBranchId !== 'ALL') {
+        const apptBranchId = a.branch_meta?.branch_id ?? hqId;
+        if (apptBranchId !== selectedBranchId) return false;
       }
       if (statusFilter !== 'ALL' && a.status !== statusFilter) return false;
       if (modeFilter !== 'ALL' && (a.consultation_mode || 'FACE_TO_FACE') !== modeFilter) {
@@ -259,10 +351,21 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
       return (
         a.appointment_ref.toLowerCase().includes(q) ||
         a.patient_name.toLowerCase().includes(q) ||
-        (a.doctor_name || '').toLowerCase().includes(q)
+        (a.doctor_name || '').toLowerCase().includes(q) ||
+        (a.branch_meta?.branch_name || '').toLowerCase().includes(q)
       );
     });
-  }, [appointments, mode, statusFilter, modeFilter, doctorFilter, dateFilter, search]);
+  }, [
+    appointments,
+    mode,
+    selectedBranchId,
+    headquartersBranch?.branch_id,
+    statusFilter,
+    modeFilter,
+    doctorFilter,
+    dateFilter,
+    search,
+  ]);
 
   const canBook = hasModulePermission(user, 'APPOINTMENTS', 'CREATE') && user?.role !== 'DOCTOR';
   const canConfirm =
@@ -285,7 +388,7 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
     [appointments, user?.role, user?.doctor_id],
   );
 
-  const columns: DataColumn<Appointment>[] = [
+  const columns: DataColumn<AppointmentWithBranch>[] = [
     {
       key: 'ref',
       header: 'Reference',
@@ -310,13 +413,20 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
     },
     {
       key: 'doctor',
-      header: 'Doctor & Department',
+      header: 'Doctor & Branch',
       render: (row) => (
         <div>
           <p className="text-slate-900">{row.doctor_name || `Slot #${row.slot_id}`}</p>
           <p className="text-xs text-slate-500">
             {row.department_name || 'OPD'}
-            {row.consultation_fee ? ` · ${formatCurrencyInr(row.consultation_fee)}` : ''}
+            {row.branch_meta
+              ? ` · ${row.branch_meta.branch_name} (${row.branch_meta.country_code})`
+              : ''}
+            {row.local_amount != null && row.local_currency && row.local_currency !== 'INR'
+              ? ` · ${formatBranchCurrency(row.local_amount, row.local_currency)}`
+              : row.consultation_fee
+                ? ` · ${formatCurrencyInr(row.consultation_fee)}`
+                : ''}
           </p>
         </div>
       ),
@@ -477,7 +587,9 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
                   : 'Appointments Management'}
           </h2>
           <p className="mt-0.5 text-sm text-slate-600">
-            Powered by Oracle PL/SQL booking, hold expiry, confirmation, cancellation, and outcome procedures.
+            {activeBranch
+              ? `${activeBranch.branch_name} (${activeBranch.city}, ${activeBranch.country_code}) · Powered by Oracle PL/SQL and GBR_ sidecar views.`
+              : 'Powered by Oracle PL/SQL booking, hold expiry, confirmation, cancellation, and outcome procedures.'}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 shrink-0">
@@ -491,6 +603,8 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
                     'Patient',
                     'Doctor',
                     'Department',
+                    'Branch',
+                    'Country',
                     'Date',
                     'Start Time',
                     'Consultation Mode',
@@ -501,6 +615,8 @@ export function AppointmentsPage({ mode = 'list', onModeHandled, onDataChanged }
                     a.patient_name,
                     a.doctor_name || `Slot #${a.slot_id}`,
                     a.department_name || 'OPD',
+                    a.branch_meta?.branch_name || 'Headquarters',
+                    a.branch_meta?.country_code || 'IN',
                     a.slot_date || a.created_on,
                     a.start_time || '',
                     a.consultation_mode || 'FACE_TO_FACE',

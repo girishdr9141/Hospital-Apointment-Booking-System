@@ -10,22 +10,31 @@ import {
   UserCheck,
   Video,
 } from 'lucide-react';
-import type { ConsultationMode, Department, Doctor, Patient, Slot } from '../../types/opd';
+import type { ConsultationMode, Department, Doctor, GlobalBranchMetadata, Patient, Slot } from '../../types/opd';
 import { apiClient } from '../../services/apiClient';
+import { useBranchContext } from '../../context/BranchContext';
 import { useToast } from '../../context/ToastContext';
 import {
   getHospitalNowParts,
   getMonthGridDates,
   isSlotEndExpired,
 } from '../../utils/calendar';
+import {
+  filterDepartmentsByBranch,
+  filterDoctorsByBranch,
+  formatBranchCurrency,
+  getDoctorEffectiveBranchFee,
+} from '../../utils/globalBranch';
 import { formatCurrencyInr, formatDisplayDate, getIsoDatePart } from '../../utils/rules';
 import {
   AppointmentPaymentModal,
   type PaymentModalAppointmentDetails,
 } from '../modals/AppointmentPaymentModal';
 
+type SlotWithBranch = Slot & { branch_meta?: GlobalBranchMetadata | null };
+
 interface PatientBookingCalendarProps {
-  slots: Slot[];
+  slots: SlotWithBranch[];
   doctors: Doctor[];
   departments: Department[];
   patients?: Patient[];
@@ -65,6 +74,16 @@ export function PatientBookingCalendar({
   onCancel,
 }: PatientBookingCalendarProps) {
   const { notify } = useToast();
+  const {
+    countries,
+    branches,
+    branchDepartments,
+    doctorBranches,
+    headquartersBranch,
+    selectedCountryCode: workspaceCountryCode,
+    selectedBranchId: workspaceBranchId,
+  } = useBranchContext();
+
   const initialNow = getHospitalNowParts();
   const todayIso = initialNow.isoDate;
 
@@ -72,9 +91,12 @@ export function PatientBookingCalendar({
   const [viewMonth, setViewMonth] = useState(initialNow.monthIndex);
   const [selectedDate, setSelectedDate] = useState(todayIso);
 
+  const [bookCountryCode, setBookCountryCode] = useState<string>(workspaceCountryCode || 'ALL');
+  const [bookBranchId, setBookBranchId] = useState<number | 'ALL'>(workspaceBranchId);
+
   const [selectedDeptId, setSelectedDeptId] = useState('ALL');
   const [selectedDoctorId, setSelectedDoctorId] = useState('ALL');
-  const [selectedSlot, setSelectedSlot] = useState<Slot | null>(null);
+  const [selectedSlot, setSelectedSlot] = useState<SlotWithBranch | null>(null);
   const [consultationMode, setConsultationMode] = useState<ConsultationMode | ''>('');
   const [bookingError, setBookingError] = useState<string | null>(null);
   const [selectedPatientId, setSelectedPatientId] = useState(
@@ -88,33 +110,85 @@ export function PatientBookingCalendar({
   const [paymentBusy, setPaymentBusy] = useState(false);
 
   useEffect(() => {
+    setBookCountryCode(workspaceCountryCode || 'ALL');
+    setBookBranchId(workspaceBranchId);
+    setSelectedDeptId('ALL');
+    setSelectedDoctorId('ALL');
+    setSelectedSlot(null);
+  }, [workspaceCountryCode, workspaceBranchId]);
+
+  useEffect(() => {
     if (patients[0] && !selectedPatientId) {
       setSelectedPatientId(String(patients[0].patient_id));
     }
   }, [patients, selectedPatientId]);
 
-  const filteredDoctors = useMemo(() => {
-    if (selectedDeptId === 'ALL') return doctors;
-    return doctors.filter((d) => String(d.department_id) === selectedDeptId);
-  }, [doctors, selectedDeptId]);
+  const activeCountries = useMemo(
+    () => countries.filter((c) => c.is_active === 'Y'),
+    [countries],
+  );
+
+  const branchesForSelectedCountry = useMemo(
+    () =>
+      branches.filter(
+        (b) => b.is_active === 'Y' && (bookCountryCode === 'ALL' || b.country_code === bookCountryCode),
+      ),
+    [branches, bookCountryCode],
+  );
+
+  const selectedBranchObj = useMemo(
+    () => (bookBranchId === 'ALL' ? null : branches.find((b) => b.branch_id === bookBranchId) || null),
+    [branches, bookBranchId],
+  );
+
+  const branchFilteredDepartments = useMemo(() => {
+    if (branches.length === 0) return departments;
+    return filterDepartmentsByBranch(departments, branchDepartments, bookBranchId, branches);
+  }, [departments, branchDepartments, bookBranchId, branches]);
+
+  const branchFilteredDoctors = useMemo(() => {
+    const baseDocs =
+      branches.length === 0
+        ? doctors
+        : filterDoctorsByBranch(doctors, doctorBranches, bookBranchId, branches);
+    if (selectedDeptId === 'ALL') return baseDocs;
+    return baseDocs.filter((d) => String(d.department_id) === selectedDeptId);
+  }, [doctors, doctorBranches, bookBranchId, branches, selectedDeptId]);
 
   const doctorById = useMemo(
     () => new Map(doctors.map((d) => [d.doctor_id, d])),
     [doctors],
   );
 
+  const getSlotBranch = (slot: SlotWithBranch) => {
+    const id = slot.branch_meta?.branch_id ?? headquartersBranch?.branch_id;
+    return branches.find((b) => b.branch_id === id) || headquartersBranch;
+  };
+
   const matchingAvailableSlots = useMemo(() => {
-    const allowedDocIds = new Set(filteredDoctors.map((d) => d.doctor_id));
+    const allowedDocIds = new Set(branchFilteredDoctors.map((d) => d.doctor_id));
+    const countryBranchIds = new Set(branchesForSelectedCountry.map((b) => b.branch_id));
+
     return slots
       .filter((s) => {
         if (s.status !== 'AVAILABLE' || s.booked_patients >= s.max_patients_per_slot) return false;
         const dStr = getIsoDatePart(s.slot_date);
         if (!dStr) return false;
         if (isSlotEndExpired(dStr, s.start_time, s.end_time)) return false;
+
+        if (branches.length > 0) {
+          const slotBranchId = s.branch_meta?.branch_id ?? headquartersBranch?.branch_id;
+          if (bookBranchId !== 'ALL') {
+            if (slotBranchId !== bookBranchId) return false;
+          } else if (bookCountryCode !== 'ALL') {
+            if (!slotBranchId || !countryBranchIds.has(slotBranchId)) return false;
+          }
+        }
+
         if (selectedDoctorId !== 'ALL') {
           return String(s.doctor_id || '') === selectedDoctorId;
         }
-        if (selectedDeptId !== 'ALL') {
+        if (selectedDeptId !== 'ALL' || bookBranchId !== 'ALL') {
           return Boolean(s.doctor_id && allowedDocIds.has(s.doctor_id));
         }
         return true;
@@ -124,7 +198,17 @@ export function PatientBookingCalendar({
         if (dCmp !== 0) return dCmp;
         return (a.start_time || '').localeCompare(b.start_time || '');
       });
-  }, [slots, filteredDoctors, selectedDoctorId, selectedDeptId]);
+  }, [
+    slots,
+    branchFilteredDoctors,
+    branchesForSelectedCountry,
+    branches.length,
+    headquartersBranch?.branch_id,
+    bookBranchId,
+    bookCountryCode,
+    selectedDoctorId,
+    selectedDeptId,
+  ]);
 
   const availableCountByDate = useMemo(() => {
     const map = new Map<string, number>();
@@ -135,7 +219,6 @@ export function PatientBookingCalendar({
     return map;
   }, [matchingAvailableSlots]);
 
-  // Keep selected date aligned with earliest available date when current selectedDate has 0 open slots
   useEffect(() => {
     if (availableCountByDate.size === 0) return;
     if ((availableCountByDate.get(selectedDate) || 0) > 0) return;
@@ -195,18 +278,33 @@ export function PatientBookingCalendar({
       return;
     }
 
+    const targetBranch = getSlotBranch(selectedSlot);
+    const doc = selectedSlot.doctor_id ? doctorById.get(selectedSlot.doctor_id) : undefined;
+    const patientObj = patients.find((p) => p.patient_id === patientIdToUse);
+    const feeInfo = getDoctorEffectiveBranchFee({
+      doctor: doc,
+      branch: targetBranch,
+      countries,
+      doctorBranches,
+      branchDepartments,
+    });
+
     setBookingBusy(true);
     try {
-      const res = await apiClient.bookAppointment({
-        patient_id: patientIdToUse,
-        slot_id: selectedSlot.slot_id,
-        booking_source: isPatientRole ? 'ONLINE' : bookingSource,
-        consultation_mode: consultationMode,
-      });
-
-      const doc = selectedSlot.doctor_id ? doctorById.get(selectedSlot.doctor_id) : undefined;
-      const patientObj = patients.find((p) => p.patient_id === patientIdToUse);
-      const fee = Number(doc?.consultation_fee ?? 0);
+      const res = targetBranch
+        ? await apiClient.bookGlobalAppointment({
+            patient_id: patientIdToUse,
+            slot_id: selectedSlot.slot_id,
+            branch_id: targetBranch.branch_id,
+            booking_source: isPatientRole ? 'ONLINE' : bookingSource,
+            consultation_mode: consultationMode,
+          })
+        : await apiClient.bookAppointment({
+            patient_id: patientIdToUse,
+            slot_id: selectedSlot.slot_id,
+            booking_source: isPatientRole ? 'ONLINE' : bookingSource,
+            consultation_mode: consultationMode,
+          });
 
       if (res.appointment_id && res.appointment_id > 0) {
         setPendingPayment({
@@ -221,7 +319,12 @@ export function PatientBookingCalendar({
           start_time: selectedSlot.start_time,
           end_time: selectedSlot.end_time,
           consultation_mode: consultationMode,
-          consultation_fee: fee,
+          consultation_fee: feeInfo.base_inr_amount,
+          branch_id: targetBranch?.branch_id ?? null,
+          branch_name: targetBranch?.branch_name ?? null,
+          country_name: targetBranch?.country_name ?? null,
+          local_currency: feeInfo.currency_code,
+          local_amount: feeInfo.local_amount,
         });
         setSelectedSlot(null);
         setConsultationMode('');
@@ -229,7 +332,7 @@ export function PatientBookingCalendar({
         await onRefreshSlots?.();
       } else {
         notify(
-          `Appointment booked successfully (${res.appointment_ref || 'Ref generated'}) · ${consultationMode === 'ONLINE' ? 'Online Consultation' : 'Face-to-Face'}`,
+          `Appointment booked successfully (${res.appointment_ref || 'Ref generated'})${targetBranch ? ` · ${targetBranch.branch_name}` : ''}`,
           'success',
         );
         setSelectedSlot(null);
@@ -252,11 +355,22 @@ export function PatientBookingCalendar({
     if (!pendingPayment) return;
     setPaymentBusy(true);
     try {
-      const res = await apiClient.payAndConfirmAppointment(pendingPayment.appointment_id, {
-        payment_method: paymentMethod,
-      });
+      const res = pendingPayment.branch_id
+        ? await apiClient.payAndConfirmGlobalAppointment(pendingPayment.appointment_id, {
+            payment_method: paymentMethod,
+            branch_id: pendingPayment.branch_id,
+          })
+        : await apiClient.payAndConfirmAppointment(pendingPayment.appointment_id, {
+            payment_method: paymentMethod,
+          });
+      const paidDisplay =
+        pendingPayment.local_currency &&
+        pendingPayment.local_currency !== 'INR' &&
+        pendingPayment.local_amount != null
+          ? formatBranchCurrency(pendingPayment.local_amount, pendingPayment.local_currency)
+          : formatCurrencyInr(pendingPayment.consultation_fee);
       notify(
-        `Payment ${formatCurrencyInr(pendingPayment.consultation_fee)} (${res.payment_ref || paymentMethod}) succeeded — slot ${pendingPayment.appointment_ref} is now booked & confirmed!`,
+        `Payment ${paidDisplay} (${res.payment_ref || paymentMethod}) succeeded — slot ${pendingPayment.appointment_ref} is now booked & confirmed!`,
         'success',
       );
       setPendingPayment(null);
@@ -282,6 +396,75 @@ export function PatientBookingCalendar({
     <div className="space-y-4">
       {/* Filter Bar */}
       <div className="grid grid-cols-1 gap-3 rounded-xl border border-slate-200 bg-white p-4 sm:grid-cols-2 lg:grid-cols-4">
+        {branches.length > 0 && (
+          <>
+            <div>
+              <label htmlFor="cal-book-country" className="block text-xs font-medium text-slate-600">
+                Country
+              </label>
+              <select
+                id="cal-book-country"
+                value={bookCountryCode}
+                onChange={(e) => {
+                  const nextCode = e.target.value;
+                  setBookCountryCode(nextCode);
+                  if (nextCode === 'ALL') {
+                    setBookBranchId('ALL');
+                  } else {
+                    const match = branches.find((b) => b.country_code === nextCode && b.is_active === 'Y');
+                    setBookBranchId(match ? match.branch_id : 'ALL');
+                  }
+                  setSelectedDeptId('ALL');
+                  setSelectedDoctorId('ALL');
+                  setSelectedSlot(null);
+                }}
+                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none"
+              >
+                <option value="ALL">All Countries ({activeCountries.length})</option>
+                {activeCountries.map((c) => (
+                  <option key={c.country_code} value={c.country_code}>
+                    {c.country_name} ({c.currency_code})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label htmlFor="cal-book-branch" className="block text-xs font-medium text-slate-600">
+                Hospital Branch
+              </label>
+              <select
+                id="cal-book-branch"
+                value={String(bookBranchId)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (val === 'ALL') {
+                    setBookBranchId('ALL');
+                  } else {
+                    const nextId = Number(val);
+                    setBookBranchId(nextId);
+                    const b = branches.find((item) => item.branch_id === nextId);
+                    if (b && bookCountryCode !== 'ALL' && b.country_code !== bookCountryCode) {
+                      setBookCountryCode(b.country_code);
+                    }
+                  }
+                  setSelectedDeptId('ALL');
+                  setSelectedDoctorId('ALL');
+                  setSelectedSlot(null);
+                }}
+                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none"
+              >
+                <option value="ALL">All Branches ({branchesForSelectedCountry.length})</option>
+                {branchesForSelectedCountry.map((b) => (
+                  <option key={b.branch_id} value={String(b.branch_id)}>
+                    {b.branch_name} ({b.city})
+                  </option>
+                ))}
+              </select>
+            </div>
+          </>
+        )}
+
         {!isPatientRole && (
           <>
             <div>
@@ -320,7 +503,7 @@ export function PatientBookingCalendar({
 
         <div>
           <label htmlFor="cal-book-dept" className="block text-xs font-medium text-slate-600">
-            Department
+            Department {selectedBranchObj ? `(${selectedBranchObj.city})` : ''}
           </label>
           <select
             id="cal-book-dept"
@@ -332,10 +515,11 @@ export function PatientBookingCalendar({
             }}
             className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none"
           >
-            <option value="ALL">All Departments</option>
-            {departments.map((d) => (
+            <option value="ALL">All Available Departments</option>
+            {branchFilteredDepartments.map((d) => (
               <option key={d.department_id} value={String(d.department_id)}>
                 {d.department_name}
+                {'is_specialized' in d && d.is_specialized ? ' (Specialized)' : ''}
               </option>
             ))}
           </select>
@@ -355,11 +539,21 @@ export function PatientBookingCalendar({
             className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-teal-700 focus:outline-none"
           >
             <option value="ALL">All Available Doctors</option>
-            {filteredDoctors.map((d) => (
-              <option key={d.doctor_id} value={String(d.doctor_id)}>
-                Dr. {d.first_name} {d.last_name} ({formatCurrencyInr(d.consultation_fee)})
-              </option>
-            ))}
+            {branchFilteredDoctors.map((d) => {
+              const feeInfo = getDoctorEffectiveBranchFee({
+                doctor: d,
+                branch: selectedBranchObj,
+                countries,
+                doctorBranches,
+                branchDepartments,
+              });
+              return (
+                <option key={d.doctor_id} value={String(d.doctor_id)}>
+                  Dr. {d.first_name} {d.last_name} (
+                  {formatBranchCurrency(feeInfo.local_amount, feeInfo.currency_code)})
+                </option>
+              );
+            })}
           </select>
         </div>
       </div>
@@ -478,7 +672,9 @@ export function PatientBookingCalendar({
                   Available Slots · {formatDisplayDate(selectedDate)}
                 </h3>
                 <p className="mt-0.5 text-xs text-slate-500">
-                  Select a confirmed doctor time slot below to book your appointment.
+                  {selectedBranchObj
+                    ? `${selectedBranchObj.branch_name} (${selectedBranchObj.city}, ${selectedBranchObj.country_code}) · ${selectedBranchObj.timezone_iana}`
+                    : 'Select a confirmed doctor time slot below to book your appointment.'}
                 </p>
               </div>
               <span className="rounded-md bg-slate-100 px-2.5 py-1 font-mono text-xs font-medium text-slate-700 tabular-nums">
@@ -490,16 +686,24 @@ export function PatientBookingCalendar({
               <div className="my-8 rounded-xl border border-dashed border-slate-200 bg-slate-50 p-6 text-center">
                 <Stethoscope className="mx-auto h-6 w-6 text-slate-400" aria-hidden="true" />
                 <p className="mt-2 text-sm font-medium text-slate-800">
-                  No open doctor slots on {formatDisplayDate(selectedDate)}
+                  No open doctor slots{selectedBranchObj ? ` at ${selectedBranchObj.branch_name}` : ''} on {formatDisplayDate(selectedDate)}
                 </p>
                 <p className="mt-1 text-xs text-slate-500">
-                  Try another highlighted date on the calendar or switch the Department/Doctor filter.
+                  Try another highlighted date on the calendar or switch the Country, Branch, Department, or Doctor filter.
                 </p>
               </div>
             ) : (
               <div className="mt-4 grid max-h-[340px] grid-cols-1 gap-2.5 overflow-y-auto pr-1 sm:grid-cols-2">
                 {slotsForSelectedDate.map((slot) => {
                   const doc = slot.doctor_id ? doctorById.get(slot.doctor_id) : undefined;
+                  const slotBranch = getSlotBranch(slot);
+                  const feeInfo = getDoctorEffectiveBranchFee({
+                    doctor: doc,
+                    branch: slotBranch,
+                    countries,
+                    doctorBranches,
+                    branchDepartments,
+                  });
                   const isPicked = selectedSlot?.slot_id === slot.slot_id;
                   return (
                     <button
@@ -524,17 +728,24 @@ export function PatientBookingCalendar({
                         </span>
                         {doc && (
                           <span className="font-mono text-xs font-semibold text-teal-800 tabular-nums">
-                            {formatCurrencyInr(doc.consultation_fee)}
+                            {formatBranchCurrency(feeInfo.local_amount, feeInfo.currency_code)}
                           </span>
                         )}
                       </div>
                       <p className="mt-1.5 text-sm font-medium text-slate-900">
                         {slot.doctor_name || (slot.doctor_id ? `Doctor #${slot.doctor_id}` : 'Assigned Doctor')}
                       </p>
-                      <div className="mt-0.5 flex items-center gap-2 text-xs text-slate-500">
+                      <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-slate-500">
                         <span>{slot.department_name || 'Outpatient'}</span>
+                        {slotBranch && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span>{slotBranch.city}</span>
+                          </>
+                        )}
                         {doc?.tele_consult_flag === 'Y' && (
                           <span className="inline-flex items-center gap-1 text-teal-700">
+                            <span aria-hidden="true">·</span>
                             <Video className="h-3 w-3" aria-hidden="true" />
                             <span>Tele-consult</span>
                           </span>
@@ -637,12 +848,14 @@ export function PatientBookingCalendar({
                       {selectedSlot.doctor_name} · {formatDisplayDate(selectedSlot.slot_date)} ({selectedSlot.start_time} – {selectedSlot.end_time})
                     </p>
                     <p className="mt-0.5 text-xs text-teal-800">
+                      {getSlotBranch(selectedSlot)?.branch_name || 'Headquarters'}
+                      {' · '}
                       {isPatientRole
                         ? 'Creates an ONLINE appointment with a 10-minute payment hold.'
-                        : `Booking mode: ${bookingSource === 'WALK_IN' ? 'Walk-in (Immediately Confirmed)' : 'Online (10-min Hold)'}`}
+                        : `Booking mode: ${bookingSource === 'WALK_IN' ? 'Walk-in (Confirmed)' : 'Online (10-min Hold)'}`}
                       {consultationMode
-                        ? ` · ${consultationMode === 'ONLINE' ? 'Online Consultation' : 'Face-to-Face Consultation'}`
-                        : ' · Select consultation mode above'}
+                        ? ` · ${consultationMode === 'ONLINE' ? 'Online' : 'Face-to-Face'}`
+                        : ' · Select mode above'}
                     </p>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">

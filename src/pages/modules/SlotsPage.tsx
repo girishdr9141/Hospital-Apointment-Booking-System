@@ -6,13 +6,16 @@ import type {
   Doctor,
   DoctorLeave,
   DoctorShiftConfig,
+  GlobalBranchMetadata,
   Slot,
   SlotTemplate,
 } from '../../types/opd';
 import { apiClient } from '../../services/apiClient';
 import { useAuth } from '../../context/AuthContext';
+import { useBranchContext } from '../../context/BranchContext';
 import { useToast } from '../../context/ToastContext';
 import { hasModulePermission } from '../../utils/permissions';
+import { filterDoctorsByBranch } from '../../utils/globalBranch';
 import { enrichAppointments, enrichSlots, formatDisplayDate, getIsoDatePart } from '../../utils/rules';
 import {
   formatShiftSummary,
@@ -23,6 +26,8 @@ import { StatusIndicator } from '../../components/layout/StatusIndicator';
 import { DoctorSlotCalendar } from '../../components/calendar/DoctorSlotCalendar';
 import { DoctorShiftModal } from '../../components/modals/DoctorShiftModal';
 
+type SlotWithBranch = Slot & { branch_meta?: GlobalBranchMetadata | null };
+
 interface SlotsPageProps {
   onDoctorSlotsChanged?: () => Promise<void> | void;
 }
@@ -30,10 +35,11 @@ interface SlotsPageProps {
 export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
   const { user } = useAuth();
   const { notify } = useToast();
+  const { branches, doctorBranches, selectedBranchId, headquartersBranch } = useBranchContext();
   const isDoctor = user?.role === 'DOCTOR';
   const canManageDoctorSlots = isDoctor && hasModulePermission(user, 'SLOTS', 'CREATE');
 
-  const [slots, setSlots] = useState<Slot[]>([]);
+  const [slots, setSlots] = useState<SlotWithBranch[]>([]);
   const [templates, setTemplates] = useState<SlotTemplate[]>([]);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [leaves, setLeaves] = useState<DoctorLeave[]>([]);
@@ -53,9 +59,9 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
     try {
       const [rawSlots, rawTemplates, rawAppts, docs, activeDepts, rawLeaves, shiftsRes] =
         await Promise.all([
-          apiClient.getSlots(),
+          apiClient.getGlobalSlots().catch(() => apiClient.getSlots()),
           apiClient.getSlotTemplates(),
-          apiClient.getAppointments().catch(() => [] as Appointment[]),
+          apiClient.getGlobalAppointments().catch(() => apiClient.getAppointments().catch(() => [] as Appointment[])),
           apiClient.getDoctors(),
           apiClient.getDepartments(),
           apiClient.getLeaves().catch(() => [] as DoctorLeave[]),
@@ -66,7 +72,15 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
         activeDepts,
       );
 
-      const joinedSlots = enrichSlots(rawSlots, rawTemplates, docs, depts);
+      const rawSlotBranchMap = new Map(
+        (rawSlots as SlotWithBranch[]).map((s) => [s.slot_id, s.branch_meta ?? null]),
+      );
+      const joinedSlots: SlotWithBranch[] = enrichSlots(rawSlots, rawTemplates, docs, depts).map(
+        (s) => ({
+          ...s,
+          branch_meta: rawSlotBranchMap.get(s.slot_id) ?? null,
+        }),
+      );
       const joinedAppts = enrichAppointments(rawAppts, joinedSlots, docs);
 
       if (isDoctor && user?.doctor_id) {
@@ -145,9 +159,13 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
   }, [slots]);
 
   const filteredDoctorCards = useMemo(() => {
+    const branchDocs =
+      branches.length > 0 && selectedBranchId !== 'ALL'
+        ? filterDoctorsByBranch(doctors, doctorBranches, selectedBranchId, branches)
+        : doctors;
     const q = docPickerSearch.trim().toLowerCase();
-    if (!q) return doctors;
-    return doctors.filter((d) => {
+    if (!q) return branchDocs;
+    return branchDocs.filter((d) => {
       const full = `Dr. ${d.first_name} ${d.last_name}`.toLowerCase();
       const dept = (deptNameById.get(d.department_id) || '').toLowerCase();
       return (
@@ -156,37 +174,41 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
         (d.specialization || '').toLowerCase().includes(q)
       );
     });
-  }, [doctors, docPickerSearch, deptNameById]);
+  }, [doctors, branches, doctorBranches, selectedBranchId, docPickerSearch, deptNameById]);
 
   const activeCalendarDoctor = useMemo(
-    () => doctors.find((d) => d.doctor_id === calendarDoctorId) || doctors[0] || null,
-    [doctors, calendarDoctorId],
+    () =>
+      filteredDoctorCards.find((d) => d.doctor_id === calendarDoctorId) ||
+      filteredDoctorCards[0] ||
+      doctors.find((d) => d.doctor_id === calendarDoctorId) ||
+      doctors[0] ||
+      null,
+    [filteredDoctorCards, doctors, calendarDoctorId],
   );
 
   const activeDoctorShift = activeCalendarDoctor
     ? shiftByDoctorId.get(activeCalendarDoctor.doctor_id) || null
     : null;
 
-  const calendarSlots = useMemo(
-    () =>
-      slots
-        .filter((s) => {
-          if (s.doctor_id !== activeCalendarDoctor?.doctor_id || s.status === 'CANCELLED') {
-            return false;
-          }
-          const isBooked = s.booked_patients > 0 || s.status === 'SOLD_OUT';
-          if (isBooked) {
-            return !isSlotEndExpired(s.slot_date, s.start_time, s.end_time);
-          }
-          return !isSlotEndExpired(s.slot_date, s.start_time, s.end_time);
-        })
-        .sort((a, b) => {
-          const dCmp = getIsoDatePart(a.slot_date).localeCompare(getIsoDatePart(b.slot_date));
-          if (dCmp !== 0) return dCmp;
-          return (a.start_time || '').localeCompare(b.start_time || '');
-        }),
-    [slots, activeCalendarDoctor],
-  );
+  const calendarSlots = useMemo(() => {
+    const hqId = headquartersBranch?.branch_id ?? 1;
+    return slots
+      .filter((s) => {
+        if (s.doctor_id !== activeCalendarDoctor?.doctor_id || s.status === 'CANCELLED') {
+          return false;
+        }
+        if (selectedBranchId !== 'ALL') {
+          const slotBranchId = s.branch_meta?.branch_id ?? hqId;
+          if (slotBranchId !== selectedBranchId) return false;
+        }
+        return !isSlotEndExpired(s.slot_date, s.start_time, s.end_time);
+      })
+      .sort((a, b) => {
+        const dCmp = getIsoDatePart(a.slot_date).localeCompare(getIsoDatePart(b.slot_date));
+        if (dCmp !== 0) return dCmp;
+        return (a.start_time || '').localeCompare(b.start_time || '');
+      });
+  }, [slots, activeCalendarDoctor, selectedBranchId, headquartersBranch?.branch_id]);
 
   const activeDoctorOpenSlots = useMemo(
     () =>
@@ -449,6 +471,7 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
                     <tr>
                       <th className="px-4 py-2.5">Date</th>
                       <th className="px-4 py-2.5">Time Window</th>
+                      <th className="px-4 py-2.5">Branch</th>
                       <th className="px-4 py-2.5">Booking Details</th>
                       <th className="px-4 py-2.5 text-right">Booked</th>
                       <th className="px-4 py-2.5">Status</th>
@@ -467,6 +490,13 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
                           </td>
                           <td className="px-4 py-2.5 font-mono text-xs font-medium text-slate-900 tabular-nums whitespace-nowrap">
                             {slot.start_time} – {slot.end_time}
+                          </td>
+                          <td className="px-4 py-2.5 text-xs text-slate-700 whitespace-nowrap">
+                            {slot.branch_meta
+                              ? `${slot.branch_meta.city} (${slot.branch_meta.branch_code})`
+                              : headquartersBranch
+                                ? `${headquartersBranch.city} (${headquartersBranch.branch_code})`
+                                : 'Headquarters'}
                           </td>
                           <td className="px-4 py-2.5 text-xs text-slate-600">
                             {appt
@@ -500,6 +530,11 @@ export function SlotsPage({ onDoctorSlotsChanged }: SlotsPageProps) {
             readOnly={!canManageDoctorSlots}
             onRequestShiftChange={canManageDoctorSlots ? () => setShiftModalOpen(true) : undefined}
             onSlotsChanged={refreshAll}
+            branches={branches}
+            doctorBranches={doctorBranches}
+            defaultBranchId={
+              selectedBranchId !== 'ALL' ? selectedBranchId : headquartersBranch?.branch_id
+            }
           />
         </div>
       )}

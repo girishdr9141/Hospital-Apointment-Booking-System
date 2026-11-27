@@ -10,9 +10,17 @@ import {
   Lock,
   Plus,
 } from 'lucide-react';
-import type { DoctorLeave, DoctorShiftConfig, Slot, SlotTemplate } from '../../types/opd';
+import type {
+  DoctorLeave,
+  DoctorShiftConfig,
+  GlobalBranch,
+  GlobalDoctorBranch,
+  Slot,
+  SlotTemplate,
+} from '../../types/opd';
 import { apiClient } from '../../services/apiClient';
 import { useToast } from '../../context/ToastContext';
+import { getHeadquartersBranch } from '../../utils/globalBranch';
 import {
   buildWorkingHourWindows,
   doesSessionCrossMidnight,
@@ -40,6 +48,9 @@ interface DoctorSlotCalendarProps {
   onRequestShiftChange?: () => void;
   onSlotsChanged: () => Promise<void> | void;
   compact?: boolean;
+  branches?: GlobalBranch[];
+  doctorBranches?: GlobalDoctorBranch[];
+  defaultBranchId?: number;
 }
 
 const MONTH_NAMES = [
@@ -70,10 +81,42 @@ export function DoctorSlotCalendar({
   onRequestShiftChange,
   onSlotsChanged,
   compact = false,
+  branches = [],
+  doctorBranches = [],
+  defaultBranchId,
 }: DoctorSlotCalendarProps) {
   const { notify } = useToast();
   const initialNow = getHospitalNowParts();
   const todayIso = initialNow.isoDate;
+
+  const hqBranch = useMemo(() => getHeadquartersBranch(branches), [branches]);
+  const doctorAssignedBranches = useMemo(() => {
+    const activeBranches = branches.filter((b) => b.is_active === 'Y');
+    const docAssignedIds = new Set(
+      doctorBranches
+        .filter((db) => db.doctor_id === doctorId && db.is_active === 'Y')
+        .map((db) => db.branch_id),
+    );
+    const matched = activeBranches.filter((b) => docAssignedIds.has(b.branch_id));
+    return matched.length > 0 ? matched : activeBranches;
+  }, [branches, doctorBranches, doctorId]);
+
+  const [targetBranchId, setTargetBranchId] = useState<number>(
+    defaultBranchId || hqBranch?.branch_id || 1,
+  );
+
+  React.useEffect(() => {
+    if (defaultBranchId && doctorAssignedBranches.some((b) => b.branch_id === defaultBranchId)) {
+      setTargetBranchId(defaultBranchId);
+    } else if (doctorAssignedBranches[0]) {
+      setTargetBranchId(doctorAssignedBranches[0].branch_id);
+    }
+  }, [defaultBranchId, doctorAssignedBranches]);
+
+  const targetBranchObj = useMemo(
+    () => branches.find((b) => b.branch_id === targetBranchId) || hqBranch || null,
+    [branches, targetBranchId, hqBranch],
+  );
 
   const [viewYear, setViewYear] = useState(initialNow.year);
   const [viewMonth, setViewMonth] = useState(initialNow.monthIndex);
@@ -207,6 +250,41 @@ export function DoctorSlotCalendar({
     setConfirmEndTime(item.end_time);
   };
 
+  const createSlotsForBranch = async (
+    items: Array<{ slot_date: string; start_time: string; end_time: string; max_patients_per_slot?: number }>,
+  ) => {
+    const isNonHqBranch =
+      Boolean(targetBranchObj) &&
+      Boolean(hqBranch) &&
+      targetBranchObj!.branch_id !== hqBranch!.branch_id;
+    if (isNonHqBranch && targetBranchObj) {
+      let createdCount = 0;
+      for (const s of items) {
+        await apiClient.createGlobalSlot({
+          doctor_id: doctorId,
+          branch_id: targetBranchObj.branch_id,
+          slot_date: s.slot_date,
+          start_time: s.start_time,
+          end_time: s.end_time,
+          max_patients_per_slot: s.max_patients_per_slot ?? 1,
+        });
+        createdCount += 1;
+      }
+      return {
+        message: `Generated ${createdCount} slot${createdCount === 1 ? '' : 's'} at ${targetBranchObj.branch_name}`,
+      };
+    }
+    return apiClient.confirmDoctorSlots({
+      doctor_id: doctorId,
+      slots: items.map((s) => ({
+        slot_date: s.slot_date,
+        start_time: s.start_time,
+        end_time: s.end_time,
+        max_patients_per_slot: s.max_patients_per_slot ?? 1,
+      })),
+    });
+  };
+
   const handleConfirmSingleSlot = async (e: React.FormEvent) => {
     e.preventDefault();
     if (readOnly || !confirmTarget) return;
@@ -217,17 +295,14 @@ export function DoctorSlotCalendar({
     const targetDate = confirmTarget.slot_date || selectedDate;
     setSubmitting(true);
     try {
-      const res = await apiClient.confirmDoctorSlots({
-        doctor_id: doctorId,
-        slots: [
-          {
-            slot_date: targetDate,
-            start_time: confirmTarget.start_time,
-            end_time: confirmEndTime,
-            max_patients_per_slot: 1,
-          },
-        ],
-      });
+      const res = await createSlotsForBranch([
+        {
+          slot_date: targetDate,
+          start_time: confirmTarget.start_time,
+          end_time: confirmEndTime,
+          max_patients_per_slot: 1,
+        },
+      ]);
       notify(res.message || 'Availability confirmed and slot generated', 'success');
       setConfirmTarget(null);
       await onSlotsChanged();
@@ -247,15 +322,14 @@ export function DoctorSlotCalendar({
     }
     setSubmitting(true);
     try {
-      const res = await apiClient.confirmDoctorSlots({
-        doctor_id: doctorId,
-        slots: targets.map((t) => ({
+      const res = await createSlotsForBranch(
+        targets.map((t) => ({
           slot_date: t.slot_date || selectedDate,
           start_time: t.start_time,
           end_time: t.end_time,
           max_patients_per_slot: 1,
         })),
-      });
+      );
       notify(res.message || `Confirmed ${targets.length} slots`, 'success');
       setSelectedKeys([]);
       setMultiSelectMode(false);
@@ -275,15 +349,14 @@ export function DoctorSlotCalendar({
     }
     setSubmitting(true);
     try {
-      const res = await apiClient.confirmDoctorSlots({
-        doctor_id: doctorId,
-        slots: unconfirmedOpenItems.map((t) => ({
+      const res = await createSlotsForBranch(
+        unconfirmedOpenItems.map((t) => ({
           slot_date: t.slot_date || selectedDate,
           start_time: t.start_time,
           end_time: t.end_time,
           max_patients_per_slot: 1,
         })),
-      });
+      );
       notify(res.message || 'Day slots generated successfully', 'success');
       setSelectedKeys([]);
       await onSlotsChanged();
@@ -311,17 +384,14 @@ export function DoctorSlotCalendar({
     }
     setSubmitting(true);
     try {
-      const res = await apiClient.confirmDoctorSlots({
-        doctor_id: doctorId,
-        slots: [
-          {
-            slot_date: selectedDate,
-            start_time: customStart,
-            end_time: customEnd,
-            max_patients_per_slot: 1,
-          },
-        ],
-      });
+      const res = await createSlotsForBranch([
+        {
+          slot_date: selectedDate,
+          start_time: customStart,
+          end_time: customEnd,
+          max_patients_per_slot: 1,
+        },
+      ]);
       notify(res.message || `Custom slot ${customStart}–${customEnd} added`, 'success');
       await onSlotsChanged();
     } catch (err) {
@@ -527,17 +597,38 @@ export function DoctorSlotCalendar({
                   : '09:00–13:00 · 14:00–17:00 (30 min)'}
               </span>
             </div>
-            {!readOnly && onRequestShiftChange && (
-              <button
-                type="button"
-                onClick={onRequestShiftChange}
-                className="font-medium text-teal-700 hover:underline whitespace-nowrap"
-              >
-                {shiftConfig?.pending_change_request
-                  ? 'Shift Change Pending Approval'
-                  : 'Request Shift Change'}
-              </button>
-            )}
+            <div className="flex flex-wrap items-center gap-3">
+              {!readOnly && doctorAssignedBranches.length > 0 && (
+                <div className="flex items-center gap-1.5">
+                  <label htmlFor="doc-slot-target-branch" className="font-medium text-slate-600">
+                    Branch:
+                  </label>
+                  <select
+                    id="doc-slot-target-branch"
+                    value={String(targetBranchId)}
+                    onChange={(e) => setTargetBranchId(Number(e.target.value))}
+                    className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-medium text-slate-900 focus:border-teal-700 focus:outline-none"
+                  >
+                    {doctorAssignedBranches.map((b) => (
+                      <option key={b.branch_id} value={String(b.branch_id)}>
+                        {b.branch_name} ({b.city})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {!readOnly && onRequestShiftChange && (
+                <button
+                  type="button"
+                  onClick={onRequestShiftChange}
+                  className="font-medium text-teal-700 hover:underline whitespace-nowrap"
+                >
+                  {shiftConfig?.pending_change_request
+                    ? 'Shift Change Pending Approval'
+                    : 'Request Shift Change'}
+                </button>
+              )}
+            </div>
           </div>
 
           {selectedDateIsPast && !readOnly ? (

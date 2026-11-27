@@ -96,6 +96,7 @@ const SUPER_ADMIN_NAV: NavItem[] = [
   { key: 'approvals', label: 'Approvals', section: 'operations', requiredPermission: 'SLOTS:UPDATE' },
   { key: 'payments', label: 'Payments', section: 'operations', requiredPermission: 'PAYMENTS:VIEW' },
   { key: 'token-queue', label: 'Token Queue', section: 'operations', requiredPermission: 'TOKEN_QUEUE:VIEW' },
+  { key: 'branches', label: 'Branches & Network', section: 'administration', requiredPermission: 'DEPARTMENTS:VIEW' },
   { key: 'error-logs', label: 'Error Logs', section: 'administration', requiredPermission: 'SYSTEM_SETTINGS:VIEW' },
 ];
 
@@ -222,6 +223,16 @@ function buildDynamicNavCatalog(role: Exclude<RoleName, 'SUPER_ADMIN'>): NavItem
       section: 'operations',
       requiredPermission: 'TOKEN_QUEUE:VIEW',
     },
+    ...(!isPatient
+      ? [
+          {
+            key: 'branches' as RouteKey,
+            label: 'Branches & Network',
+            section: 'operations' as const,
+            requiredPermission: 'DEPARTMENTS:VIEW',
+          },
+        ]
+      : []),
     { key: 'users-roles', label: 'User Management', section: 'administration', requiredPermission: 'USERS:VIEW' },
     {
       key: 'role-management',

@@ -148,6 +148,29 @@ import {
   serializePrescriptionForOracle,
   serializeShiftChangeRequestForOracle,
 } from './src/utils/clinicalAndShifts.ts';
+import type {
+  GlobalBranch,
+  GlobalBranchDepartment,
+  GlobalBranchUtilisationRow,
+  GlobalCountry,
+  GlobalDoctorBranch,
+  GlobalPatientProfile,
+  GlobalPaymentBranchLink,
+} from './src/types/opd.ts';
+import {
+  computeBranchUtilisation,
+  enrichAppointmentsWithBranch,
+  enrichPaymentsWithBranch,
+  enrichSlotsWithBranch,
+  getDoctorEffectiveBranchFee,
+  getHeadquartersBranch,
+} from './src/utils/globalBranch.ts';
+import {
+  getNextNumericId,
+  readGlobalStore,
+  writeGlobalStore,
+  type GlobalSidecarStoreData,
+} from './server/globalStore.ts';
 
 const HOSPITAL_TIMEZONE = process.env.HOSPITAL_TIMEZONE || DEFAULT_HOSPITAL_TIMEZONE;
 function getServerTodayIso(): string {
@@ -5770,6 +5793,1405 @@ async function startServer() {
     });
     res.json({ status: 'success', message: 'Prescription deleted.' });
   });
+
+  // ============================================================================
+  // GLOBAL CAREPULSE SIDECAR LAYER (/api/global/*) — ZERO MUTATION TO CORE APIs
+  // ============================================================================
+  const GLOBAL_ORDS_BASE_URL = ORDS_BASE_URL.includes('girish_opd_api')
+    ? ORDS_BASE_URL.replace('girish_opd_api', 'girish_global_api')
+    : `${ORDS_BASE_URL.replace(/\/+$/, '')}/global`;
+
+  let cachedGlobalOrdsLive: { value: boolean; checkedAt: number } | null = null;
+
+  function normalizeGlobalCurrencySymbol(currencyCode?: string | null, rawSymbol?: string | null): string {
+    const code = String(currencyCode || '').trim().toUpperCase();
+    if (code === 'INR') return '₹';
+    if (code === 'GBP') return '£';
+    if (code === 'SGD') return 'S$';
+    if (code === 'USD') return '$';
+    if (code === 'AED') return 'AED';
+    return String(rawSymbol || code || '₹');
+  }
+
+  async function isGlobalOrdsModuleLive(forceCheck = false): Promise<boolean> {
+    const now = Date.now();
+    if (!forceCheck && cachedGlobalOrdsLive && now - cachedGlobalOrdsLive.checkedAt < 60_000) {
+      return cachedGlobalOrdsLive.value;
+    }
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 3500);
+      const res = await fetch(`${GLOBAL_ORDS_BASE_URL}/branches?limit=1`, {
+        signal: controller.signal,
+        headers: { Accept: 'application/json' },
+      });
+      clearTimeout(t);
+      const live = res.ok;
+      cachedGlobalOrdsLive = { value: live, checkedAt: now };
+      return live;
+    } catch {
+      cachedGlobalOrdsLive = { value: false, checkedAt: now };
+      return false;
+    }
+  }
+
+  async function fetchGlobalOrdsCollection<T>(pathSuffix: string): Promise<T[]> {
+    const clean = pathSuffix.replace(/^\/+/, '');
+    const sep = clean.includes('?') ? '&' : '?';
+    const res = await fetch(`${GLOBAL_ORDS_BASE_URL}/${clean}${sep}limit=500`, {
+      signal: AbortSignal.timeout(10_000),
+      headers: { Accept: 'application/json' },
+    });
+    const text = await res.text();
+    let parsed: { items?: T[]; message?: string } = {};
+    try {
+      parsed = text ? (JSON.parse(text) as { items?: T[]; message?: string }) : {};
+    } catch {
+      // Non-JSON response
+    }
+    if (!res.ok) {
+      throw new Error(parsed.message || `Global ORDS HTTP ${res.status}`);
+    }
+    return Array.isArray(parsed.items) ? parsed.items : [];
+  }
+
+  async function postGlobalOrdsJson<T extends { status?: string; message?: string }>(
+    pathSuffix: string,
+    payload: unknown,
+  ): Promise<T> {
+    const clean = pathSuffix.replace(/^\/+/, '');
+    const res = await fetch(`${GLOBAL_ORDS_BASE_URL}/${clean}`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(12_000),
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+    let parsed: T = {} as T;
+    try {
+      parsed = text ? (JSON.parse(text) as T) : ({} as T);
+    } catch {
+      parsed = { status: 'error', message: text || `Global ORDS HTTP ${res.status}` } as T;
+    }
+    if (!res.ok || parsed.status === 'error') {
+      throw new Error(normalizeOrdsError(parsed, parsed.message || `Global ORDS HTTP ${res.status}`));
+    }
+    return parsed;
+  }
+
+  async function syncGlobalDirectoryFromOracle(): Promise<{
+    store: GlobalSidecarStoreData;
+    live: boolean;
+  }> {
+    const store = readGlobalStore();
+    const live = await isGlobalOrdsModuleLive();
+    if (!live) {
+      return { store, live: false };
+    }
+    try {
+      const [rawCountries, rawBranches, rawBranchDepts, rawDocBranches] = await Promise.all([
+        fetchGlobalOrdsCollection<GlobalCountry>('countries'),
+        fetchGlobalOrdsCollection<GlobalBranch>('branches'),
+        fetchGlobalOrdsCollection<GlobalBranchDepartment>('branch-departments'),
+        fetchGlobalOrdsCollection<GlobalDoctorBranch>('doctor-branches'),
+      ]);
+
+      const countries: GlobalCountry[] = rawCountries.map((c) => ({
+        country_id: Number(c.country_id),
+        country_code: String(c.country_code || '').toUpperCase(),
+        country_name: String(c.country_name || ''),
+        currency_code: String(c.currency_code || '').toUpperCase(),
+        currency_symbol: normalizeGlobalCurrencySymbol(c.currency_code, c.currency_symbol),
+        phone_dial_code: String(c.phone_dial_code || '+1'),
+        default_timezone: String(c.default_timezone || 'UTC'),
+        fx_rate_to_inr: Number(c.fx_rate_to_inr || 1),
+        is_active: c.is_active === 'N' ? 'N' : 'Y',
+      }));
+
+      const countryById = new Map(countries.map((c) => [c.country_id, c]));
+
+      const branches: GlobalBranch[] = rawBranches.map((b) => {
+        const c = countryById.get(Number(b.country_id));
+        const currCode = String(b.currency_code || c?.currency_code || 'INR').toUpperCase();
+        return {
+          branch_id: Number(b.branch_id),
+          country_id: Number(b.country_id),
+          country_code: String(b.country_code || c?.country_code || ''),
+          country_name: String(b.country_name || c?.country_name || ''),
+          currency_symbol: normalizeGlobalCurrencySymbol(currCode, b.currency_symbol || c?.currency_symbol),
+          fx_rate_to_inr: Number(b.fx_rate_to_inr ?? c?.fx_rate_to_inr ?? 1),
+          branch_code: String(b.branch_code || ''),
+          branch_name: String(b.branch_name || ''),
+          city: String(b.city || ''),
+          address_line: b.address_line ?? null,
+          postal_code: b.postal_code ?? null,
+          phone: b.phone ?? null,
+          email: b.email ?? null,
+          timezone_iana: String(b.timezone_iana || c?.default_timezone || 'UTC'),
+          currency_code: currCode,
+          is_headquarters: b.is_headquarters === 'Y' ? 'Y' : 'N',
+          is_active: b.is_active === 'N' ? 'N' : 'Y',
+        };
+      });
+
+      const branchDepts: GlobalBranchDepartment[] = rawBranchDepts.map((bd) => ({
+        branch_dept_id: Number(bd.branch_dept_id),
+        branch_id: Number(bd.branch_id),
+        department_id: Number(bd.department_id),
+        department_name: bd.department_name,
+        is_specialized: bd.is_specialized === 'Y' ? 'Y' : 'N',
+        local_consultation_fee:
+          bd.local_consultation_fee !== null && bd.local_consultation_fee !== undefined
+            ? Number(bd.local_consultation_fee)
+            : null,
+        is_active: bd.is_active === 'N' ? 'N' : 'Y',
+      }));
+
+      const docBranches: GlobalDoctorBranch[] = rawDocBranches.map((db) => ({
+        doc_branch_id: Number(db.doc_branch_id),
+        doctor_id: Number(db.doctor_id),
+        doctor_name: db.doctor_name,
+        branch_id: Number(db.branch_id),
+        is_primary_branch: db.is_primary_branch === 'Y' ? 'Y' : 'N',
+        local_consultation_fee:
+          db.local_consultation_fee !== null && db.local_consultation_fee !== undefined
+            ? Number(db.local_consultation_fee)
+            : null,
+        is_active: db.is_active === 'N' ? 'N' : 'Y',
+      }));
+
+      const syncedStore: GlobalSidecarStoreData = {
+        ...store,
+        countries: countries.length > 0 ? countries : store.countries,
+        branches: branches.length > 0 ? branches : store.branches,
+        branch_departments: branchDepts,
+        doctor_branches: docBranches,
+      };
+      writeGlobalStore(syncedStore);
+      return { store: syncedStore, live: true };
+    } catch {
+      return { store, live: false };
+    }
+  }
+
+  app.get('/api/global/public-context', async (_req, res) => {
+    const { store } = await syncGlobalDirectoryFromOracle();
+    const hq = getHeadquartersBranch(store.branches);
+    res.json({
+      status: 'success',
+      headquarters_branch_id: hq?.branch_id ?? 1,
+      countries: store.countries.filter((c) => c.is_active === 'Y'),
+      branches: store.branches.filter((b) => b.is_active === 'Y'),
+    });
+  });
+
+  app.get('/api/global/context', requireAuth, async (_req, res) => {
+    const { store, live } = await syncGlobalDirectoryFromOracle();
+    const hq = getHeadquartersBranch(store.branches);
+    res.json({
+      status: 'success',
+      global_ords_live: live,
+      headquarters_branch_id: hq?.branch_id ?? 1,
+      countries: store.countries,
+      branches: store.branches,
+      branch_departments: store.branch_departments,
+      doctor_branches: store.doctor_branches,
+    });
+  });
+
+  app.post('/api/global/countries', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+      res.status(403).json({ status: 'error', message: 'Only administrators can manage countries.' });
+      return;
+    }
+    const code = String(req.body?.country_code || '').trim().toUpperCase();
+    const name = String(req.body?.country_name || '').trim();
+    const currencyCode = String(req.body?.currency_code || '').trim().toUpperCase();
+    const currencySymbol = String(req.body?.currency_symbol || currencyCode).trim();
+    const dialCode = String(req.body?.phone_dial_code || '+1').trim();
+    const tz = String(req.body?.default_timezone || 'UTC').trim();
+    const fx = Number(req.body?.fx_rate_to_inr || 1);
+    if (!code || !name || !currencyCode || !(fx > 0)) {
+      res.status(400).json({ status: 'error', message: 'Country code, name, currency code, and positive FX rate are required.' });
+      return;
+    }
+
+    const { store, live } = await syncGlobalDirectoryFromOracle();
+    const existing = store.countries.find((c) => c.country_code === code);
+    const payload = {
+      country_code: code,
+      country_name: name,
+      currency_code: currencyCode,
+      currency_symbol: currencySymbol,
+      phone_dial_code: dialCode,
+      default_timezone: tz,
+      fx_rate_to_inr: fx,
+    };
+
+    if (live) {
+      try {
+        await postGlobalOrdsJson('countries', payload);
+        const refreshed = await syncGlobalDirectoryFromOracle();
+        const savedOracle = refreshed.store.countries.find((c) => c.country_code === code);
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: `${name} (${code})`,
+          action: existing ? 'GLOBAL_COUNTRY_UPDATED' : 'GLOBAL_COUNTRY_CREATED',
+          category: 'OPERATIONS',
+          details: `${user.full_name} saved country ${name} (${code} · ${currencyCode}) in Oracle GBR_COUNTRIES.`,
+          severity: 'info',
+        });
+        res.json({ status: 'success', country: savedOracle || payload });
+        return;
+      } catch (err) {
+        res.status(400).json({
+          status: 'error',
+          message: err instanceof Error ? err.message : 'Unable to save country in Oracle.',
+        });
+        return;
+      }
+    }
+
+    let saved: GlobalCountry;
+    if (existing) {
+      existing.country_name = name;
+      existing.currency_code = currencyCode;
+      existing.currency_symbol = currencySymbol;
+      existing.phone_dial_code = dialCode;
+      existing.default_timezone = tz;
+      existing.fx_rate_to_inr = fx;
+      existing.is_active = req.body?.is_active === 'N' ? 'N' : 'Y';
+      saved = existing;
+    } else {
+      saved = {
+        country_id: getNextNumericId(store.countries as unknown as Array<Record<string, unknown>>, 'country_id'),
+        ...payload,
+        is_active: 'Y',
+      };
+      store.countries.push(saved);
+    }
+    writeGlobalStore(store);
+    recordRbacAuditLog({
+      actor_user_id: user.user_id,
+      actor_name: user.full_name,
+      actor_email: user.email,
+      actor_role: user.role,
+      target_label: `${name} (${code})`,
+      action: existing ? 'GLOBAL_COUNTRY_UPDATED' : 'GLOBAL_COUNTRY_CREATED',
+      category: 'OPERATIONS',
+      details: `${user.full_name} saved country ${name} (${code} · ${currencyCode}).`,
+      severity: 'info',
+    });
+    res.json({ status: 'success', country: saved });
+  });
+
+  app.post('/api/global/branches', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+      res.status(403).json({ status: 'error', message: 'Only administrators can create branches.' });
+      return;
+    }
+    const { store, live } = await syncGlobalDirectoryFromOracle();
+    const countryId = Number(req.body?.country_id);
+    const country = store.countries.find((c) => c.country_id === countryId);
+    const branchCode = String(req.body?.branch_code || '').trim().toUpperCase();
+    const branchName = String(req.body?.branch_name || '').trim();
+    const city = String(req.body?.city || '').trim();
+    if (!country || !branchCode || !branchName || !city) {
+      res.status(400).json({ status: 'error', message: 'Valid country, branch code, branch name, and city are required.' });
+      return;
+    }
+    if (store.branches.some((b) => b.branch_code === branchCode)) {
+      res.status(409).json({ status: 'error', message: `Branch code ${branchCode} already exists.` });
+      return;
+    }
+
+    const oraclePayload = {
+      country_id: country.country_id,
+      branch_code: branchCode,
+      branch_name: branchName,
+      city,
+      address_line: req.body?.address_line ? String(req.body.address_line).trim() : null,
+      postal_code: req.body?.postal_code ? String(req.body.postal_code).trim() : null,
+      phone: req.body?.phone ? String(req.body.phone).trim() : null,
+      email: req.body?.email ? String(req.body.email).trim() : null,
+      timezone_iana: String(req.body?.timezone_iana || country.default_timezone).trim(),
+      currency_code: String(req.body?.currency_code || country.currency_code).trim().toUpperCase(),
+    };
+
+    if (live) {
+      try {
+        await postGlobalOrdsJson<{ status: string; branch_id?: number }>('branches', oraclePayload);
+        const refreshed = await syncGlobalDirectoryFromOracle();
+        const createdOracle = refreshed.store.branches.find((b) => b.branch_code === branchCode);
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: `${branchName} (${branchCode})`,
+          action: 'GLOBAL_BRANCH_CREATED',
+          category: 'OPERATIONS',
+          details: `${user.full_name} created branch ${branchName} in ${city}, ${country.country_name} (${oraclePayload.currency_code}) in Oracle GBR_BRANCHES.`,
+          severity: 'info',
+        });
+        res.json({ status: 'success', branch: createdOracle || oraclePayload });
+        return;
+      } catch (err) {
+        res.status(400).json({
+          status: 'error',
+          message: err instanceof Error ? err.message : 'Unable to create branch in Oracle.',
+        });
+        return;
+      }
+    }
+
+    const created: GlobalBranch = {
+      branch_id: getNextNumericId(store.branches as unknown as Array<Record<string, unknown>>, 'branch_id'),
+      country_id: country.country_id,
+      country_code: country.country_code,
+      country_name: country.country_name,
+      currency_symbol: country.currency_symbol,
+      fx_rate_to_inr: country.fx_rate_to_inr,
+      branch_code: branchCode,
+      branch_name: branchName,
+      city,
+      address_line: oraclePayload.address_line,
+      postal_code: oraclePayload.postal_code,
+      phone: oraclePayload.phone,
+      email: oraclePayload.email,
+      timezone_iana: oraclePayload.timezone_iana,
+      currency_code: oraclePayload.currency_code,
+      is_headquarters: 'N',
+      is_active: 'Y',
+    };
+    store.branches.push(created);
+    writeGlobalStore(store);
+    recordRbacAuditLog({
+      actor_user_id: user.user_id,
+      actor_name: user.full_name,
+      actor_email: user.email,
+      actor_role: user.role,
+      target_label: `${branchName} (${branchCode})`,
+      action: 'GLOBAL_BRANCH_CREATED',
+      category: 'OPERATIONS',
+      details: `${user.full_name} created branch ${branchName} in ${city}, ${country.country_name} (${created.currency_code}).`,
+      severity: 'info',
+    });
+    res.json({ status: 'success', branch: created });
+  });
+
+  app.put('/api/global/branches/:id', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+      res.status(403).json({ status: 'error', message: 'Only administrators can update branches.' });
+      return;
+    }
+    const branchId = Number(req.params.id);
+    const { store } = await syncGlobalDirectoryFromOracle();
+    const target = store.branches.find((b) => b.branch_id === branchId);
+    if (!target) {
+      res.status(404).json({ status: 'error', message: 'Branch not found.' });
+      return;
+    }
+    if (target.is_headquarters === 'Y' && req.body?.is_active === 'N') {
+      res.status(400).json({ status: 'error', message: 'Headquarters branch cannot be deactivated.' });
+      return;
+    }
+    if (req.body?.branch_name) target.branch_name = String(req.body.branch_name).trim();
+    if (req.body?.city) target.city = String(req.body.city).trim();
+    if (req.body?.address_line !== undefined) target.address_line = req.body.address_line ? String(req.body.address_line).trim() : null;
+    if (req.body?.phone !== undefined) target.phone = req.body.phone ? String(req.body.phone).trim() : null;
+    if (req.body?.email !== undefined) target.email = req.body.email ? String(req.body.email).trim() : null;
+    if (req.body?.timezone_iana) target.timezone_iana = String(req.body.timezone_iana).trim();
+    if (req.body?.is_active === 'Y' || req.body?.is_active === 'N') target.is_active = req.body.is_active;
+    writeGlobalStore(store);
+    res.json({ status: 'success', branch: target });
+  });
+
+  app.post('/api/global/branch-departments', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+      res.status(403).json({ status: 'error', message: 'Only administrators can assign branch departments.' });
+      return;
+    }
+    const branchId = Number(req.body?.branch_id);
+    const departmentId = Number(req.body?.department_id);
+    if (!branchId || !departmentId) {
+      res.status(400).json({ status: 'error', message: 'branch_id and department_id are required.' });
+      return;
+    }
+    const { store, live } = await syncGlobalDirectoryFromOracle();
+    if (!store.branches.some((b) => b.branch_id === branchId)) {
+      res.status(404).json({ status: 'error', message: 'Branch not found.' });
+      return;
+    }
+    const isSpecialized = req.body?.is_specialized === 'N' ? 'N' : 'Y';
+    const isActive = req.body?.is_active === 'N' ? 'N' : 'Y';
+    const localFee =
+      req.body?.local_consultation_fee != null && req.body.local_consultation_fee !== ''
+        ? Number(req.body.local_consultation_fee)
+        : null;
+
+    if (live) {
+      try {
+        await postGlobalOrdsJson('branch-departments', {
+          branch_id: branchId,
+          department_id: departmentId,
+          is_specialized: isSpecialized,
+          local_consultation_fee: localFee,
+          is_active: isActive,
+        });
+        const refreshed = await syncGlobalDirectoryFromOracle();
+        const savedMapping = refreshed.store.branch_departments.find(
+          (bd) => bd.branch_id === branchId && bd.department_id === departmentId,
+        );
+        res.json({ status: 'success', mapping: savedMapping });
+        return;
+      } catch (err) {
+        res.status(400).json({
+          status: 'error',
+          message: err instanceof Error ? err.message : 'Unable to assign department to branch in Oracle.',
+        });
+        return;
+      }
+    }
+
+    let mapping = store.branch_departments.find(
+      (bd) => bd.branch_id === branchId && bd.department_id === departmentId,
+    );
+    if (mapping) {
+      mapping.is_specialized = isSpecialized;
+      mapping.local_consultation_fee = localFee;
+      mapping.is_active = isActive;
+    } else {
+      mapping = {
+        branch_dept_id: getNextNumericId(
+          store.branch_departments as unknown as Array<Record<string, unknown>>,
+          'branch_dept_id',
+        ),
+        branch_id: branchId,
+        department_id: departmentId,
+        is_specialized: isSpecialized,
+        local_consultation_fee: localFee,
+        is_active: isActive,
+      };
+      store.branch_departments.push(mapping);
+    }
+    writeGlobalStore(store);
+    res.json({ status: 'success', mapping });
+  });
+
+  app.post('/api/global/doctor-branches', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+      res.status(403).json({ status: 'error', message: 'Only administrators can assign doctors to branches.' });
+      return;
+    }
+    const doctorId = Number(req.body?.doctor_id);
+    const branchId = Number(req.body?.branch_id);
+    if (!doctorId || !branchId) {
+      res.status(400).json({ status: 'error', message: 'doctor_id and branch_id are required.' });
+      return;
+    }
+    const { store, live } = await syncGlobalDirectoryFromOracle();
+    if (!store.branches.some((b) => b.branch_id === branchId)) {
+      res.status(404).json({ status: 'error', message: 'Branch not found.' });
+      return;
+    }
+    const isPrimary = req.body?.is_primary_branch === 'Y' ? 'Y' : 'N';
+    const isActive = req.body?.is_active === 'N' ? 'N' : 'Y';
+    const localFee =
+      req.body?.local_consultation_fee != null && req.body.local_consultation_fee !== ''
+        ? Number(req.body.local_consultation_fee)
+        : null;
+
+    if (live) {
+      try {
+        await postGlobalOrdsJson('doctor-branches', {
+          doctor_id: doctorId,
+          branch_id: branchId,
+          is_primary_branch: isPrimary,
+          local_consultation_fee: localFee,
+          is_active: isActive,
+        });
+        const refreshed = await syncGlobalDirectoryFromOracle();
+        const savedMapping = refreshed.store.doctor_branches.find(
+          (db) => db.doctor_id === doctorId && db.branch_id === branchId,
+        );
+        res.json({ status: 'success', mapping: savedMapping });
+        return;
+      } catch (err) {
+        res.status(400).json({
+          status: 'error',
+          message: err instanceof Error ? err.message : 'Unable to assign doctor to branch in Oracle.',
+        });
+        return;
+      }
+    }
+
+    if (isPrimary === 'Y') {
+      for (const row of store.doctor_branches) {
+        if (row.doctor_id === doctorId && row.branch_id !== branchId) {
+          row.is_primary_branch = 'N';
+        }
+      }
+    }
+
+    let mapping = store.doctor_branches.find(
+      (db) => db.doctor_id === doctorId && db.branch_id === branchId,
+    );
+    if (mapping) {
+      mapping.is_primary_branch = isPrimary;
+      mapping.local_consultation_fee = localFee;
+      mapping.is_active = isActive;
+    } else {
+      mapping = {
+        doc_branch_id: getNextNumericId(
+          store.doctor_branches as unknown as Array<Record<string, unknown>>,
+          'doc_branch_id',
+        ),
+        doctor_id: doctorId,
+        branch_id: branchId,
+        is_primary_branch: isPrimary,
+        local_consultation_fee: localFee,
+        is_active: isActive,
+      };
+      store.doctor_branches.push(mapping);
+    }
+    writeGlobalStore(store);
+    res.json({ status: 'success', mapping });
+  });
+
+  app.get('/api/global/slots', requireAuth, async (req, res) => {
+    try {
+      const branchIdParam = req.query.branch_id ? Number(req.query.branch_id) : null;
+      const [{ store, live }, rawSlots, templates] = await Promise.all([
+        syncGlobalDirectoryFromOracle(),
+        fetchOrdsItems<Slot>('slots'),
+        fetchSlotTemplatesSafe(),
+      ]);
+
+      const mergedSlotBranchMap: Record<string, number> = { ...store.slot_branch_map };
+      if (live) {
+        const oracleGlobalSlots = await fetchGlobalOrdsCollection<{
+          slot_id: number;
+          branch_id: number;
+          branch_resolution?: string;
+        }>('slots').catch(() => []);
+        for (const gs of oracleGlobalSlots) {
+          if (gs.branch_resolution === 'LINKED' && gs.branch_id) {
+            mergedSlotBranchMap[String(gs.slot_id)] = Number(gs.branch_id);
+          }
+        }
+      }
+
+      const shiftStore = readShiftStore();
+      const slotsWithDoc = attachDoctorIdsToSlots(rawSlots, templates, shiftStore);
+      let enriched = enrichSlotsWithBranch(
+        slotsWithDoc,
+        mergedSlotBranchMap,
+        store.branches,
+        store.countries,
+      );
+      if (branchIdParam) {
+        enriched = enriched.filter((s) => s.branch_meta?.branch_id === branchIdParam);
+      }
+      res.json({ status: 'success', items: enriched });
+    } catch (err) {
+      res.status(502).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to load global slots.',
+      });
+    }
+  });
+
+  app.post('/api/global/slots', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(user, res, 'SLOTS:CREATE', 'Global Branch Slot')) return;
+    const doctorId = Number(req.body?.doctor_id);
+    const branchId = Number(req.body?.branch_id);
+    const slotDate = String(req.body?.slot_date || '').slice(0, 10);
+    const startTime = String(req.body?.start_time || '').slice(0, 5);
+    const endTime = String(req.body?.end_time || startTime).slice(0, 5);
+    const maxPatients = Math.max(1, Number(req.body?.max_patients_per_slot || 1));
+
+    const { store, live } = await syncGlobalDirectoryFromOracle();
+    const branch = store.branches.find((b) => b.branch_id === branchId && b.is_active === 'Y');
+    if (!branch) {
+      res.status(400).json({ status: 'error', message: 'Selected branch is inactive or does not exist.' });
+      return;
+    }
+
+    try {
+      let createdSlotId = 0;
+      if (live) {
+        const globalSlotRes = await postGlobalOrdsJson<{ status: string; slot_id?: number }>('slots', {
+          doctor_id: doctorId,
+          branch_id: branch.branch_id,
+          slot_date: slotDate,
+          start_time: startTime,
+          end_time: endTime,
+          max_patients_per_slot: maxPatients,
+        });
+        createdSlotId = Number(globalSlotRes.slot_id || 0);
+      } else {
+        const upstreamRes = await fetchOrdsJson<{ status?: string; message?: string; slot_id?: number }>('slots', {
+          method: 'POST',
+          body: JSON.stringify({
+            doctor_id: doctorId,
+            slot_date: slotDate,
+            start_time: startTime,
+            end_time: endTime,
+            max_patients_per_slot: maxPatients,
+          }),
+        });
+        if (upstreamRes?.status === 'error') {
+          res.status(400).json({ status: 'error', message: upstreamRes.message || 'Slot creation failed.' });
+          return;
+        }
+        createdSlotId = Number(upstreamRes?.slot_id || 0);
+      }
+
+      if (!createdSlotId) {
+        const latestSlots = await fetchOrdsItems<Slot>('slots');
+        const matched = latestSlots
+          .filter(
+            (s) =>
+              Number(s.doctor_id) === doctorId &&
+              getIsoDatePart(s.slot_date) === slotDate &&
+              String(s.start_time || '').slice(0, 5) === startTime,
+          )
+          .sort((a, b) => b.slot_id - a.slot_id)[0];
+        if (matched) createdSlotId = matched.slot_id;
+      }
+
+      if (createdSlotId > 0) {
+        store.slot_branch_map[String(createdSlotId)] = branch.branch_id;
+        writeGlobalStore(store);
+      }
+
+      recordRbacAuditLog({
+        actor_user_id: user.user_id,
+        actor_name: user.full_name,
+        actor_email: user.email,
+        actor_role: user.role,
+        target_label: `Slot #${createdSlotId || 'NEW'} (${branch.branch_code})`,
+        action: 'GLOBAL_BRANCH_SLOT_CREATED',
+        category: 'SHIFTS_LEAVES',
+        details: `${user.full_name} created slot for Doctor #${doctorId} on ${slotDate} ${startTime}-${endTime} at ${branch.branch_name}.`,
+        severity: 'info',
+      });
+
+      res.json({
+        status: 'success',
+        slot_id: createdSlotId || null,
+        branch_id: branch.branch_id,
+        branch_code: branch.branch_code,
+      });
+    } catch (err) {
+      res.status(400).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to create branch slot.',
+      });
+    }
+  });
+
+  app.get('/api/global/appointments', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    const branchIdParam = req.query.branch_id ? Number(req.query.branch_id) : null;
+    try {
+      await ensureOverdueHoldsExpired();
+      const [{ store, live }, rawAppts, rawPayments, rawSlots, templates, doctors, departments] =
+        await Promise.all([
+          syncGlobalDirectoryFromOracle(),
+          fetchOrdsItems<Appointment>('appointments'),
+          fetchOrdsItems<Payment>('payments').catch(() => [] as Payment[]),
+          fetchOrdsItems<Slot>('slots'),
+          fetchSlotTemplatesSafe(),
+          fetchOrdsItems<Doctor>('doctors'),
+          fetchOrdsItems<Department>('departments/'),
+        ]);
+
+      const mergedSlotBranchMap: Record<string, number> = { ...store.slot_branch_map };
+      const mergedApptBranchMap: Record<string, { branch_id: number; consultation_mode?: string }> = {
+        ...store.appt_branch_map,
+      };
+      const mergedPayBranchMap: Record<string, GlobalPaymentBranchLink> = {
+        ...store.payment_branch_map,
+      };
+
+      if (live) {
+        const [oracleGlobalAppts, oracleGlobalSlots, oracleGlobalPays] = await Promise.all([
+          fetchGlobalOrdsCollection<{
+            appointment_id: number;
+            appointment_ref?: string;
+            branch_id: number;
+            consultation_mode?: string;
+            branch_resolution?: string;
+          }>('appointments').catch(() => []),
+          fetchGlobalOrdsCollection<{
+            slot_id: number;
+            branch_id: number;
+            branch_resolution?: string;
+          }>('slots').catch(() => []),
+          fetchGlobalOrdsCollection<{
+            appointment_id: number;
+            branch_id: number;
+            local_currency: string;
+            local_amount: number;
+            base_inr_amount: number;
+            fx_rate_to_inr: number;
+            created_on?: string;
+          }>('payments').catch(() => []),
+        ]);
+        for (const gs of oracleGlobalSlots) {
+          if (gs.branch_resolution === 'LINKED' && gs.branch_id) {
+            mergedSlotBranchMap[String(gs.slot_id)] = Number(gs.branch_id);
+          }
+        }
+        for (const ga of oracleGlobalAppts) {
+          if (ga.branch_resolution === 'LINKED' && ga.branch_id) {
+            mergedApptBranchMap[String(ga.appointment_id)] = {
+              branch_id: Number(ga.branch_id),
+              consultation_mode: ga.consultation_mode,
+            };
+          }
+        }
+        for (const gp of oracleGlobalPays) {
+          if (gp.appointment_id && gp.local_currency && gp.local_amount != null) {
+            mergedPayBranchMap[String(gp.appointment_id)] = {
+              appointment_id: Number(gp.appointment_id),
+              branch_id: Number(gp.branch_id),
+              local_currency: gp.local_currency,
+              local_amount: Number(gp.local_amount),
+              base_inr_amount: Number(gp.base_inr_amount),
+              fx_rate_to_inr: Number(gp.fx_rate_to_inr || 1),
+              created_on: gp.created_on,
+            };
+          }
+        }
+      }
+
+      const shiftStore = readShiftStore();
+      const fullSlots = enrichSlots(
+        attachDoctorIdsToSlots(rawSlots, templates, shiftStore),
+        templates,
+        doctors,
+        departments,
+      );
+      let appts = enrichAppointments(attachConsultationMode(rawAppts, rawPayments), fullSlots, doctors);
+      if (user.role === 'PATIENT') {
+        appts = appts.filter((a) => a.patient_id === user.patient_id);
+      } else if (user.role === 'DOCTOR') {
+        appts = appts.filter((a) => a.doctor_id === user.doctor_id);
+      }
+
+      let enriched = enrichAppointmentsWithBranch(
+        appts,
+        mergedApptBranchMap,
+        mergedSlotBranchMap,
+        mergedPayBranchMap,
+        store.branches,
+        store.countries,
+      );
+      if (branchIdParam) {
+        enriched = enriched.filter((a) => a.branch_meta?.branch_id === branchIdParam);
+      }
+      res.json({ status: 'success', items: enriched });
+    } catch (err) {
+      res.status(502).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to load global appointments.',
+      });
+    }
+  });
+
+  app.post('/api/global/appointments', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    if (!requirePermission(user, res, 'APPOINTMENTS:CREATE', 'Global Branch Booking')) return;
+    const patientId =
+      user.role === 'PATIENT' ? Number(user.patient_id || req.body?.patient_id) : Number(req.body?.patient_id);
+    const slotId = Number(req.body?.slot_id);
+    const branchId = Number(req.body?.branch_id);
+    const bookingSource =
+      String(req.body?.booking_source || (user.role === 'PATIENT' ? 'ONLINE' : 'WALK_IN')).toUpperCase() === 'WALK_IN'
+        ? 'WALK_IN'
+        : 'ONLINE';
+    const consultationMode =
+      String(req.body?.consultation_mode || 'FACE_TO_FACE').toUpperCase() === 'ONLINE'
+        ? 'ONLINE'
+        : 'FACE_TO_FACE';
+
+    const { store, live } = await syncGlobalDirectoryFromOracle();
+    const branch = store.branches.find((b) => b.branch_id === branchId && b.is_active === 'Y');
+    if (!branch) {
+      res.status(400).json({ status: 'error', message: 'Selected hospital branch is inactive or invalid.' });
+      return;
+    }
+
+    try {
+      let createdApptId = 0;
+      let createdApptRef = '';
+
+      if (live) {
+        const globalBookRes = await postGlobalOrdsJson<{
+          status: string;
+          appointment_id?: number;
+          appointment_ref?: string;
+        }>('appointments', {
+          patient_id: patientId,
+          slot_id: slotId,
+          branch_id: branch.branch_id,
+          booking_source: bookingSource,
+          consultation_mode: consultationMode,
+        });
+        createdApptId = Number(globalBookRes.appointment_id || 0);
+        createdApptRef = String(globalBookRes.appointment_ref || '');
+      } else {
+        const slotLinkedBranchId = store.slot_branch_map[String(slotId)];
+        const hqBranch = getHeadquartersBranch(store.branches);
+        const effectiveSlotBranchId = slotLinkedBranchId ?? hqBranch?.branch_id ?? 1;
+        if (effectiveSlotBranchId !== branch.branch_id) {
+          res.status(400).json({ status: 'error', message: 'Selected slot does not belong to the chosen branch.' });
+          return;
+        }
+        const bookRes = await fetchOrdsJson<{
+          status?: string;
+          message?: string;
+          appointment_ref?: string;
+          appointment_id?: number;
+        }>('appointments/', {
+          method: 'POST',
+          body: JSON.stringify({
+            patient_id: patientId,
+            slot_id: slotId,
+            booking_source: bookingSource,
+            consultation_mode: consultationMode,
+          }),
+        });
+        if (bookRes?.status === 'error') {
+          res.status(400).json({ status: 'error', message: bookRes.message || 'Booking failed.' });
+          return;
+        }
+        createdApptId = Number(bookRes?.appointment_id || 0);
+        createdApptRef = String(bookRes?.appointment_ref || '');
+      }
+
+      const appts = await fetchOrdsItems<Appointment>('appointments');
+      const created =
+        (createdApptId ? appts.find((a) => a.appointment_id === createdApptId) : undefined) ||
+        (createdApptRef ? appts.find((a) => a.appointment_ref === createdApptRef) : undefined) ||
+        appts
+          .filter((a) => a.patient_id === patientId && a.slot_id === slotId && a.status !== 'CANCELLED')
+          .sort((a, b) => b.appointment_id - a.appointment_id)[0];
+
+      if (created) {
+        saveAppointmentMetadata({
+          consultation_mode: consultationMode,
+          rescheduled_from_id: null,
+          appointment_ref: created.appointment_ref,
+          appointment_id: created.appointment_id,
+          patient_id: created.patient_id,
+          slot_id: created.slot_id,
+          updated_at: new Date().toISOString(),
+        });
+        store.appt_branch_map[String(created.appointment_id)] = {
+          branch_id: branch.branch_id,
+          consultation_mode: consultationMode,
+        };
+        store.appt_branch_map[created.appointment_ref] = {
+          branch_id: branch.branch_id,
+          consultation_mode: consultationMode,
+        };
+        writeGlobalStore(store);
+
+        recordRbacAuditLog({
+          actor_user_id: user.user_id,
+          actor_name: user.full_name,
+          actor_email: user.email,
+          actor_role: user.role,
+          target_label: `${created.appointment_ref} (${branch.branch_code})`,
+          action: 'GLOBAL_APPOINTMENT_BOOKED',
+          category: 'APPOINTMENTS',
+          details: `${user.full_name} booked ${created.appointment_ref} at ${branch.branch_name} (${branch.country_name}) [${consultationMode}].`,
+          severity: 'info',
+        });
+      }
+
+      res.json({
+        status: 'success',
+        appointment_id: created?.appointment_id ?? (createdApptId || null),
+        appointment_ref: created?.appointment_ref ?? (createdApptRef || null),
+        branch_id: branch.branch_id,
+        branch_code: branch.branch_code,
+        branch_name: branch.branch_name,
+        currency_code: branch.currency_code,
+      });
+    } catch (err) {
+      res.status(400).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to complete global branch booking.',
+      });
+    }
+  });
+
+  app.post('/api/global/appointments/:id/pay-and-confirm', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    const apptId = Number(req.params.id);
+    if (!apptId) {
+      res.status(400).json({ status: 'error', message: 'Invalid appointment ID.' });
+      return;
+    }
+    const allowedPerms =
+      user.role === 'PATIENT' ? ['APPOINTMENTS:UPDATE', 'APPOINTMENTS:CREATE'] : ['APPOINTMENTS:UPDATE'];
+    if (!requireAnyPermission(user, res, allowedPerms, `Global Pay & Confirm #${apptId}`)) return;
+
+    const rawMethod = String(req.body?.payment_method || 'UPI').trim().toUpperCase();
+    const paymentMethod = ['UPI', 'CARD', 'NET_BANKING', 'CASH'].includes(rawMethod) ? rawMethod : 'UPI';
+
+    try {
+      await ensureOverdueHoldsExpired();
+      const [{ store, live }, rawAppts, rawSlots, templates, doctors, departments, existingPayments] =
+        await Promise.all([
+          syncGlobalDirectoryFromOracle(),
+          fetchOrdsItems<Appointment>('appointments'),
+          fetchOrdsItems<Slot>('slots'),
+          fetchSlotTemplatesSafe(),
+          fetchOrdsItems<Doctor>('doctors'),
+          fetchOrdsItems<Department>('departments/'),
+          fetchOrdsItems<Payment>('payments').catch(() => [] as Payment[]),
+        ]);
+      const shiftStore = readShiftStore();
+      const fullSlots = enrichSlots(
+        attachDoctorIdsToSlots(rawSlots, templates, shiftStore),
+        templates,
+        doctors,
+        departments,
+      );
+      const enrichedAppts = enrichAppointments(
+        attachConsultationMode(rawAppts, existingPayments),
+        fullSlots,
+        doctors,
+      );
+      const targetAppt = enrichedAppts.find((a) => a.appointment_id === apptId);
+      if (!targetAppt) {
+        res.status(404).json({ status: 'error', message: 'Appointment not found.' });
+        return;
+      }
+      if (user.role === 'PATIENT' && targetAppt.patient_id !== user.patient_id) {
+        res.status(403).json({ status: 'error', message: 'Patients can only pay for their own appointments.' });
+        return;
+      }
+      if (isAppointmentHoldExpired(targetAppt)) {
+        await ensureOverdueHoldsExpired({ force: true });
+        res.status(409).json({
+          status: 'error',
+          code: 'HOLD_EXPIRED',
+          message: 'This 10-minute booking hold has expired and the slot has been released.',
+        });
+        return;
+      }
+
+      let oracleApptBranchId: number | undefined;
+      if (live) {
+        const oracleAppts = await fetchGlobalOrdsCollection<{
+          appointment_id: number;
+          branch_id: number;
+          branch_resolution?: string;
+        }>('appointments').catch(() => []);
+        const match = oracleAppts.find((a) => Number(a.appointment_id) === apptId);
+        if (match?.branch_id) oracleApptBranchId = Number(match.branch_id);
+      }
+
+      const requestedBranchId = req.body?.branch_id ? Number(req.body.branch_id) : undefined;
+      const linkedBranchId =
+        requestedBranchId ??
+        oracleApptBranchId ??
+        store.appt_branch_map[String(apptId)]?.branch_id ??
+        store.slot_branch_map[String(targetAppt.slot_id)] ??
+        getHeadquartersBranch(store.branches)?.branch_id ??
+        1;
+      const branch =
+        store.branches.find((b) => b.branch_id === linkedBranchId) ||
+        getHeadquartersBranch(store.branches);
+      const doc = doctors.find((d) => d.doctor_id === targetAppt.doctor_id);
+      const feeInfo = getDoctorEffectiveBranchFee({
+        doctor: doc,
+        branch,
+        countries: store.countries,
+        doctorBranches: store.doctor_branches,
+        branchDepartments: store.branch_departments,
+      });
+
+      const alreadyPaid = existingPayments.find((p) => p.appointment_id === apptId && p.status === 'SUCCESS');
+      let paymentRef = alreadyPaid?.payment_ref || '';
+      if (!alreadyPaid) {
+        if (live) {
+          const globalPayRes = await postGlobalOrdsJson<{
+            status: string;
+            payment_id?: number;
+            payment_ref?: string;
+          }>('payments', {
+            appointment_id: apptId,
+            branch_id: branch?.branch_id ?? 1,
+            payment_method: paymentMethod,
+            local_currency: feeInfo.currency_code,
+            local_amount: feeInfo.local_amount,
+            base_inr_amount: feeInfo.base_inr_amount,
+            fx_rate_to_inr: feeInfo.fx_rate_to_inr,
+          });
+          paymentRef = globalPayRes.payment_ref || `PAY${Date.now()}`;
+        } else {
+          const payRes = await fetchOrdsJson<{ status?: string; message?: string; payment_ref?: string }>(
+            'payments',
+            {
+              method: 'POST',
+              body: JSON.stringify({
+                appointment_id: apptId,
+                amount: feeInfo.base_inr_amount,
+                payment_method: paymentMethod,
+                status: 'SUCCESS',
+              }),
+            },
+          );
+          if (payRes?.status === 'error') {
+            res.status(400).json({ status: 'error', message: payRes.message || 'Payment failed.' });
+            return;
+          }
+          paymentRef = payRes.payment_ref || `PAY${Date.now()}`;
+
+          const refreshedAppts = await fetchOrdsItems<Appointment>('appointments').catch(() => [] as Appointment[]);
+          const latest = refreshedAppts.find((a) => a.appointment_id === apptId);
+          if (latest && latest.status === 'HELD') {
+            await fetchOrdsJson(`appointments/${apptId}/confirm`, {
+              method: 'POST',
+              body: JSON.stringify({}),
+            });
+          }
+        }
+      }
+
+      const paidAt = new Date().toISOString();
+      saveAppointmentMetadata({
+        consultation_mode: targetAppt.consultation_mode || 'FACE_TO_FACE',
+        rescheduled_from_id: targetAppt.rescheduled_from_id ?? null,
+        appointment_ref: targetAppt.appointment_ref,
+        appointment_id: apptId,
+        patient_id: targetAppt.patient_id,
+        slot_id: targetAppt.slot_id,
+        payment_status: 'SUCCESS',
+        paid_amount: feeInfo.base_inr_amount,
+        payment_ref: paymentRef,
+        payment_method: paymentMethod,
+        paid_at: paidAt,
+        updated_at: paidAt,
+      });
+
+      const payLink: GlobalPaymentBranchLink = {
+        appointment_id: apptId,
+        branch_id: branch?.branch_id ?? 1,
+        local_currency: feeInfo.currency_code,
+        local_amount: feeInfo.local_amount,
+        base_inr_amount: feeInfo.base_inr_amount,
+        fx_rate_to_inr: feeInfo.fx_rate_to_inr,
+        created_on: paidAt,
+      };
+      store.payment_branch_map[String(apptId)] = payLink;
+      if (branch) {
+        store.appt_branch_map[String(apptId)] = {
+          branch_id: branch.branch_id,
+          consultation_mode: targetAppt.consultation_mode || 'FACE_TO_FACE',
+        };
+      }
+      writeGlobalStore(store);
+
+      res.json({
+        status: 'success',
+        appointment_id: apptId,
+        appointment_ref: targetAppt.appointment_ref,
+        appointment_status: 'CONFIRMED',
+        payment_ref: paymentRef,
+        amount: feeInfo.base_inr_amount,
+        local_currency: feeInfo.currency_code,
+        local_amount: feeInfo.local_amount,
+        branch_id: branch?.branch_id ?? 1,
+        branch_name: branch?.branch_name ?? 'Headquarters',
+        payment_method: paymentMethod,
+        message: `Paid ${feeInfo.currency_code} ${feeInfo.local_amount.toFixed(2)} and confirmed booking.`,
+      });
+    } catch (err) {
+      res.status(400).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to process branch payment.',
+      });
+    }
+  });
+
+  app.get('/api/global/payments', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    const branchIdParam = req.query.branch_id ? Number(req.query.branch_id) : null;
+    try {
+      const [{ store, live }, rawPayments] = await Promise.all([
+        syncGlobalDirectoryFromOracle(),
+        fetchOrdsItems<Payment>('payments'),
+      ]);
+      let payments = rawPayments;
+      if (user.role === 'PATIENT') {
+        const appts = await fetchOrdsItems<Appointment>('appointments');
+        const myIds = new Set(appts.filter((a) => a.patient_id === user.patient_id).map((a) => a.appointment_id));
+        payments = payments.filter((p) => myIds.has(p.appointment_id));
+      }
+
+      const mergedPayBranchMap: Record<string, GlobalPaymentBranchLink> = {
+        ...store.payment_branch_map,
+      };
+      const mergedApptBranchMap: Record<string, { branch_id: number; consultation_mode?: string }> = {
+        ...store.appt_branch_map,
+      };
+      if (live) {
+        const [oracleGlobalPays, oracleGlobalAppts] = await Promise.all([
+          fetchGlobalOrdsCollection<{
+            appointment_id: number;
+            branch_id: number;
+            local_currency: string;
+            local_amount: number;
+            base_inr_amount: number;
+            fx_rate_to_inr: number;
+            created_on?: string;
+          }>('payments').catch(() => []),
+          fetchGlobalOrdsCollection<{
+            appointment_id: number;
+            branch_id: number;
+            consultation_mode?: string;
+            branch_resolution?: string;
+          }>('appointments').catch(() => []),
+        ]);
+        for (const gp of oracleGlobalPays) {
+          if (gp.appointment_id) {
+            mergedPayBranchMap[String(gp.appointment_id)] = {
+              appointment_id: Number(gp.appointment_id),
+              branch_id: Number(gp.branch_id),
+              local_currency: gp.local_currency,
+              local_amount: Number(gp.local_amount),
+              base_inr_amount: Number(gp.base_inr_amount),
+              fx_rate_to_inr: Number(gp.fx_rate_to_inr || 1),
+              created_on: gp.created_on,
+            };
+          }
+        }
+        for (const ga of oracleGlobalAppts) {
+          if (ga.branch_resolution === 'LINKED' && ga.branch_id) {
+            mergedApptBranchMap[String(ga.appointment_id)] = {
+              branch_id: Number(ga.branch_id),
+              consultation_mode: ga.consultation_mode,
+            };
+          }
+        }
+      }
+
+      let enriched = enrichPaymentsWithBranch(
+        payments,
+        mergedPayBranchMap,
+        mergedApptBranchMap,
+        store.branches,
+        store.countries,
+      );
+      if (branchIdParam) {
+        enriched = enriched.filter((p) => p.branch_meta?.branch_id === branchIdParam);
+      }
+      res.json({ status: 'success', items: enriched });
+    } catch (err) {
+      res.status(502).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to load global payments.',
+      });
+    }
+  });
+
+  app.get('/api/global/patient-profiles', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    const { store, live } = await syncGlobalDirectoryFromOracle();
+    let list = Object.values(store.patient_profiles);
+    if (live) {
+      try {
+        const oracleProfiles = await fetchGlobalOrdsCollection<GlobalPatientProfile>('patient-profiles');
+        for (const p of oracleProfiles) {
+          store.patient_profiles[String(p.patient_id)] = {
+            ...p,
+            patient_id: Number(p.patient_id),
+            country_id: p.country_id ? Number(p.country_id) : null,
+            home_branch_id: p.home_branch_id ? Number(p.home_branch_id) : null,
+          };
+        }
+        writeGlobalStore(store);
+        list = Object.values(store.patient_profiles);
+      } catch {
+        // Fallback to local profiles
+      }
+    }
+    if (user.role === 'PATIENT') {
+      res.json({
+        status: 'success',
+        items: list.filter((p) => p.patient_id === user.patient_id),
+      });
+      return;
+    }
+    res.json({ status: 'success', items: list });
+  });
+
+  app.post('/api/global/patient-profiles', requireAuth, async (req, res) => {
+    const user = (req as Request & { authUser: AuthUser }).authUser;
+    const patientId =
+      user.role === 'PATIENT' ? Number(user.patient_id || req.body?.patient_id) : Number(req.body?.patient_id);
+    if (!patientId) {
+      res.status(400).json({ status: 'error', message: 'patient_id is required.' });
+      return;
+    }
+    if (
+      user.role !== 'PATIENT' &&
+      !requireAnyPermission(user, res, ['PATIENTS:CREATE', 'PATIENTS:UPDATE'], 'Global Patient Profile')
+    ) {
+      return;
+    }
+    const { store, live } = await syncGlobalDirectoryFromOracle();
+    const countryId = req.body?.country_id ? Number(req.body.country_id) : null;
+    const homeBranchId = req.body?.home_branch_id ? Number(req.body.home_branch_id) : null;
+    const country = countryId ? store.countries.find((c) => c.country_id === countryId) : undefined;
+    const branch = homeBranchId ? store.branches.find((b) => b.branch_id === homeBranchId) : undefined;
+    const profile: GlobalPatientProfile = {
+      patient_id: patientId,
+      country_id: country?.country_id ?? countryId,
+      country_code: country?.country_code ?? null,
+      country_name: country?.country_name ?? null,
+      home_branch_id: branch?.branch_id ?? homeBranchId,
+      branch_name: branch?.branch_name ?? null,
+      city: req.body?.city ? String(req.body.city).trim() : null,
+      address_line: req.body?.address_line ? String(req.body.address_line).trim() : null,
+      postal_code: req.body?.postal_code ? String(req.body.postal_code).trim() : null,
+      preferred_currency: branch?.currency_code ?? country?.currency_code ?? null,
+      updated_on: new Date().toISOString(),
+    };
+
+    if (live) {
+      try {
+        await postGlobalOrdsJson('patient-profiles', {
+          patient_id: profile.patient_id,
+          country_id: profile.country_id,
+          home_branch_id: profile.home_branch_id,
+          city: profile.city,
+          address_line: profile.address_line,
+          postal_code: profile.postal_code,
+          preferred_currency: profile.preferred_currency,
+        });
+      } catch (err) {
+        res.status(400).json({
+          status: 'error',
+          message: err instanceof Error ? err.message : 'Unable to save patient profile in Oracle.',
+        });
+        return;
+      }
+    }
+
+    store.patient_profiles[String(patientId)] = profile;
+    writeGlobalStore(store);
+    res.json({ status: 'success', profile });
+  });
+
+  app.get('/api/global/utilisation', requireAuth, async (_req, res) => {
+    try {
+      const { store, live } = await syncGlobalDirectoryFromOracle();
+      if (live) {
+        const oracleUtil = await fetchGlobalOrdsCollection<GlobalBranchUtilisationRow>(
+          'reports/branch-utilisation',
+        );
+        const branchById = new Map(store.branches.map((b) => [b.branch_id, b]));
+        const items: GlobalBranchUtilisationRow[] = oracleUtil.map((row) => {
+          const bId = Number(row.branch_id);
+          const branch = branchById.get(bId);
+          return {
+            branch_id: bId,
+            branch_code: String(row.branch_code || branch?.branch_code || ''),
+            branch_name: String(row.branch_name || branch?.branch_name || ''),
+            city: String(row.city || branch?.city || ''),
+            country_code: String(row.country_code || branch?.country_code || ''),
+            country_name: String(row.country_name || branch?.country_name || ''),
+            timezone_iana: String(row.timezone_iana || branch?.timezone_iana || 'UTC'),
+            currency_code: String(row.currency_code || branch?.currency_code || 'INR'),
+            currency_symbol: normalizeGlobalCurrencySymbol(
+              row.currency_code || branch?.currency_code,
+              row.currency_symbol || branch?.currency_symbol,
+            ),
+            total_slots: Number(row.total_slots || 0),
+            booked_slots: Number(row.booked_slots || 0),
+            total_appointments: Number(row.total_appointments || 0),
+            confirmed_appointments: Number(row.confirmed_appointments || 0),
+            completed_appointments: Number(row.completed_appointments || 0),
+            total_local_revenue: Number(row.total_local_revenue || 0),
+            total_inr_revenue: Number(row.total_inr_revenue || 0),
+            active_doctors: store.doctor_branches.filter(
+              (db) => db.branch_id === bId && db.is_active === 'Y',
+            ).length,
+            specialized_departments: store.branch_departments.filter(
+              (bd) => bd.branch_id === bId && bd.is_active === 'Y' && bd.is_specialized === 'Y',
+            ).length,
+          };
+        });
+        res.json({ status: 'success', items });
+        return;
+      }
+
+      const [rawSlots, rawAppts, rawPayments, templates] = await Promise.all([
+        fetchOrdsItems<Slot>('slots').catch(() => [] as Slot[]),
+        fetchOrdsItems<Appointment>('appointments').catch(() => [] as Appointment[]),
+        fetchOrdsItems<Payment>('payments').catch(() => [] as Payment[]),
+        fetchSlotTemplatesSafe(),
+      ]);
+      const shiftStore = readShiftStore();
+      const slotsWithDoc = attachDoctorIdsToSlots(rawSlots, templates, shiftStore);
+      const enrichedSlots = enrichSlotsWithBranch(
+        slotsWithDoc,
+        store.slot_branch_map,
+        store.branches,
+        store.countries,
+      );
+      const enrichedAppts = enrichAppointmentsWithBranch(
+        rawAppts,
+        store.appt_branch_map,
+        store.slot_branch_map,
+        store.payment_branch_map,
+        store.branches,
+        store.countries,
+      );
+      const enrichedPays = enrichPaymentsWithBranch(
+        rawPayments,
+        store.payment_branch_map,
+        store.appt_branch_map,
+        store.branches,
+        store.countries,
+      );
+      const rows = computeBranchUtilisation({
+        branches: store.branches,
+        countries: store.countries,
+        slots: enrichedSlots,
+        appointments: enrichedAppts,
+        payments: enrichedPays,
+        doctorBranches: store.doctor_branches,
+        branchDepartments: store.branch_departments,
+      });
+      res.json({ status: 'success', items: rows });
+    } catch (err) {
+      res.status(502).json({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to compute global branch utilization.',
+      });
+    }
+  });
+
   // ============================================================================
   // FULL-APPLICATION HYBRID (OIC + ORDS) / OIC / ORDS BACKEND TOGGLE & PROBE
   // ============================================================================

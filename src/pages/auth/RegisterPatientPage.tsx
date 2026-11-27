@@ -4,6 +4,7 @@ import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
 import { RegionFields } from '../../components/common/RegionFields';
 import { apiClient } from '../../services/apiClient';
+import type { GlobalBranch, GlobalCountry } from '../../types/opd';
 
 interface RegisterPatientPageProps {
   onSwitchToLogin: () => void;
@@ -30,6 +31,10 @@ export function RegisterPatientPage({
   const [gender, setGender] = useState<'MALE' | 'FEMALE' | 'OTHER' | ''>('');
   const [bloodGroup, setBloodGroup] = useState('');
   const [password, setPassword] = useState('');
+  const [globalCountries, setGlobalCountries] = useState<GlobalCountry[]>([]);
+  const [globalBranches, setGlobalBranches] = useState<GlobalBranch[]>([]);
+  const [selectedCountryId, setSelectedCountryId] = useState<string>('1');
+  const [homeBranchId, setHomeBranchId] = useState<string>('1');
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -39,6 +44,20 @@ export function RegisterPatientPage({
       .then((res) => {
         setAllowRegistration(res.allow_patient_registration);
         setMinPasswordLen(Math.max(6, Number(res.min_password_length || 6)));
+      })
+      .catch(() => null);
+    apiClient
+      .getPublicGlobalContext()
+      .then((res) => {
+        const activeC = (res.countries || []).filter((c) => c.is_active === 'Y');
+        const activeB = (res.branches || []).filter((b) => b.is_active === 'Y');
+        setGlobalCountries(activeC);
+        setGlobalBranches(activeB);
+        const hq = activeB.find((b) => b.branch_id === res.headquarters_branch_id) || activeB[0];
+        if (hq) {
+          setSelectedCountryId(String(hq.country_id));
+          setHomeBranchId(String(hq.branch_id));
+        }
       })
       .catch(() => null);
   }, []);
@@ -81,6 +100,17 @@ export function RegisterPatientPage({
         blood_group: bloodGroup.trim() || undefined,
         password,
       });
+      if (user.patient_id) {
+        await apiClient
+          .saveGlobalPatientProfile({
+            patient_id: user.patient_id,
+            country_id: selectedCountryId ? Number(selectedCountryId) : null,
+            home_branch_id: homeBranchId ? Number(homeBranchId) : null,
+            city: city.trim(),
+            address_line: locality.trim(),
+          })
+          .catch(() => null);
+      }
       notify(`Welcome, ${user.full_name}. Your patient record is registered.`, 'success');
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Unable to register patient');
@@ -248,6 +278,54 @@ export function RegisterPatientPage({
                   onCityChange={setCity}
                   onLocalityChange={setLocality}
                 />
+
+                {globalCountries.length > 0 && (
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <div>
+                      <label htmlFor="reg-country" className="block text-sm font-medium text-slate-700">
+                        Country
+                      </label>
+                      <select
+                        id="reg-country"
+                        value={selectedCountryId}
+                        onChange={(e) => {
+                          const cid = e.target.value;
+                          setSelectedCountryId(cid);
+                          const matchBranch = globalBranches.find(
+                            (b) => String(b.country_id) === cid,
+                          );
+                          if (matchBranch) setHomeBranchId(String(matchBranch.branch_id));
+                        }}
+                        className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
+                      >
+                        {globalCountries.map((c) => (
+                          <option key={c.country_id} value={String(c.country_id)}>
+                            {c.country_name} ({c.currency_code})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label htmlFor="reg-branch" className="block text-sm font-medium text-slate-700">
+                        Preferred Hospital Branch
+                      </label>
+                      <select
+                        id="reg-branch"
+                        value={homeBranchId}
+                        onChange={(e) => setHomeBranchId(e.target.value)}
+                        className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
+                      >
+                        {globalBranches
+                          .filter((b) => !selectedCountryId || String(b.country_id) === selectedCountryId)
+                          .map((b) => (
+                            <option key={b.branch_id} value={String(b.branch_id)}>
+                              {b.branch_name} ({b.city})
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+                  </div>
+                )}
 
                 <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
                   <div>

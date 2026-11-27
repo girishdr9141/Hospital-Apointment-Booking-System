@@ -1,24 +1,34 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Download, Plus } from 'lucide-react';
-import type { Appointment, Payment } from '../../types/opd';
+import type { Appointment, GlobalBranchMetadata, Payment } from '../../types/opd';
 import { apiClient, isEndpointNotDeployedError } from '../../services/apiClient';
 import { useAuth } from '../../context/AuthContext';
+import { useBranchContext } from '../../context/BranchContext';
 import { useToast } from '../../context/ToastContext';
 import { hasModulePermission } from '../../utils/permissions';
 import { buildCsvString, downloadCsvFile } from '../../utils/csv';
+import { formatBranchCurrency } from '../../utils/globalBranch';
 import { formatCurrencyInr, formatDisplayDateTime } from '../../utils/rules';
 import { formatRefundRemaining, isRefundCompletionDue } from '../../utils/refunds';
 import { DataTable, type DataColumn } from '../../components/common/DataTable';
 import { Modal } from '../../components/common/Modal';
 import { StatusIndicator } from '../../components/layout/StatusIndicator';
 
+type PaymentWithBranch = Payment & {
+  branch_meta?: GlobalBranchMetadata | null;
+  local_currency?: string | null;
+  local_amount?: number | null;
+  fx_rate_to_inr?: number | null;
+};
+
 export function PaymentsPage() {
   const { user } = useAuth();
   const { notify } = useToast();
+  const { selectedBranchId, activeBranch, headquartersBranch } = useBranchContext();
   const canRecord = hasModulePermission(user, 'PAYMENTS', 'CREATE');
   const canExport = hasModulePermission(user, 'PAYMENTS', 'EXPORT');
 
-  const [payments, setPayments] = useState<Payment[]>([]);
+  const [payments, setPayments] = useState<PaymentWithBranch[]>([]);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
@@ -37,12 +47,12 @@ export function PaymentsPage() {
     setLoading(true);
     try {
       const [payList, apptList] = await Promise.all([
-        apiClient.getPayments(),
+        apiClient.getGlobalPayments().catch(() => apiClient.getPayments()),
         canRecord
-          ? apiClient.getAppointments().catch(() => [] as Appointment[])
+          ? apiClient.getGlobalAppointments().catch(() => apiClient.getAppointments().catch(() => [] as Appointment[]))
           : Promise.resolve([] as Appointment[]),
       ]);
-      setPayments(payList);
+      setPayments(payList as PaymentWithBranch[]);
       setAppointments(apptList);
       if (apptList[0] && !appointmentId) {
         setAppointmentId(String(apptList[0].appointment_id));
@@ -107,18 +117,24 @@ export function PaymentsPage() {
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
+    const hqId = headquartersBranch?.branch_id ?? 1;
     return payments.filter((p) => {
+      if (selectedBranchId !== 'ALL') {
+        const payBranchId = p.branch_meta?.branch_id ?? hqId;
+        if (payBranchId !== selectedBranchId) return false;
+      }
       if (statusFilter !== 'ALL' && p.status !== statusFilter) return false;
       if (!q) return true;
       return (
         p.payment_ref.toLowerCase().includes(q) ||
         p.appointment_ref.toLowerCase().includes(q) ||
-        (p.payment_method || '').toLowerCase().includes(q)
+        (p.payment_method || '').toLowerCase().includes(q) ||
+        (p.branch_meta?.branch_name || '').toLowerCase().includes(q)
       );
     });
-  }, [payments, statusFilter, search]);
+  }, [payments, selectedBranchId, headquartersBranch?.branch_id, statusFilter, search]);
 
-  const columns: DataColumn<Payment>[] = [
+  const columns: DataColumn<PaymentWithBranch>[] = [
     {
       key: 'pay_ref',
       header: 'Payment Ref',
@@ -138,6 +154,22 @@ export function PaymentsPage() {
       ),
     },
     {
+      key: 'branch',
+      header: 'Branch',
+      render: (row) => (
+        <div>
+          <p className="text-xs font-medium text-slate-900">
+            {row.branch_meta?.branch_name || 'Headquarters'}
+          </p>
+          <p className="text-[11px] text-slate-500">
+            {row.branch_meta
+              ? `${row.branch_meta.city}, ${row.branch_meta.country_code}`
+              : 'Bengaluru, IN'}
+          </p>
+        </div>
+      ),
+    },
+    {
       key: 'method',
       header: 'Method',
       render: (row) => <span className="text-slate-700">{row.payment_method || '—'}</span>,
@@ -146,11 +178,24 @@ export function PaymentsPage() {
       key: 'amount',
       header: 'Amount',
       align: 'right',
-      render: (row) => (
-        <span className="font-mono text-xs font-semibold text-slate-900 tabular-nums">
-          {formatCurrencyInr(row.amount)}
-        </span>
-      ),
+      render: (row) => {
+        const localCurr = (row.local_currency || row.branch_meta?.currency_code || 'INR').toUpperCase();
+        const showLocal = localCurr !== 'INR' && row.local_amount != null;
+        return (
+          <div className="text-right">
+            <span className="font-mono text-xs font-semibold text-slate-900 tabular-nums">
+              {showLocal
+                ? formatBranchCurrency(row.local_amount, localCurr)
+                : formatCurrencyInr(row.amount)}
+            </span>
+            {showLocal && (
+              <p className="font-mono text-[10px] text-slate-500 tabular-nums">
+                {formatCurrencyInr(row.amount)}
+              </p>
+            )}
+          </div>
+        );
+      },
     },
     {
       key: 'status',
@@ -194,7 +239,9 @@ export function PaymentsPage() {
         <div>
           <h2 className="text-xl font-semibold text-slate-900">Payments &amp; Receipts</h2>
           <p className="mt-0.5 text-sm text-slate-600">
-            Consultation fee records and transaction statuses stored in Oracle GIRISH_PAYMENTS.
+            {activeBranch
+              ? `${activeBranch.branch_name} (${activeBranch.currency_code}) · Consultation fee records stored in Oracle GIRISH_PAYMENTS.`
+              : 'Consultation fee records and multi-currency branch receipts stored in Oracle GIRISH_PAYMENTS.'}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 shrink-0">
@@ -203,10 +250,23 @@ export function PaymentsPage() {
               type="button"
               onClick={() => {
                 const csv = buildCsvString(
-                  ['Payment Ref', 'Appointment Ref', 'Method', 'Amount INR', 'Status', 'Recorded On'],
+                  [
+                    'Payment Ref',
+                    'Appointment Ref',
+                    'Branch',
+                    'Local Currency',
+                    'Local Amount',
+                    'Method',
+                    'Amount INR',
+                    'Status',
+                    'Recorded On',
+                  ],
                   filtered.map((p) => [
                     p.payment_ref,
                     p.appointment_ref,
+                    p.branch_meta?.branch_name || 'Headquarters',
+                    p.local_currency || 'INR',
+                    p.local_amount ?? p.amount,
                     p.payment_method || '',
                     p.amount,
                     p.status,
@@ -242,7 +302,7 @@ export function PaymentsPage() {
         loading={loading}
         searchValue={search}
         onSearchChange={setSearch}
-        searchPlaceholder="Search payment ref or appointment ref..."
+        searchPlaceholder="Search payment ref, appointment ref, or branch..."
         filters={
           <select
             aria-label="Filter by payment status"

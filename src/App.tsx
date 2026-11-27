@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, Bell, CalendarPlus, CheckCheck, ChevronRight, ClipboardCheck } from 'lucide-react';
 import { AuthProvider, useAuth } from './context/AuthContext';
+import { BranchProvider } from './context/BranchContext';
 import { ToastProvider, useToast } from './context/ToastContext';
 import type { DashboardSummaryResponse, PortalNotification, RoleName, RouteKey } from './types/opd';
 import { canAccessRoute } from './utils/permissions';
@@ -49,12 +50,14 @@ import { SecuritySettingsPage } from './pages/modules/SecuritySettingsPage';
 import { LogsPage } from './pages/modules/LogsPage';
 import { ProfilePage } from './pages/modules/ProfilePage';
 import { AnalyticsPage } from './pages/modules/AnalyticsPage';
+import { BranchesPage } from './pages/modules/BranchesPage';
 import { DoctorShiftModal } from './components/modals/DoctorShiftModal';
 import { DoctorOutcomePromptModal } from './components/modals/DoctorOutcomePromptModal';
 
 const VALID_ROUTES: RouteKey[] = [
   'dashboard',
   'analytics',
+  'branches',
   'patients',
   'register-patient',
   'doctors',
@@ -513,6 +516,8 @@ function PortalContent() {
         return renderDashboard();
       case 'analytics':
         return <AnalyticsPage />;
+      case 'branches':
+        return <BranchesPage />;
       case 'patients':
         return <PatientsPage key="patients" mode="directory" />;
       case 'register-patient':
@@ -792,7 +797,9 @@ export default function App() {
   return (
     <ToastProvider>
       <AuthProvider>
-        <PortalContent />
+        <BranchProvider>
+          <PortalContent />
+        </BranchProvider>
       </AuthProvider>
     </ToastProvider>
   );

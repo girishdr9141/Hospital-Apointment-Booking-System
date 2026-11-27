@@ -13,6 +13,13 @@ import type {
   DoctorLeave,
   DoctorShiftConfig,
   ErrorLogRecord,
+  GlobalBranch,
+  GlobalBranchDepartment,
+  GlobalBranchUtilisationRow,
+  GlobalContextPayload,
+  GlobalCountry,
+  GlobalDoctorBranch,
+  GlobalPatientProfile,
   ManagedUserRecord,
   MedicalRecordEntry,
   ModuleDefinition,
@@ -891,4 +898,206 @@ export const apiClient = {
       `/api/clinical/prescriptions/${encodeURIComponent(id)}`,
       { method: 'DELETE' },
     ),
+
+  // Global CarePulse Sidecar APIs (/api/global/*)
+  getPublicGlobalContext: () =>
+    requestJson<{
+      status: string;
+      headquarters_branch_id: number;
+      countries: GlobalCountry[];
+      branches: GlobalBranch[];
+    }>('/api/global/public-context'),
+  getGlobalContext: () => requestJson<GlobalContextPayload>('/api/global/context'),
+  saveGlobalCountry: (payload: {
+    country_code: string;
+    country_name: string;
+    currency_code: string;
+    currency_symbol?: string;
+    phone_dial_code?: string;
+    default_timezone?: string;
+    fx_rate_to_inr: number;
+    is_active?: 'Y' | 'N';
+  }) =>
+    requestJson<{ status: string; country: GlobalCountry }>('/api/global/countries', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  createGlobalBranch: (payload: {
+    country_id: number;
+    branch_code: string;
+    branch_name: string;
+    city: string;
+    address_line?: string;
+    postal_code?: string;
+    phone?: string;
+    email?: string;
+    timezone_iana?: string;
+    currency_code?: string;
+  }) =>
+    requestJson<{ status: string; branch: GlobalBranch }>('/api/global/branches', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  updateGlobalBranch: (
+    branchId: number,
+    payload: Partial<Pick<GlobalBranch, 'branch_name' | 'city' | 'address_line' | 'phone' | 'email' | 'timezone_iana' | 'is_active'>>,
+  ) =>
+    requestJson<{ status: string; branch: GlobalBranch }>(`/api/global/branches/${branchId}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  assignBranchDepartment: (payload: {
+    branch_id: number;
+    department_id: number;
+    is_specialized?: 'Y' | 'N';
+    local_consultation_fee?: number | null;
+    is_active?: 'Y' | 'N';
+  }) =>
+    requestJson<{ status: string; mapping: GlobalBranchDepartment }>('/api/global/branch-departments', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  assignDoctorBranch: (payload: {
+    doctor_id: number;
+    branch_id: number;
+    is_primary_branch?: 'Y' | 'N';
+    local_consultation_fee?: number | null;
+    is_active?: 'Y' | 'N';
+  }) =>
+    requestJson<{ status: string; mapping: GlobalDoctorBranch }>('/api/global/doctor-branches', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  getGlobalSlots: async (branchId?: number | null) => {
+    const q = branchId ? `?branch_id=${branchId}` : '';
+    const data = await requestJson<{ items: Array<Slot & { branch_meta?: unknown }> }>(
+      `/api/global/slots${q}`,
+    );
+    return data.items || [];
+  },
+  createGlobalSlot: (payload: {
+    doctor_id: number;
+    branch_id: number;
+    slot_date: string;
+    start_time: string;
+    end_time: string;
+    max_patients_per_slot?: number;
+  }) =>
+    requestJson<{ status: string; slot_id: number | null; branch_id: number; branch_code: string }>(
+      '/api/global/slots',
+      { method: 'POST', body: JSON.stringify(payload) },
+    ),
+  getGlobalAppointments: async (branchId?: number | null) => {
+    const q = branchId ? `?branch_id=${branchId}` : '';
+    const data = await requestJson<{
+      items: Array<
+        Appointment & {
+          branch_meta?: {
+            branch_id: number;
+            branch_code: string;
+            branch_name: string;
+            city: string;
+            country_code: string;
+            country_name: string;
+            timezone_iana: string;
+            currency_code: string;
+            currency_symbol: string;
+            fx_rate_to_inr: number;
+            is_headquarters: boolean;
+            resolution: 'LINKED' | 'HQ_DEFAULT';
+          } | null;
+          local_currency?: string | null;
+          local_amount?: number | null;
+        }
+      >;
+    }>(`/api/global/appointments${q}`);
+    return data.items || [];
+  },
+  bookGlobalAppointment: (payload: {
+    patient_id: number;
+    slot_id: number;
+    branch_id: number;
+    booking_source: 'ONLINE' | 'WALK_IN';
+    consultation_mode: ConsultationMode;
+  }) =>
+    requestJson<{
+      status: string;
+      appointment_id: number | null;
+      appointment_ref: string | null;
+      branch_id: number;
+      branch_code: string;
+      branch_name: string;
+      currency_code: string;
+    }>('/api/global/appointments', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  payAndConfirmGlobalAppointment: (
+    appointmentId: number,
+    payload: { payment_method: 'UPI' | 'CARD' | 'NET_BANKING' | 'CASH'; branch_id?: number },
+  ) =>
+    requestJson<{
+      status: string;
+      appointment_id: number;
+      appointment_ref: string;
+      appointment_status: 'CONFIRMED';
+      payment_ref: string;
+      amount: number;
+      local_currency: string;
+      local_amount: number;
+      branch_id: number;
+      branch_name: string;
+      payment_method: string;
+      message: string;
+    }>(`/api/global/appointments/${appointmentId}/pay-and-confirm`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  getGlobalPayments: async (branchId?: number | null) => {
+    const q = branchId ? `?branch_id=${branchId}` : '';
+    const data = await requestJson<{
+      items: Array<
+        Payment & {
+          branch_meta?: {
+            branch_id: number;
+            branch_code: string;
+            branch_name: string;
+            city: string;
+            country_code: string;
+            country_name: string;
+            timezone_iana: string;
+            currency_code: string;
+            currency_symbol: string;
+            fx_rate_to_inr: number;
+            is_headquarters: boolean;
+            resolution: 'LINKED' | 'HQ_DEFAULT';
+          } | null;
+          local_currency?: string | null;
+          local_amount?: number | null;
+          fx_rate_to_inr?: number | null;
+        }
+      >;
+    }>(`/api/global/payments${q}`);
+    return data.items || [];
+  },
+  getGlobalPatientProfiles: async () => {
+    const data = await requestJson<{ items: GlobalPatientProfile[] }>('/api/global/patient-profiles');
+    return data.items || [];
+  },
+  saveGlobalPatientProfile: (payload: {
+    patient_id: number;
+    country_id?: number | null;
+    home_branch_id?: number | null;
+    city?: string | null;
+    address_line?: string | null;
+    postal_code?: string | null;
+  }) =>
+    requestJson<{ status: string; profile: GlobalPatientProfile }>('/api/global/patient-profiles', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  getGlobalBranchUtilisation: async () => {
+    const data = await requestJson<{ items: GlobalBranchUtilisationRow[] }>('/api/global/utilisation');
+    return data.items || [];
+  },
 };

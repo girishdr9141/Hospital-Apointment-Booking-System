@@ -10,6 +10,11 @@ const MODULE_META: Record<
     summary: 'Explore annual OPD consultation trends, top doctors, departments, and patient regions.',
     oracleObjects: 'GET /api/analytics · Historical Seed + Oracle ORDS',
   },
+  branches: {
+    title: 'Global CarePulse Branches & Network',
+    summary: 'Manage countries, international hospital branches, branch specializations, and doctor branch assignments.',
+    oracleObjects: 'GBR_COUNTRIES · GBR_BRANCHES · girish_global_api',
+  },
   patients: {
     title: 'Patient Directory & Records',
     summary: 'Search, register, update patient demographics, and inspect appointment history.',

@@ -549,7 +549,131 @@ export type RouteKey =
   | 'audit-logs'
   | 'security-settings'
   | 'error-logs'
+  | 'branches'
   | 'profile';
+
+export interface GlobalCountry {
+  country_id: number;
+  country_code: string;
+  country_name: string;
+  currency_code: string;
+  currency_symbol: string;
+  phone_dial_code: string;
+  default_timezone: string;
+  fx_rate_to_inr: number;
+  is_active: 'Y' | 'N';
+}
+
+export interface GlobalBranch {
+  branch_id: number;
+  country_id: number;
+  country_code: string;
+  country_name: string;
+  currency_symbol?: string;
+  fx_rate_to_inr?: number;
+  branch_code: string;
+  branch_name: string;
+  city: string;
+  address_line?: string | null;
+  postal_code?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  timezone_iana: string;
+  currency_code: string;
+  is_headquarters: 'Y' | 'N';
+  is_active: 'Y' | 'N';
+}
+
+export interface GlobalBranchDepartment {
+  branch_dept_id?: number;
+  branch_id: number;
+  department_id: number;
+  department_name?: string;
+  is_specialized: 'Y' | 'N';
+  local_consultation_fee?: number | null;
+  is_active: 'Y' | 'N';
+}
+
+export interface GlobalDoctorBranch {
+  doc_branch_id?: number;
+  doctor_id: number;
+  doctor_name?: string;
+  branch_id: number;
+  is_primary_branch: 'Y' | 'N';
+  local_consultation_fee?: number | null;
+  is_active: 'Y' | 'N';
+}
+
+export interface GlobalPatientProfile {
+  patient_id: number;
+  country_id?: number | null;
+  country_code?: string | null;
+  country_name?: string | null;
+  home_branch_id?: number | null;
+  branch_name?: string | null;
+  city?: string | null;
+  address_line?: string | null;
+  postal_code?: string | null;
+  preferred_currency?: string | null;
+  updated_on?: string;
+}
+
+export interface GlobalPaymentBranchLink {
+  payment_id?: number;
+  appointment_id: number;
+  branch_id: number;
+  local_currency: string;
+  local_amount: number;
+  base_inr_amount: number;
+  fx_rate_to_inr: number;
+  created_on?: string;
+}
+
+export interface GlobalBranchMetadata {
+  branch_id: number;
+  branch_code: string;
+  branch_name: string;
+  city: string;
+  country_code: string;
+  country_name: string;
+  timezone_iana: string;
+  currency_code: string;
+  currency_symbol: string;
+  fx_rate_to_inr: number;
+  is_headquarters: boolean;
+  resolution: 'LINKED' | 'HQ_DEFAULT';
+}
+
+export interface GlobalBranchUtilisationRow {
+  branch_id: number;
+  branch_code: string;
+  branch_name: string;
+  city: string;
+  country_code: string;
+  country_name: string;
+  timezone_iana: string;
+  currency_code: string;
+  currency_symbol: string;
+  total_slots: number;
+  booked_slots: number;
+  total_appointments: number;
+  confirmed_appointments: number;
+  completed_appointments: number;
+  total_local_revenue: number;
+  total_inr_revenue: number;
+  active_doctors: number;
+  specialized_departments: number;
+}
+
+export interface GlobalContextPayload {
+  status: 'success';
+  global_ords_live: boolean;
+  headquarters_branch_id: number;
+  countries: GlobalCountry[];
+  branches: GlobalBranch[];
+  branch_departments: GlobalBranchDepartment[];
+  doctor_branches: GlobalDoctorBranch[];
+}
 
 export interface NavItem {
   key: RouteKey;

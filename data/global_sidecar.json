@@ -1,0 +1,308 @@
+{
+  "countries": [
+    {
+      "country_id": 5,
+      "country_code": "IN",
+      "country_name": "India",
+      "currency_code": "INR",
+      "currency_symbol": "₹",
+      "phone_dial_code": "+91",
+      "default_timezone": "Asia/Kolkata",
+      "fx_rate_to_inr": 1,
+      "is_active": "Y"
+    },
+    {
+      "country_id": 2,
+      "country_code": "SG",
+      "country_name": "Singapore",
+      "currency_code": "SGD",
+      "currency_symbol": "S$",
+      "phone_dial_code": "+65",
+      "default_timezone": "Asia/Singapore",
+      "fx_rate_to_inr": 62.5,
+      "is_active": "Y"
+    },
+    {
+      "country_id": 1,
+      "country_code": "AE",
+      "country_name": "United Arab Emirates",
+      "currency_code": "AED",
+      "currency_symbol": "AED",
+      "phone_dial_code": "+971",
+      "default_timezone": "Asia/Dubai",
+      "fx_rate_to_inr": 22.85,
+      "is_active": "Y"
+    },
+    {
+      "country_id": 4,
+      "country_code": "GB",
+      "country_name": "United Kingdom",
+      "currency_code": "GBP",
+      "currency_symbol": "£",
+      "phone_dial_code": "+44",
+      "default_timezone": "Europe/London",
+      "fx_rate_to_inr": 106.4,
+      "is_active": "Y"
+    },
+    {
+      "country_id": 3,
+      "country_code": "US",
+      "country_name": "United States",
+      "currency_code": "USD",
+      "currency_symbol": "$",
+      "phone_dial_code": "+1",
+      "default_timezone": "America/New_York",
+      "fx_rate_to_inr": 84.1,
+      "is_active": "Y"
+    }
+  ],
+  "branches": [
+    {
+      "branch_id": 2,
+      "country_id": 5,
+      "country_code": "IN",
+      "country_name": "India",
+      "currency_symbol": "₹",
+      "fx_rate_to_inr": 1,
+      "branch_code": "IN-BLR-HQ",
+      "branch_name": "CarePulse Bengaluru Headquarters",
+      "city": "Bengaluru",
+      "address_line": "12 MG Road, Indiranagar",
+      "postal_code": "560038",
+      "phone": "+91-80-4000-1000",
+      "email": "hq-blr@carepulse.global",
+      "timezone_iana": "Asia/Kolkata",
+      "currency_code": "INR",
+      "is_headquarters": "Y",
+      "is_active": "Y"
+    },
+    {
+      "branch_id": 1,
+      "country_id": 2,
+      "country_code": "SG",
+      "country_name": "Singapore",
+      "currency_symbol": "S$",
+      "fx_rate_to_inr": 62.5,
+      "branch_code": "SG-ORC-01",
+      "branch_name": "CarePulse Singapore Orchard",
+      "city": "Singapore",
+      "address_line": "290 Orchard Road, Paragon Medical",
+      "postal_code": "238859",
+      "phone": "+65-6500-3300",
+      "email": "singapore@carepulse.global",
+      "timezone_iana": "Asia/Singapore",
+      "currency_code": "SGD",
+      "is_headquarters": "N",
+      "is_active": "Y"
+    },
+    {
+      "branch_id": 3,
+      "country_id": 1,
+      "country_code": "AE",
+      "country_name": "United Arab Emirates",
+      "currency_symbol": "AED",
+      "fx_rate_to_inr": 22.85,
+      "branch_code": "AE-DXB-01",
+      "branch_name": "CarePulse Dubai Healthcare City",
+      "city": "Dubai",
+      "address_line": "Building 64, Al Razi Medical Complex",
+      "postal_code": "505001",
+      "phone": "+971-4-500-2200",
+      "email": "dubai@carepulse.global",
+      "timezone_iana": "Asia/Dubai",
+      "currency_code": "AED",
+      "is_headquarters": "N",
+      "is_active": "Y"
+    },
+    {
+      "branch_id": 4,
+      "country_id": 4,
+      "country_code": "GB",
+      "country_name": "United Kingdom",
+      "currency_symbol": "£",
+      "fx_rate_to_inr": 106.4,
+      "branch_code": "GB-LON-01",
+      "branch_name": "CarePulse London Harley Street",
+      "city": "London",
+      "address_line": "88 Harley Street, Marylebone",
+      "postal_code": "W1G 7HR",
+      "phone": "+44-20-7946-0911",
+      "email": "london@carepulse.global",
+      "timezone_iana": "Europe/London",
+      "currency_code": "GBP",
+      "is_headquarters": "N",
+      "is_active": "Y"
+    },
+    {
+      "branch_id": 5,
+      "country_id": 3,
+      "country_code": "US",
+      "country_name": "United States",
+      "currency_symbol": "$",
+      "fx_rate_to_inr": 84.1,
+      "branch_code": "US-NYC-01",
+      "branch_name": "CarePulse New York Midtown",
+      "city": "New York",
+      "address_line": "535 Madison Avenue, Suite 400",
+      "postal_code": "10022",
+      "phone": "+1-212-555-0190",
+      "email": "nyc@carepulse.global",
+      "timezone_iana": "America/New_York",
+      "currency_code": "USD",
+      "is_headquarters": "N",
+      "is_active": "Y"
+    }
+  ],
+  "branch_departments": [
+    {
+      "branch_dept_id": 3,
+      "branch_id": 2,
+      "department_id": 3,
+      "department_name": "Dermatology",
+      "is_specialized": "N",
+      "local_consultation_fee": null,
+      "is_active": "Y"
+    },
+    {
+      "branch_dept_id": 4,
+      "branch_id": 2,
+      "department_id": 4,
+      "department_name": "General Medicine",
+      "is_specialized": "N",
+      "local_consultation_fee": null,
+      "is_active": "Y"
+    },
+    {
+      "branch_dept_id": 6,
+      "branch_id": 2,
+      "department_id": 21,
+      "department_name": "Neurology",
+      "is_specialized": "N",
+      "local_consultation_fee": null,
+      "is_active": "Y"
+    },
+    {
+      "branch_dept_id": 2,
+      "branch_id": 2,
+      "department_id": 2,
+      "department_name": "Orthopedics",
+      "is_specialized": "N",
+      "local_consultation_fee": null,
+      "is_active": "Y"
+    },
+    {
+      "branch_dept_id": 5,
+      "branch_id": 2,
+      "department_id": 5,
+      "department_name": "Pediatrics",
+      "is_specialized": "N",
+      "local_consultation_fee": null,
+      "is_active": "Y"
+    },
+    {
+      "branch_dept_id": 1,
+      "branch_id": 2,
+      "department_id": 81,
+      "department_name": "Radiology",
+      "is_specialized": "N",
+      "local_consultation_fee": null,
+      "is_active": "Y"
+    }
+  ],
+  "doctor_branches": [
+    {
+      "doc_branch_id": 3,
+      "doctor_id": 2,
+      "doctor_name": "Priya Sharma",
+      "branch_id": 2,
+      "is_primary_branch": "Y",
+      "local_consultation_fee": 600,
+      "is_active": "Y"
+    },
+    {
+      "doc_branch_id": 4,
+      "doctor_id": 3,
+      "doctor_name": "Anil Mehta",
+      "branch_id": 2,
+      "is_primary_branch": "Y",
+      "local_consultation_fee": 450,
+      "is_active": "Y"
+    },
+    {
+      "doc_branch_id": 5,
+      "doctor_id": 4,
+      "doctor_name": "Sneha Patel",
+      "branch_id": 2,
+      "is_primary_branch": "Y",
+      "local_consultation_fee": 400,
+      "is_active": "Y"
+    },
+    {
+      "doc_branch_id": 6,
+      "doctor_id": 5,
+      "doctor_name": "Vikram Rao",
+      "branch_id": 2,
+      "is_primary_branch": "Y",
+      "local_consultation_fee": 300,
+      "is_active": "Y"
+    },
+    {
+      "doc_branch_id": 1,
+      "doctor_id": 21,
+      "doctor_name": "Arjun Nair",
+      "branch_id": 2,
+      "is_primary_branch": "Y",
+      "local_consultation_fee": 800,
+      "is_active": "Y"
+    },
+    {
+      "doc_branch_id": 7,
+      "doctor_id": 44,
+      "doctor_name": "Arjun das Noor",
+      "branch_id": 2,
+      "is_primary_branch": "Y",
+      "local_consultation_fee": 800,
+      "is_active": "Y"
+    },
+    {
+      "doc_branch_id": 10,
+      "doctor_id": 46,
+      "doctor_name": "Rohit Ramachandra",
+      "branch_id": 2,
+      "is_primary_branch": "Y",
+      "local_consultation_fee": 800,
+      "is_active": "Y"
+    },
+    {
+      "doc_branch_id": 8,
+      "doctor_id": 61,
+      "doctor_name": "Suhas G",
+      "branch_id": 2,
+      "is_primary_branch": "Y",
+      "local_consultation_fee": 500,
+      "is_active": "Y"
+    },
+    {
+      "doc_branch_id": 9,
+      "doctor_id": 82,
+      "doctor_name": "Sachin Ram",
+      "branch_id": 2,
+      "is_primary_branch": "Y",
+      "local_consultation_fee": 800,
+      "is_active": "Y"
+    },
+    {
+      "doc_branch_id": 2,
+      "doctor_id": 101,
+      "doctor_name": "G Shashank",
+      "branch_id": 2,
+      "is_primary_branch": "Y",
+      "local_consultation_fee": 500,
+      "is_active": "Y"
+    }
+  ],
+  "slot_branch_map": {},
+  "appt_branch_map": {},
+  "patient_profiles": {},
+  "payment_branch_map": {}
+}

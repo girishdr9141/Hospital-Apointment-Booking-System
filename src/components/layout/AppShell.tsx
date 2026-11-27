@@ -12,6 +12,7 @@ import {
   CreditCard,
   FileSearch,
   FileText,
+  Globe,
   History,
   KeyRound,
   LayoutDashboard,
@@ -33,12 +34,14 @@ import {
 import type { AuthUser, NavItem, PortalNotification, RouteKey } from '../../types/opd';
 import { getNavForUser, getRouteLabel, ROLE_LABELS } from '../../utils/permissions';
 import { formatDisplayDateTime } from '../../utils/rules';
+import { useBranchContext } from '../../context/BranchContext';
 import { BackendToggle } from '../common/BackendToggle';
 import { ConfirmDialog } from './ConfirmDialog';
 
 const ROUTE_ICONS: Record<RouteKey, React.ComponentType<{ className?: string }>> = {
   dashboard: LayoutDashboard,
   analytics: BarChart3,
+  branches: Globe,
   patients: Users,
   'register-patient': UserPlus,
   doctors: Stethoscope,
@@ -105,6 +108,22 @@ export function AppShell({
     user.role === 'PATIENT';
   const unreadCount = notifications.filter((n) => !n.read).length;
 
+  const {
+    countries,
+    branches,
+    headquartersBranch,
+    selectedCountryCode,
+    selectedBranchId,
+    activeBranch,
+    setSelectedCountryCode,
+    setSelectedBranchId,
+  } = useBranchContext();
+
+  const activeCountries = countries.filter((c) => c.is_active === 'Y');
+  const activeBranches = branches.filter(
+    (b) => b.is_active === 'Y' && (selectedCountryCode === 'ALL' || b.country_code === selectedCountryCode),
+  );
+
   const navItems = getNavForUser(user);
   const activeLabel = getRouteLabel(user, activeRoute);
 
@@ -142,7 +161,7 @@ export function AppShell({
           }}
           className="text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
         >
-          CarePulse OPD
+          Global CarePulse
         </a>
         <button
           type="button"
@@ -377,6 +396,72 @@ export function AppShell({
               </button>
             </div>
           </header>
+
+          {branches.length > 0 && (
+            <div className="border-b border-slate-200 bg-white/80 px-4 py-2 sm:px-6 lg:px-8">
+              <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-2 text-xs lg:flex-nowrap">
+                <div className="flex min-w-0 flex-wrap items-center gap-2 lg:flex-nowrap">
+                  <span className="inline-flex shrink-0 items-center gap-1.5 font-medium text-slate-600 whitespace-nowrap">
+                    <Globe className="h-3.5 w-3.5 text-teal-700" aria-hidden="true" />
+                    <span>Network Scope</span>
+                  </span>
+                  <select
+                    aria-label="Workspace country filter"
+                    value={selectedCountryCode}
+                    onChange={(e) => setSelectedCountryCode(e.target.value)}
+                    className="max-w-[175px] truncate rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs text-slate-800 focus:border-teal-700 focus:outline-none"
+                  >
+                    <option value="ALL">All Countries ({activeCountries.length})</option>
+                    {activeCountries.map((c) => (
+                      <option key={c.country_code} value={c.country_code}>
+                        {c.country_name} ({c.currency_code})
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    aria-label="Workspace branch filter"
+                    value={String(selectedBranchId)}
+                    onChange={(e) =>
+                      setSelectedBranchId(e.target.value === 'ALL' ? 'ALL' : Number(e.target.value))
+                    }
+                    className="max-w-[240px] truncate rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-900 focus:border-teal-700 focus:outline-none"
+                  >
+                    <option value="ALL">
+                      All Branches ({activeBranches.length})
+                    </option>
+                    {activeBranches.map((b) => (
+                      <option key={b.branch_id} value={String(b.branch_id)}>
+                        {b.branch_name} · {b.city} ({b.branch_code})
+                        {b.is_headquarters === 'Y' ? ' · HQ' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="flex shrink-0 flex-wrap items-center gap-1.5 font-mono text-[11px] text-slate-500 tabular-nums whitespace-nowrap">
+                  {activeBranch ? (
+                    <>
+                      <span className="font-sans font-medium text-slate-700">
+                        {activeBranch.city}, {activeBranch.country_name}
+                      </span>
+                      <span aria-hidden="true">·</span>
+                      <span>{activeBranch.timezone_iana}</span>
+                      <span aria-hidden="true">·</span>
+                      <span className="font-semibold text-teal-800">{activeBranch.currency_code}</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>{activeBranches.length} branches</span>
+                      <span aria-hidden="true">·</span>
+                      <span>HQ {headquartersBranch?.branch_code || 'IN-BLR-HQ'}</span>
+                      <span aria-hidden="true">·</span>
+                      <span>Unlinked rows → HQ</span>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
 
           <main className="flex-1 p-4 sm:p-6 lg:p-8">
             <div className="mx-auto max-w-7xl">{children}</div>
